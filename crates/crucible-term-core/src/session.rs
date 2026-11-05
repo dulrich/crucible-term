@@ -182,6 +182,15 @@ impl Session {
         self.term.grid.total_lines() - self.term.grid.screen_lines()
     }
 
+    /// Approximate bytes held by the live grid (screen plus scrollback rows, `size_of` the
+    /// rio-vt cell each; excludes per-row bookkeeping and style tables). Debug attribution only.
+    pub fn grid_bytes_estimate(&self) -> usize {
+        let (cols, rows) = self.size();
+        (rows + self.history_len())
+            * cols
+            * std::mem::size_of::<rio_vt::crosswords::square::Square>()
+    }
+
     /// The last OSC 7 working directory, if any.
     pub fn cwd(&self) -> Option<&Path> {
         self.term.current_directory.as_deref()

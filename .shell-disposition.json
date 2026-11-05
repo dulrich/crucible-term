@@ -4,6 +4,7 @@
     {"path":"scripts/deploy.sh","disposition":"bash","modes":["exec"],"strict":"required","reason":"host-mutating deploy: local arrays, trap EXIT cleanup, BASH_SOURCE"},
     {"path":"scripts/g1/g1.sh","disposition":"bash","modes":["exec"],"strict":"required","reason":"arrays, process substitution and trap cleanup in the nested-compositor measurement driver; sources the bash build-id lib"},
     {"path":"scripts/g1/term.sh","disposition":"bash","modes":["exec"],"strict":"required","reason":"sources the bash build-id lib; BASH_SOURCE"},
+    {"path":"scripts/g2/spike-mem.sh","disposition":"bash","modes":["exec"],"strict":"required","reason":"process substitution and trap cleanup in the nested-compositor memory spike; sources the bash build-id lib; BASH_SOURCE"},
     {"path":"scripts/lib/build-id.sh","disposition":"lib-sh","modes":["source"]}
   ]
 }

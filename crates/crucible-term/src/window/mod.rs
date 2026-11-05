@@ -242,8 +242,18 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         sync_timer: false,
         last_cursor: None,
         exit: None,
+        mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
+        mem_first: true,
     };
     app.apply_cursor_defaults();
+    if app.mem_debug {
+        let _ =
+            app.handle
+                .insert_source(Timer::from_duration(Duration::from_secs(4)), |_, _, app| {
+                    app.print_mem("idle-4s");
+                    TimeoutAction::Drop
+                });
+    }
     while app.exit.is_none() {
         event_loop
             .dispatch(None, &mut app)
@@ -319,6 +329,9 @@ pub struct App {
     sync_timer: bool,
     last_cursor: Option<usize>,
     exit: Option<i32>,
+    /// `CTERM_DEBUG_MEM=1`: print memory attribution to stderr (first frame, then 4 s idle).
+    mem_debug: bool,
+    mem_first: bool,
 }
 
 fn exit_code(s: std::process::ExitStatus) -> i32 {
@@ -619,6 +632,33 @@ impl App {
         if self.buffers.len() > 2 {
             self.buffers.remove(0);
         }
+        if self.mem_debug && self.mem_first {
+            self.mem_first = false;
+            self.print_mem("first-frame");
+        }
+    }
+
+    /// Debug-only (`CTERM_DEBUG_MEM=1`): byte sizes of the big per-window and shareable pieces.
+    fn print_mem(&self, when: &str) {
+        let (faces, emoji, nfaces, nshapes, nglyphs, gbytes) = self.fonts.mem_stats();
+        let (cols, rows) = self.session.size();
+        eprintln!(
+            "crucible-term: mem: {when} image_bytes={} buf={}x{} pool_bytes={} live_buffers={}",
+            self.image.len() * 4,
+            self.buf.0,
+            self.buf.1,
+            self.pool.len(),
+            self.buffers.len()
+        );
+        eprintln!(
+            "crucible-term: mem: {when} face_bytes={faces} emoji_face_bytes={emoji} faces={nfaces} \
+             shape_entries={nshapes} glyph_entries={nglyphs} glyph_bitmap_bytes={gbytes}"
+        );
+        eprintln!(
+            "crucible-term: mem: {when} session_grid_bytes_est={} cols={cols} rows={rows} history_rows={}",
+            self.session.grid_bytes_estimate(),
+            self.session.history_len()
+        );
     }
 
     /// A buffer the compositor has released, or a new one (double buffering: at most two live).

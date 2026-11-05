@@ -314,6 +314,28 @@ impl Fonts {
         }
     }
 
+    /// Debug-only memory attribution (`CTERM_DEBUG_MEM`): `(face_total, emoji_face, face_count,
+    /// shape_entries, glyph_entries, glyph_bitmap_bytes)`. The emoji face is the loaded face whose
+    /// path names "emoji" (a heuristic); its bytes are included in `face_total`.
+    pub fn mem_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let total = self.faces.iter().map(|f| f.data.len()).sum();
+        let emoji = self
+            .loaded
+            .iter()
+            .filter(|(l, _)| l.path.to_string_lossy().to_lowercase().contains("emoji"))
+            .map(|(_, &i)| self.faces[i].data.len())
+            .sum();
+        let bitmaps = self.glyphs.values().flatten().map(|g| g.data.len()).sum();
+        (
+            total,
+            emoji,
+            self.faces.len(),
+            self.shapes.len(),
+            self.glyphs.len(),
+            bitmaps,
+        )
+    }
+
     /// Current cell metrics.
     pub fn metrics(&self) -> Metrics {
         self.metrics
