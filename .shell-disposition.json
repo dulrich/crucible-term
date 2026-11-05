@@ -1,4 +1,7 @@
 {
   "exclude": [],
-  "entries": []
+  "entries": [
+    {"path":"scripts/deploy.sh","disposition":"bash","modes":["exec"],"strict":"required","reason":"host-mutating deploy: local arrays, trap EXIT cleanup, BASH_SOURCE"},
+    {"path":"scripts/lib/build-id.sh","disposition":"lib-sh","modes":["source"]}
+  ]
 }

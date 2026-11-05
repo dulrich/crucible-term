@@ -490,3 +490,17 @@ fn bench_swash_frame() {
         prep.as_secs_f64() * 1e3
     );
 }
+
+#[test]
+fn centered_splits_the_spare_pixels() {
+    let f = fonts(false);
+    let m = f.metrics();
+    let (cw, ch) = (m.cell_w, m.cell_h);
+    let p = centered(cw * 10 + 12, ch * 4 + 7, &m, (10, 4), Pad { x: 2, y: 1 });
+    // 12 spare px minus 2*2 padding = 8, so 4 more each side; 7 - 2 = 5, so 2 more (floor).
+    assert_eq!(p, Pad { x: 6, y: 3 });
+    assert_eq!(
+        centered(1, 1, &m, (10, 4), Pad { x: 2, y: 1 }),
+        Pad { x: 2, y: 1 }
+    );
+}

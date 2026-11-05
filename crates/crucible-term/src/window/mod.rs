@@ -11,9 +11,10 @@
 
 mod input;
 
+use crate::config::Settings;
 use crate::font::{Fonts, Metrics};
 use crate::outbox::Outbox;
-use crate::render::{self, Canvas, CursorDraw, Theme};
+use crate::render::{self, Canvas, CursorDraw, Pad, Theme};
 use crate::selection::{invalidated, merge_damage};
 use crucible_term_core::pty::{Pty, SpawnSpec};
 use crucible_term_core::{Damage, Event, Session};
@@ -58,21 +59,17 @@ const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// Cursor blink half-period.
 const BLINK: Duration = Duration::from_millis(500);
 
-/// Window and terminal settings (WP-4 fills these from config and CLI).
+/// Window and terminal settings, resolved from the config file, `-o` overrides and the CLI.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// xdg-toplevel app id.
     pub app_id: String,
     /// Default title until the child sets one.
     pub title: String,
-    /// Fontconfig family.
-    pub family: String,
-    /// Font size in points.
-    pub size_pt: f32,
-    /// Padding in logical pixels.
-    pub pad: u32,
-    /// Scrollback rows.
-    pub scrollback: usize,
+    /// Font, theme, scrollback, padding and cursor defaults from the config and `-o`.
+    pub settings: Settings,
+    /// The child's working directory.
+    pub cwd: std::path::PathBuf,
     /// Initial grid size.
     pub cols: u16,
     /// Initial grid size.
@@ -84,10 +81,8 @@ impl Default for Config {
         Config {
             app_id: "crucible-term".into(),
             title: "crucible-term".into(),
-            family: "monospace".into(),
-            size_pt: 11.0,
-            pad: 2,
-            scrollback: 10_000,
+            settings: Settings::default(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
             cols: 80,
             rows: 24,
         }
@@ -147,13 +142,14 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
     window.set_app_id(cfg.app_id.clone());
     window.commit();
 
-    let fonts = Fonts::discover(&cfg.family, cfg.size_pt, 1.0).map_err(WindowError::Font)?;
+    let fonts = Fonts::discover(&cfg.settings.family, cfg.settings.size_pt, 1.0)
+        .map_err(WindowError::Font)?;
     let m = fonts.metrics();
     let logical = (
-        u32::from(cfg.cols) * m.cell_w + 2 * cfg.pad,
-        u32::from(cfg.rows) * m.cell_h + 2 * cfg.pad,
+        u32::from(cfg.cols) * m.cell_w + 2 * cfg.settings.pad.0,
+        u32::from(cfg.rows) * m.cell_h + 2 * cfg.settings.pad.1,
     );
-    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let cwd = cfg.cwd.clone();
     let pty = Pty::spawn(&SpawnSpec {
         argv,
         cwd,
@@ -182,6 +178,27 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         )
         .map_err(|e| WindowError::Loop(e.to_string()))?;
 
+    // The child's exit also arrives on a pidfd, so a background grandchild holding the slave
+    // cannot keep the window open after the shell is gone. Without pidfd the PTY EOF path
+    // above still ends the window.
+    match rustix::process::Pid::from_raw(pty.pid() as i32)
+        .map(|p| rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()))
+    {
+        Some(Ok(fd)) => {
+            handle
+                .insert_source(
+                    Generic::new(fd, Interest::READ, Mode::Level),
+                    |_, _, app| {
+                        app.on_child_exited();
+                        Ok(PostAction::Remove)
+                    },
+                )
+                .map_err(|e| WindowError::Loop(e.to_string()))?;
+        }
+        Some(Err(e)) => eprintln!("crucible-term: pidfd_open: {e}; relying on PTY EOF"),
+        None => {}
+    }
+
     let pool = SlotPool::new((logical.0 * logical.1 * 4) as usize, &shm).map_err(wl)?;
     let mut app = App {
         registry: RegistryState::new(&globals),
@@ -197,14 +214,18 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         qh: qh.clone(),
         handle,
         cfg: cfg.clone(),
-        session: Session::new(usize::from(cfg.cols), usize::from(cfg.rows), cfg.scrollback),
+        session: Session::new(
+            usize::from(cfg.cols),
+            usize::from(cfg.rows),
+            cfg.settings.scrollback,
+        ),
         pty,
         outbox: Outbox::default(),
         write_armed: false,
         pending_damage: None,
         inp: input::Input::new(&globals, &qh),
         fonts,
-        theme: Theme::default(),
+        theme: cfg.settings.theme.clone(),
         logical,
         scale: 1.0,
         int_scale: 1,
@@ -222,6 +243,7 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         last_cursor: None,
         exit: None,
     };
+    app.apply_cursor_defaults();
     while app.exit.is_none() {
         event_loop
             .dispatch(None, &mut app)
@@ -313,8 +335,31 @@ impl App {
         }
     }
 
-    fn pad_px(&self) -> u32 {
-        (f64::from(self.cfg.pad) * self.effective_scale()).round() as u32
+    /// The configured logical padding in buffer pixels (sizes the grid).
+    fn base_pad(&self) -> Pad {
+        let s = self.effective_scale();
+        let px = |v: u32| (f64::from(v) * s).round() as u32;
+        Pad {
+            x: px(self.cfg.settings.pad.0),
+            y: px(self.cfg.settings.pad.1),
+        }
+    }
+
+    /// The padding in buffer pixels: the configured logical padding scaled, plus the spare
+    /// pixels split evenly when `center` is set.
+    fn pad_px(&self) -> Pad {
+        let base = self.base_pad();
+        if self.cfg.settings.center {
+            render::centered(
+                self.buf.0,
+                self.buf.1,
+                &self.fonts.metrics(),
+                self.session.size(),
+                base,
+            )
+        } else {
+            base
+        }
     }
 
     fn on_pty_readable(&mut self) {
@@ -370,6 +415,31 @@ impl App {
         self.request_redraw();
     }
 
+    /// The pidfd fired: the child has exited. Drain what the PTY still holds, then close.
+    fn on_child_exited(&mut self) {
+        if self.exit.is_none() {
+            self.on_pty_readable();
+        }
+        if self.exit.is_none() {
+            self.child_gone();
+        }
+    }
+
+    /// Seed the session's cursor with the configured shape and blink, as if the child had sent
+    /// DECSCUSR (which still overrides it later; `CSI 0 q` resets to a steady block).
+    fn apply_cursor_defaults(&mut self) {
+        use crucible_term_core::CursorKind;
+        let s = &self.cfg.settings;
+        let base = match s.cursor_shape {
+            CursorKind::Underline => 3,
+            CursorKind::Beam => 5,
+            _ => 1,
+        };
+        let n = if s.cursor_blink { base } else { base + 1 };
+        self.session.feed(format!("\x1b[{n} q").as_bytes());
+        self.arm_blink();
+    }
+
     fn child_gone(&mut self) {
         let code = self.pty.wait().map(exit_code).unwrap_or(1);
         self.exit = Some(code);
@@ -423,7 +493,7 @@ impl App {
             self.buffers.clear();
         }
         let m: Metrics = self.fonts.metrics();
-        let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.pad_px());
+        let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.base_pad());
         if (cols, rows) != self.session.size() {
             self.inp.selection = None;
             self.session.resize(cols, rows);
@@ -812,3 +882,40 @@ delegate_seat!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_registry!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    /// The pidfd turns readable when the shell exits even though a background grandchild still
+    /// holds the PTY slave (so the master sees no EOF), and the exit code is the shell's.
+    #[test]
+    fn pidfd_fires_while_a_grandchild_holds_the_slave() {
+        let mut pty = Pty::spawn(&SpawnSpec {
+            argv: vec!["sh".into(), "-c".into(), "sleep 2 & exit 7".into()],
+            cwd: "/".into(),
+            env: crucible_term_core::pty::inherited_env(),
+            size: (80, 24),
+        })
+        .expect("spawn");
+        let pid = rustix::process::Pid::from_raw(pty.pid() as i32).expect("pid");
+        let fd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            .expect("pidfd_open");
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        let t = Instant::now();
+        assert_eq!(
+            poll(
+                &mut fds,
+                Some(&rustix::event::Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 500_000_000,
+                })
+            )
+            .expect("poll"),
+            1
+        );
+        assert!(t.elapsed() < Duration::from_millis(1500));
+        assert_eq!(exit_code(pty.wait().expect("wait")), 7);
+    }
+}

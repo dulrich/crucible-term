@@ -1,8 +1,10 @@
-//! `crucible-term`: CDE's terminal emulator. With no arguments it spawns `$SHELL` (fallback
-//! `/bin/sh`) on a PTY in a new Wayland window and exits with the shell's exit status. It
-//! answers `--help`, `--build` and `--version`; every other argument is refused until WP-4's CLI.
+//! `crucible-term`: CDE's terminal emulator. It opens a Wayland window running `-e <cmd>` (or
+//! `$SHELL`, fallback `/bin/sh`) on a PTY and exits with the child's exit status. The command
+//! line is in [`cli`], the KDL configuration and `-o` overrides in [`config`].
 
+mod cli;
 mod clipboard;
+mod config;
 mod font;
 mod outbox;
 mod render;
@@ -10,9 +12,8 @@ mod selection;
 mod window;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
-
-const USAGE: &str = "usage: crucible-term [--help | --build | --version]\n\nWith no arguments, open a terminal window running $SHELL (fallback /bin/sh) in the current\ndirectory; the exit status is the shell's.\n\n  --build                  print the tool-scoped build id (40-hex commit, `-dirty` if modified) and exit 0\n  --version                print `crucible-term <semver> (<build id>)` and exit 0\n  -h, --help               print this usage and exit 0\n\nAny other argument exits 2 (the full CLI arrives with plan 01 WP-4).\n";
 
 /// The `--version` line, in the `"version": "semver"` format the fleet help gate matches.
 fn version_line(version: &str, build_id: &str) -> String {
@@ -25,29 +26,70 @@ fn shell(var: Option<OsString>) -> OsString {
         .unwrap_or_else(|| OsString::from("/bin/sh"))
 }
 
+/// The working directory: the requested one if it is a directory (else a warning and the
+/// current directory).
+fn working_directory(requested: Option<PathBuf>) -> PathBuf {
+    let current = || std::env::current_dir().unwrap_or_else(|_| "/".into());
+    match requested {
+        Some(d) if d.is_dir() => d,
+        Some(d) => {
+            eprintln!(
+                "crucible-term: --working-directory {}: not a directory, using the current directory",
+                d.display()
+            );
+            current()
+        }
+        None => current(),
+    }
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print!("{USAGE}");
-        return ExitCode::SUCCESS;
+    let cli = match cli::parse(std::env::args_os().skip(1).collect()) {
+        Ok(cli::Parsed::Help) => {
+            print!("{}", cli::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Build) => {
+            println!("{}", env!("FLEET_BUILD_ID"));
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Version) => {
+            println!(
+                "{}",
+                version_line(env!("CARGO_PKG_VERSION"), env!("FLEET_BUILD_ID"))
+            );
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Run(c)) => c,
+        Err(e) => {
+            eprintln!("crucible-term: {e}\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let path = config::config_path(&|k| std::env::var_os(k));
+    let (settings, warnings) = config::load(
+        path.as_deref(),
+        &|p| std::fs::read_to_string(p),
+        &cli.overrides,
+    );
+    for w in warnings {
+        eprintln!("{w}");
     }
-    if args.iter().any(|a| a == "--build") {
-        println!("{}", env!("FLEET_BUILD_ID"));
-        return ExitCode::SUCCESS;
+    let mut cfg = window::Config {
+        settings,
+        cwd: working_directory(cli.working_directory),
+        ..window::Config::default()
+    };
+    if let Some(id) = cli.app_id {
+        cfg.app_id = id;
     }
-    if args.iter().any(|a| a == "--version") {
-        println!(
-            "{}",
-            version_line(env!("CARGO_PKG_VERSION"), env!("FLEET_BUILD_ID"))
-        );
-        return ExitCode::SUCCESS;
+    if let Some(t) = cli.title {
+        cfg.title = t;
     }
-    if let Some(a) = args.first() {
-        eprintln!("crucible-term: unknown argument {a:?} (see --help)");
-        return ExitCode::from(2);
-    }
-    let argv = vec![shell(std::env::var_os("SHELL"))];
-    match window::run(&window::Config::default(), argv) {
+    let argv = cli
+        .exec
+        .unwrap_or_else(|| vec![shell(std::env::var_os("SHELL"))]);
+    match window::run(&cfg, argv) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("crucible-term: {e}");

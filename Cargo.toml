@@ -25,7 +25,7 @@ rio-graphics = { version = "=0.5.29", default-features = false }
 cursor-icon = { version = "1.1.0", default-features = false }
 
 # The owned PTY: openpty, ioctls (TIOCSWINSZ, TIOCSCTTY), fd flags, process wait.
-rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio"] }
+rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio", "event"] }
 
 # `close_range(2)` in the PTY child before exec (rustix has no wrapper). Already in the lock.
 libc = "0.2"
@@ -40,6 +40,9 @@ yeslogic-fontconfig-sys = "6.0.1"
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# KDL config (matches CDE: kdl 6, default features).
+kdl = "6"
 
 # Lints are defined once here and inherited by every crate with `[lints] workspace = true`.
 [workspace.lints.clippy]

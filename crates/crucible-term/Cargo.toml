@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 crucible-term-core.workspace = true
 rustix.workspace = true
+kdl.workspace = true
 swash.workspace = true
 yeslogic-fontconfig-sys.workspace = true
 smithay-client-toolkit.workspace = true

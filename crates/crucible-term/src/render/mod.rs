@@ -27,6 +27,34 @@ pub struct Theme {
     pub alpha: u8,
 }
 
+/// Padding in buffer pixels, per axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pad {
+    /// Left (and right) padding.
+    pub x: u32,
+    /// Top (and bottom) padding.
+    pub y: u32,
+}
+
+impl From<u32> for Pad {
+    fn from(p: u32) -> Pad {
+        Pad { x: p, y: p }
+    }
+}
+
+/// The padding that centres a `cols` x `rows` grid in a `width` x `height` buffer: `base` plus
+/// half the pixels left over after the grid and `base` on both sides.
+pub fn centered(width: u32, height: u32, m: &Metrics, grid: (usize, usize), base: Pad) -> Pad {
+    let spare = |total: u32, cell: u32, n: usize, b: u32| {
+        let used = (n as u64 * u64::from(cell)).min(u64::from(u32::MAX)) as u32;
+        b + total.saturating_sub(used).saturating_sub(2 * b) / 2
+    };
+    Pad {
+        x: spare(width, m.cell_w, grid.0, base.x),
+        y: spare(height, m.cell_h, grid.1, base.y),
+    }
+}
+
 /// The built-in 16 colours (foot's defaults).
 const BASE16: [Rgb; 16] = [
     Rgb(0x24, 0x24, 0x24),
@@ -91,9 +119,10 @@ pub struct CursorDraw {
 }
 
 /// Columns and rows that fit a `width` x `height` buffer with `pad` pixels on every side.
-pub fn grid_size(width: u32, height: u32, m: &Metrics, pad: u32) -> (usize, usize) {
-    let w = width.saturating_sub(2 * pad) / m.cell_w;
-    let h = height.saturating_sub(2 * pad) / m.cell_h;
+pub fn grid_size(width: u32, height: u32, m: &Metrics, pad: impl Into<Pad>) -> (usize, usize) {
+    let pad = pad.into();
+    let w = width.saturating_sub(2 * pad.x) / m.cell_w;
+    let h = height.saturating_sub(2 * pad.y) / m.cell_h;
     (w.max(1) as usize, h.max(1) as usize)
 }
 
@@ -187,12 +216,23 @@ pub type Selected<'a> = &'a dyn Fn(usize, usize) -> bool;
 
 /// The grid cell `(col, row)` under a pixel position (buffer pixels, padding aware), clamped to
 /// the `cols` x `rows` grid.
-pub fn cell_at(x: f64, y: f64, m: &Metrics, pad: u32, cols: usize, rows: usize) -> (usize, usize) {
-    let axis = |v: f64, cell: u32, n: usize| {
-        let c = ((v - f64::from(pad)) / f64::from(cell.max(1))).floor();
+pub fn cell_at(
+    x: f64,
+    y: f64,
+    m: &Metrics,
+    pad: impl Into<Pad>,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let pad = pad.into();
+    let axis = |v: f64, p: u32, cell: u32, n: usize| {
+        let c = ((v - f64::from(p)) / f64::from(cell.max(1))).floor();
         (c.max(0.0) as usize).min(n.saturating_sub(1))
     };
-    (axis(x, m.cell_w, cols), axis(y, m.cell_h, rows))
+    (
+        axis(x, pad.x, m.cell_w, cols),
+        axis(y, pad.y, m.cell_h, rows),
+    )
 }
 
 /// Paint `grid` into `canvas`: every row when `rows` is `None` (padding too), otherwise only the
@@ -204,11 +244,12 @@ pub fn paint(
     grid: &Grid,
     theme: &Theme,
     fonts: &mut Fonts,
-    pad: u32,
+    pad: impl Into<Pad>,
     cursor: CursorDraw,
     rows: Option<&[usize]>,
     selected: Option<Selected<'_>>,
 ) -> Vec<(usize, usize)> {
+    let pad: Pad = pad.into();
     let m = fonts.metrics();
     let bg = premul(theme.bg, theme.alpha);
     let all: Vec<usize>;
@@ -225,7 +266,7 @@ pub fn paint(
         if r >= grid.screen.len() {
             continue;
         }
-        let y0 = pad as usize + r * m.cell_h as usize;
+        let y0 = pad.y as usize + r * m.cell_h as usize;
         let y1 = (y0 + m.cell_h as usize).min(canvas.height);
         if y0 >= y1 {
             continue;
@@ -290,7 +331,7 @@ fn paint_row(
     t: &Theme,
     fonts: &mut Fonts,
     m: &Metrics,
-    pad: u32,
+    pad: Pad,
     cur: Option<usize>,
     cursor: CursorDraw,
     sel: &dyn Fn(usize) -> bool,
@@ -302,7 +343,7 @@ fn paint_row(
     let block = show && cursor.focused && cursor.style.shape == CursorKind::Block;
     // Backgrounds first, so glyph overhang from one cell is not erased by the next.
     for (x, cell) in cells.iter().enumerate() {
-        let cx = i64::from(pad) + x as i64 * cw;
+        let cx = i64::from(pad.x) + x as i64 * cw;
         let mut col = colors(cell, t);
         if sel(x) {
             invert(&mut col, t);
@@ -318,7 +359,7 @@ fn paint_row(
         if cell.width == Width::Spacer {
             continue;
         }
-        let cx = i64::from(pad) + x as i64 * cw;
+        let cx = i64::from(pad.x) + x as i64 * cw;
         let span = if cell.width == Width::Wide { 2 } else { 1 };
         let mut col = colors(cell, t);
         if sel(x) {
@@ -359,7 +400,7 @@ fn paint_row(
         decorate(b, cell, cx, y, cw * span, m, fg);
     }
     if let (true, Some(x)) = (show && !block, cur) {
-        let cx = i64::from(pad) + x as i64 * cw;
+        let cx = i64::from(pad.x) + x as i64 * cw;
         let s = i64::from(m.stroke);
         let c = premul(t.cursor, 255);
         match (cursor.focused, cursor.style.shape) {
