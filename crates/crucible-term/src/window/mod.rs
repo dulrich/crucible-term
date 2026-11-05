@@ -244,6 +244,7 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         exit: None,
         mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
         mem_first: true,
+        noimage_debug: std::env::var_os("CTERM_DEBUG_NOIMAGE").is_some_and(|v| v == "1"),
     };
     app.apply_cursor_defaults();
     if app.mem_debug {
@@ -332,6 +333,9 @@ pub struct App {
     /// `CTERM_DEBUG_MEM=1`: print memory attribution to stderr (first frame, then 4 s idle).
     mem_debug: bool,
     mem_first: bool,
+    /// Debug-only (`CTERM_DEBUG_NOIMAGE=1`, measurement of the "no persistent frame image" reduction): every frame is a full
+    /// repaint into a transient image that is freed right after the shm copy. Off by default; not a product behaviour.
+    noimage_debug: bool,
 }
 
 fn exit_code(s: std::process::ExitStatus) -> i32 {
@@ -587,6 +591,9 @@ impl App {
             blink_on: self.blink_on,
         };
         let (w, h) = (self.buf.0 as usize, self.buf.1 as usize);
+        if self.noimage_debug && self.image.len() != w * h {
+            self.image = vec![0; w * h];
+        }
         let pad = self.pad_px();
         let top = self.session.viewport_top();
         let sel = self.inp.selection.as_ref();
@@ -617,6 +624,10 @@ impl App {
             for (dst, src) in canvas.chunks_exact_mut(4).zip(&self.image) {
                 dst.copy_from_slice(&src.to_le_bytes());
             }
+        }
+        if self.noimage_debug {
+            self.image = Vec::new();
+            self.full = true;
         }
         let surface = self.window.wl_surface().clone();
         for (y, bh) in bands {

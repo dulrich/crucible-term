@@ -12,7 +12,13 @@ set -euo pipefail
 
 usage() {
 	cat <<'USAGE'
-Usage: spike-mem.sh [--help|-h] [--build|--version]
+Usage: spike-mem.sh [--help|-h] [--build|--version] [SUBJECT...]
+
+SUBJECT is `cterm` (default) or `foot`; several subjects run back to back in one invocation (a fresh nested compositor each,
+same geometry), so the split is comparable. `foot` is ~/.local/bin/foot (G2_FOOT) with ~/.config/foot/foot.ini (G2_FOOT_INI),
+as in scripts/g1/g1.sh; it has no debug hook (no MEMHOOK lines). G2_WLDEBUG=1 additionally records WAYLAND_DEBUG for each
+window and prints a WLBUF summary (wl_shm pool/buffer creates and destroys; foot also logs its cell grid) - this perturbs memory
+slightly, so use it in a separate batch from the PSS split.
 
 Start a nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with the
 g1 tiling probe config, open one standalone `cterm` window (`CTERM_DEBUG_MEM=1`) three times (fresh window each),
@@ -20,11 +26,11 @@ wait the 4 s settle (and for the hook's idle line), then split the window's PSS 
 class: anon (heap/stack/anon), shm (memfd and /dev/shm: Wayland buffers; PSS is halved where the nested compositor
 also maps the pages, so Rss is printed too), bin (the cterm binary), lib_core (libc, ld, libm, libgcc), lib_other,
 font (font files, fontconfig caches), file_other; plus the shell child's PSS and the total. Also measures a blocked
-`sleep` as the thin-client anon baseline. Prints RUN/SPLIT/MEMHOOK lines and writes them to target/g2/spike-mem.out.
+`sleep` as the thin-client anon baseline. Prints RUN/SPLIT/MEMHOOK lines and writes them to target/g2/spike-mem.out (target/g2/spike-mem-<subjects>.out when not just `cterm`).
 Scratch lives in /tmp/cde-g2 (removed at exit). Only pids recorded by this script are ever signalled.
 
 Environment (defaults): G2_CRUCIBLE (crucible-dev-env/target/release/crucible), G2_CT (target/release/cterm),
-G2_GAP (10), G2_PARENT_WL (/run/user/1001/wayland-1), G2_RUNS (3), G2_SETTLE_S (4).
+G2_GAP (10), G2_PARENT_WL (/run/user/1001/wayland-1), G2_RUNS (3), G2_SETTLE_S (4), G2_FOOT, G2_FOOT_INI, G2_WLDEBUG (0), G2_CT_ENV (extra env words for cterm, e.g. CTERM_DEBUG_NOIMAGE=1), G2_TOP (1: print the 6 largest anon mappings per window as ANONTOP lines).
 Bash reasons: process substitution, trap cleanup, BASH_SOURCE.
 USAGE
 }
@@ -33,7 +39,9 @@ USAGE
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/build-id.sh"
 case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
-[ "$#" -eq 0 ] || { usage >&2; exit 2; }
+SUBJECTS=("$@")
+[ "$#" -gt 0 ] || SUBJECTS=(cterm)
+for s in "${SUBJECTS[@]}"; do case $s in cterm | foot) ;; *) usage >&2; exit 2 ;; esac; done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
@@ -44,11 +52,15 @@ GAP=${G2_GAP:-10}
 PARENT_WL=${G2_PARENT_WL:-/run/user/1001/wayland-1}
 RUNS=${G2_RUNS:-3}
 SETTLE=${G2_SETTLE_S:-4}
+FOOT=$(readlink -f "${G2_FOOT:-$HOME/.local/bin/foot}")
+FOOT_INI=${G2_FOOT_INI:-$HOME/.config/foot/foot.ini}
+WLDEBUG=${G2_WLDEBUG:-0}
 OUT=$R/target/g2
 T=/tmp/cde-g2
 mkdir -p "$OUT"
 [ -x "$CT" ] || { echo "spike-mem.sh: missing $CT (cargo build --release)" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "spike-mem.sh: missing $BIN" >&2; exit 1; }
+[ -x "$FOOT" ] || [ "${SUBJECTS[*]}" = cterm ] || { echo "spike-mem.sh: missing $FOOT" >&2; exit 1; }
 
 median() { sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "NA"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.1f\n",(a[NR/2]+a[NR/2+1])/2} }'; }
 
@@ -59,14 +71,14 @@ split_pss() {
   open(F,"<","/proc/$pid/smaps") or die "smaps: $!";
   while(<F>){
     if(/^[0-9a-f]+-[0-9a-f]+ \S+ \S+ \S+ \d+\s*(.*)$/){ $path=$1;
-      $cur = $path eq "" || $path =~ /^\[(heap|stack|anon|vvar|vdso|vsyscall)/ ? "anon"
+      $mp=$path eq "" ? "[anon]" : $path; $cur = $path eq "" || $path =~ /^\[(heap|stack|anon|vvar|vdso|vsyscall)/ ? "anon"
         : $path =~ m{^/memfd:|^/dev/shm/} ? "shm"
         : $path eq $ct ? "bin"
         : $path =~ m{/(libc\.so|libm\.so|libgcc_s\.so|ld-linux)} ? "lib_core"
         : $path =~ m{\.so(\.|$)} ? "lib_other"
         : $path =~ m{\.(ttf|otf|ttc|pcf|pfb)(\s|$)|fontconfig|/fonts/|\.cache} ? "font"
         : "file_other"; }
-    elsif(/^Pss:\s+(\d+)/){ $c{$cur}+=$1; $c{total}+=$1 }
+    elsif(/^Pss:\s+(\d+)/){ $c{$cur}+=$1; $c{total}+=$1; push @top,[$1,$mp] if $cur eq "anon" }
     elsif(/^Rss:\s+(\d+)/ && $cur eq "shm"){ $c{shm_rss}+=$1 }
   }
   close F;
@@ -74,6 +86,7 @@ split_pss() {
   my @q=@{$kids{$pid}||[]}; my $sh=0;
   while(my $p=shift @q){ push @q,@{$kids{$p}||[]}; if(open(S,"<","/proc/$p/smaps_rollup")){ while(<S>){ $sh+=$1 if /^Pss:\s+(\d+)/ } close S } }
   $c{shell}=$sh;
+  if($ENV{G2_TOP}){ my $i=0; for my $t (sort { $b->[0] <=> $a->[0] } @top){ print STDERR "ANONTOP pid=$pid pss_kB=$t->[0] $t->[1]\n"; last if ++$i>=6 } }
   print join(" ", map { "$_=".($c{$_}||0) } qw(anon shm shm_rss bin lib_core lib_other font file_other shell total)),"\n"' "$1" "$2"
 }
 
@@ -89,12 +102,22 @@ cleanup() {
 trap cleanup EXIT
 
 run() {
+	local subj=$1 prog=$CT pre
+	[ "$subj" = foot ] && prog=$FOOT
 	rm -rf "$T"
 	mkdir -p "$T/config/cde" "$T/config/crucible-term" "$T/state" "$T/data" "$T/run"
 	chmod 700 "$T/run"
 	: >"$T/pids"
-	# env sets CTERM_DEBUG_MEM and keeps the recorded wrapper pid (exec chain: term.sh -> env -> cterm)
-	printf 'PROG=%s\nPRE=%q\n' /usr/bin/env "CTERM_DEBUG_MEM=1 $CT" >"$T/term.env"
+	if [ "$subj" = foot ]; then
+		cp "$FOOT_INI" "$T/foot.ini"
+		pre="--config=$T/foot.ini"
+		[ "$WLDEBUG" = 1 ] && pre="$pre --log-level=info"
+		printf 'PROG=%s\nPRE=%q\n' "$FOOT" "$pre" >"$T/term.env"
+	else
+		# env sets CTERM_DEBUG_MEM and keeps the recorded wrapper pid (exec chain: term.sh -> env -> cterm)
+		printf 'PROG=%s\nPRE=%q\n' /usr/bin/env "CTERM_DEBUG_MEM=1 ${G2_CT_ENV:-} $CT" >"$T/term.env"
+	fi
+	[ "$WLDEBUG" = 1 ] && : >"$T/debug"
 	# same crucible-term config as g1 (equivalent of the user's foot.ini)
 	cat >"$T/config/crucible-term/config.kdl" <<'KDL'
 font "Bitstream Vera Sans Mono" size=14
@@ -152,15 +175,23 @@ KDL
 		base=$(wc -l <"$T/log")
 		msg exec run-terminal >/dev/null
 		sleep "$SETTLE"
-		for _ in $(seq 1 20); do grep -q 'mem: idle-4s session_grid' <(tail -n +"$((base + 1))" "$T/log") && break; sleep 0.25; done
+		[ "$subj" = foot ] || for _ in $(seq 1 20); do grep -q 'mem: idle-4s session_grid' <(tail -n +"$((base + 1))" "$T/log") && break; sleep 0.25; done
 		P=$(tail -1 "$T/pids")
-		line=$(split_pss "$P" "$CT")
+		line=$(split_pss "$P" "$prog")
 		echo "RUN $k pid=$P $line"
 		tail -n +"$((base + 1))" "$T/log" | grep 'crucible-term: mem:' | sed "s/^/MEMHOOK run $k: /" || true
 		for cls in "${KEYS[@]}"; do
 			v=$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n "s/^$cls=//p")
 			eval "L_$cls=\"\$L_$cls\$v\"\$'\\n'"
 		done
+		if [ "$WLDEBUG" = 1 ]; then
+			for f in "$T"/wl.*.log; do
+				[ -f "$f" ] || continue
+				echo "WLBUF run $k $subj: create_pool=$(grep -c 'wl_shm#[0-9]*\.create_pool' "$f") create_buffer=$(grep -c 'wl_shm_pool#[0-9]*\.create_buffer' "$f") buffer_destroy=$(grep -c 'wl_buffer#[0-9]*\.destroy' "$f") pool_destroy=$(grep -c 'wl_shm_pool#[0-9]*\.destroy' "$f") attach=$(grep -c 'wl_surface#[0-9]*\.attach' "$f") release=$(grep -c 'wl_buffer#[0-9]*\.release' "$f")"
+				grep -m6 -E 'wl_shm#[0-9]*\.create_pool|create_buffer|cell|grid|surface size' "$f" | cut -c1-200 | sed "s/^/WLBUF run $k sample: /"
+				rm -f "$f"
+			done
+		fi
 		kill "$P" 2>/dev/null || true
 		sleep 1.5
 	done
@@ -181,4 +212,11 @@ KDL
 	echo "== done"
 }
 
-run 2>&1 | tee "$OUT/spike-mem.out"
+OUTF=spike-mem.out
+[ "${SUBJECTS[*]}" = cterm ] || OUTF=spike-mem-$(IFS=-; echo "${SUBJECTS[*]}").out
+{
+	for s in "${SUBJECTS[@]}"; do
+		echo "=== SUBJECT $s"
+		run "$s"
+	done
+} 2>&1 | tee "$OUT/$OUTF"
