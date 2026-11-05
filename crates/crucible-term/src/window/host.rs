@@ -103,11 +103,15 @@ fn lp(e: impl std::fmt::Display) -> WindowError {
     WindowError::Loop(e.to_string())
 }
 
-/// Spawn `argv` on a PTY in a new window and run until the child exits or the window closes.
-/// Returns the child's exit code (128 + signal when killed).
-pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
+/// Spawn `argv` on a PTY (child environment `env`) in a new window and run until the child exits
+/// or the window closes. Returns the child's exit code (128 + signal when killed).
+pub fn run(
+    cfg: &Config,
+    argv: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+) -> Result<i32, WindowError> {
     let (mut event_loop, mut host) = Host::new()?;
-    let id = host.open_window(cfg, argv)?;
+    let (id, _) = host.open_window(cfg, argv, env)?;
     while !host.terms.is_empty() || host.closing > 0 {
         event_loop.dispatch(None, &mut host).map_err(lp)?;
         host.reap();
@@ -116,7 +120,10 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
 }
 
 impl Host {
-    fn new() -> Result<(EventLoop<'static, Host>, Host), WindowError> {
+    /// Connect to Wayland and bind the globals. The host stays resident with zero windows; the
+    /// caller drives the returned loop (the daemon inserts its own sources through
+    /// [`EventLoop::handle`]) and calls [`Host::reap`] after each dispatch.
+    pub(crate) fn new() -> Result<(EventLoop<'static, Host>, Host), WindowError> {
         let conn = Connection::connect_to_env().map_err(wl)?;
         let (globals, queue) = registry_queue_init::<Host>(&conn).map_err(wl)?;
         let qh = queue.handle();
@@ -154,12 +161,14 @@ impl Host {
         Ok((event_loop, host))
     }
 
-    /// Open one toplevel running `argv` on a new PTY. Standalone opens exactly one.
-    pub(super) fn open_window(
+    /// Open one toplevel running `argv` with environment `env` on a new PTY; returns the window
+    /// id and the child (root) pid. Standalone opens exactly one.
+    pub(crate) fn open_window(
         &mut self,
         cfg: &Config,
         argv: Vec<OsString>,
-    ) -> Result<TermId, WindowError> {
+        env: Vec<(OsString, OsString)>,
+    ) -> Result<(TermId, u32), WindowError> {
         let id = TermId(self.next_id);
         self.next_id += 1;
         let qh = &self.qh;
@@ -191,7 +200,7 @@ impl Host {
         let pty = Pty::spawn(&SpawnSpec {
             argv,
             cwd: cfg.cwd.clone(),
-            env: crucible_term_core::pty::inherited_env(),
+            env,
             size: (cfg.cols, cfg.rows),
         })
         .map_err(WindowError::Pty)?;
@@ -302,14 +311,33 @@ impl Host {
                 },
             );
         }
+        let root_pid = term.pty.pid();
         self.routes.insert(surface_id, id);
         self.terms.insert(id, term);
-        Ok(id)
+        Ok((id, root_pid))
+    }
+
+    /// Ask window `id` to close, as the compositor's close request does: the next [`Host::reap`]
+    /// removes it and SIGHUPs its child with the close grace.
+    pub(crate) fn close(&mut self, id: TermId) {
+        if let Some(t) = self.terms.get_mut(&id) {
+            t.close_requested = true;
+        }
+    }
+
+    /// Take the exit codes recorded since the last call.
+    pub(crate) fn drain_exits(&mut self) -> Vec<(TermId, i32)> {
+        std::mem::take(&mut self.exits).into_iter().collect()
+    }
+
+    /// No window open and no child in its close grace.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.terms.is_empty() && self.closing == 0
     }
 
     /// Remove every window whose child exited or that was asked to close. A closed window's
     /// surface goes at once; its child is reaped asynchronously ([`Host::begin_grace`]).
-    fn reap(&mut self) {
+    pub(crate) fn reap(&mut self) {
         let done: Vec<TermId> = self
             .terms
             .iter()
@@ -344,9 +372,23 @@ impl Host {
         let r =
             self.handle
                 .insert_source(Timer::from_duration(Duration::ZERO), move |_, _, host| {
-                    match grace_step(pty.try_wait(), Instant::now(), deadline) {
+                    let status = pty.try_wait();
+                    let exited = matches!(status, Ok(Some(_)));
+                    match grace_step(status, Instant::now(), deadline) {
                         Grace::Wait => TimeoutAction::ToDuration(CLOSE_POLL),
                         Grace::Done(code) => {
+                            if !exited {
+                                // Past the deadline: SIGKILL and reap at once, so a long-lived
+                                // daemon keeps no zombie. The recorded code stays 128 + 1.
+                                if let Some(pid) = rustix::process::Pid::from_raw(pty.pid() as i32)
+                                {
+                                    let _ = rustix::process::kill_process(
+                                        pid,
+                                        rustix::process::Signal::KILL,
+                                    );
+                                }
+                                let _ = pty.wait();
+                            }
                             host.exits.insert(id, code);
                             host.closing -= 1;
                             TimeoutAction::Drop

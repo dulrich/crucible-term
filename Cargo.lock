@@ -132,6 +132,7 @@ version = "0.2.0"
 dependencies = [
  "crucible-term-core",
  "kdl",
+ "libc",
  "rustix",
  "smithay-client-toolkit",
  "swash",

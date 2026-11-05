@@ -14,6 +14,8 @@
 //! pad 6 6                                  // logical px, 0-10000 each; default 2 2
 //! center                                   // optional: centre the grid in the spare pixels
 //! cursor shape="block" blink=#false        // block | underline | beam
+//! mode "standalone"                        // standalone | daemon | auto (default standalone)
+//! daemon-linger 0                          // daemon idle-exit seconds; 0 = stay resident
 //! ```
 //!
 //! **Errors never stop the terminal.** A whole-file syntax error prints one
@@ -60,6 +62,10 @@ pub struct Settings {
     pub cursor_shape: CursorKind,
     /// Initial cursor blink.
     pub cursor_blink: bool,
+    /// How `cterm` (no subcommand) runs its window: in-process, through the daemon, or `auto`.
+    pub mode: RunMode,
+    /// Daemon idle-exit timeout in seconds with no windows and no clients; 0 = stay resident.
+    pub daemon_linger: u64,
 }
 
 impl Default for Settings {
@@ -73,8 +79,41 @@ impl Default for Settings {
             center: false,
             cursor_shape: CursorKind::Block,
             cursor_blink: false,
+            mode: RunMode::Standalone,
+            daemon_linger: 0,
         }
     }
+}
+
+/// The `mode` config key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunMode {
+    /// One window in this process (phase-1 behaviour, the default).
+    Standalone,
+    /// A thin client of the per-user daemon.
+    Daemon,
+    /// The daemon only when the spawn carries `CRUCIBLE_WINDOW_GRANT`, else standalone.
+    Auto,
+}
+
+fn set_mode(s: &mut Settings, v: &str) -> Result<(), String> {
+    s.mode = match v {
+        "standalone" => RunMode::Standalone,
+        "daemon" => RunMode::Daemon,
+        "auto" => RunMode::Auto,
+        _ => return Err(format!("mode {v:?}: expected standalone|daemon|auto")),
+    };
+    Ok(())
+}
+
+fn set_linger(s: &mut Settings, n: f64) -> Result<(), String> {
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > f64::from(u32::MAX) {
+        return Err(format!(
+            "daemon-linger {n}: expected a non-negative integer of seconds"
+        ));
+    }
+    s.daemon_linger = n as u64;
+    Ok(())
 }
 
 /// Largest accepted scrollback.
@@ -202,6 +241,14 @@ pub fn parse(file: &str, src: &str, s: &mut Settings, warns: &mut Vec<String>) {
                 _ => w(node, "pad: expected two integers <x> <y>".into()),
             },
             "center" => s.center = true,
+            "mode" => match pos(0).and_then(KdlValue::as_string) {
+                Some(m) => set_mode(s, m).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "mode: expected standalone|daemon|auto".into()),
+            },
+            "daemon-linger" => match pos(0).and_then(num) {
+                Some(n) => set_linger(s, n).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "daemon-linger: expected seconds".into()),
+            },
             "cursor" => {
                 if let Some(v) = node.get("shape") {
                     match v.as_string() {
@@ -396,6 +443,8 @@ fn apply_key(s: &mut Settings, key: &str, val: &str) -> Result<(), String> {
             Ok(())
         }
         "cursor.shape" | "cursor.style" => set_shape(s, val),
+        "mode" => set_mode(s, val),
+        "daemon-linger" => set_linger(s, float()?),
         "cursor.blink" => {
             s.cursor_blink = parse_bool(val).ok_or("cursor.blink: expected true|false|yes|no")?;
             Ok(())

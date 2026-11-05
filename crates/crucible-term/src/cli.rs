@@ -1,7 +1,8 @@
 //! The command line CDE spawns the terminal through: a pure parser over the argument vector.
 //!
 //! ```text
-//! cterm [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
+//! cterm [--standalone] [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
+//! cterm daemon [--help]
 //! ```
 //!
 //! Everything after `-e` is the child's argv, verbatim (CDE's `exec-flag`), so `--help` after
@@ -13,7 +14,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The usage text (`--help` prints it on stdout; errors print it on stderr).
-pub const USAGE: &str = "usage: cterm [OPTIONS] [-e CMD [ARG]...]\n\nOpen a terminal window running CMD (default: $SHELL, fallback /bin/sh); the exit status is\nthe child's (128 + signal when killed).\n\n  -e CMD [ARG]...          run CMD with its arguments; everything after -e is the argv\n  --working-directory DIR  start the child in DIR (a missing DIR warns and uses the current dir)\n  -o, --override KEY=VAL   override a config key (repeatable), e.g. -o pad=6x6\\ center\n                           -o font=Mono:size=12 -o colors.alpha=0.9 -o scrollback=5000\n  --app-id ID              xdg app id (default crucible-term)\n  --title TITLE            initial window title (the child can still change it)\n  --build                  print the tool-scoped build id (40-hex commit, `-dirty` if modified)\n  --version                print `cterm <semver> (<build id>)`\n  -h, --help               print this usage and exit 0\n\nConfig: $XDG_CONFIG_HOME/crucible-term/config.kdl (fallback ~/.config/crucible-term/config.kdl).\n";
+pub const USAGE: &str = "usage: cterm [OPTIONS] [-e CMD [ARG]...]\n\nOpen a terminal window running CMD (default: $SHELL, fallback /bin/sh); the exit status is\nthe child's (128 + signal when killed).\n\n  -e CMD [ARG]...          run CMD with its arguments; everything after -e is the argv\n  --working-directory DIR  start the child in DIR (a missing DIR warns and uses the current dir)\n  -o, --override KEY=VAL   override a config key (repeatable), e.g. -o pad=6x6\\ center\n                           -o font=Mono:size=12 -o colors.alpha=0.9 -o scrollback=5000\n  --app-id ID              xdg app id (default crucible-term)\n  --title TITLE            initial window title (the child can still change it)\n  --standalone             run this window in-process even when config `mode` is daemon/auto\n  --build                  print the tool-scoped build id (40-hex commit, `-dirty` if modified)\n  --version                print `cterm <semver> (<build id>)`\n  -h, --help               print this usage and exit 0\n\nSubcommands:\n  daemon                   run the per-user window daemon (see `cterm daemon --help`)\n\nConfig: $XDG_CONFIG_HOME/crucible-term/config.kdl (fallback ~/.config/crucible-term/config.kdl).\n";
+
+/// The `cterm daemon --help` text.
+pub const DAEMON_USAGE: &str = "usage: cterm daemon [-h | --help]\n\nRun the per-user crucible-term daemon in the foreground: it owns the PTYs and windows of every\n`cterm` thin client on this Wayland display. Clients start it on demand (config `mode daemon`,\nor `auto` with a CDE grant); running it by hand is only needed for debugging.\n\nSocket: $XDG_RUNTIME_DIR/cterm/<WAYLAND_DISPLAY basename>.sock (lock: the sibling .lock).\nLog:    $XDG_STATE_HOME/crucible-term/daemon.log when started by a client.\nIt stays resident after its last window; config `daemon-linger N` exits after N idle seconds.\nIt exits when its Wayland connection is lost; killing it closes every window.\n";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +30,10 @@ pub enum Parsed {
     Version,
     /// Open a window.
     Run(Cli),
+    /// Run the daemon (`cterm daemon`).
+    Daemon,
+    /// Print [`DAEMON_USAGE`] and exit 0.
+    DaemonHelp,
 }
 
 /// The options of a window run.
@@ -41,6 +49,8 @@ pub struct Cli {
     pub app_id: Option<String>,
     /// `--title`.
     pub title: Option<String>,
+    /// `--standalone`: force the in-process mode.
+    pub standalone: bool,
 }
 
 /// A command-line mistake; the message is one line without the `crucible-term:` prefix.
@@ -57,6 +67,19 @@ impl std::error::Error for CliError {}
 
 /// Parse the arguments after `argv[0]`.
 pub fn parse(args: Vec<OsString>) -> Result<Parsed, CliError> {
+    // `daemon` is a subcommand only as the first argument.
+    if args.first().is_some_and(|a| a == "daemon") {
+        return match args.get(1).and_then(|a| a.to_str()) {
+            None => Ok(Parsed::Daemon),
+            Some("-h" | "--help") if args.len() == 2 => Ok(Parsed::DaemonHelp),
+            Some("--build") if args.len() == 2 => Ok(Parsed::Build),
+            Some("--version") if args.len() == 2 => Ok(Parsed::Version),
+            _ => Err(CliError(format!(
+                "daemon: unexpected argument {:?}",
+                args[1]
+            ))),
+        };
+    }
     let mut cli = Cli::default();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -99,6 +122,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Parsed, CliError> {
             }
             "--app-id" => cli.app_id = Some(text(value(&mut it)?, flag)?),
             "--title" => cli.title = Some(text(value(&mut it)?, flag)?),
+            "--standalone" if inline.is_none() => cli.standalone = true,
             _ => return Err(CliError(format!("unknown argument {a:?}"))),
         }
     }
@@ -177,5 +201,16 @@ mod tests {
         assert!(p(&["-o"]).is_err());
         assert!(p(&["--help=1"]).is_err());
         assert!(p(&["stray"]).is_err());
+    }
+
+    #[test]
+    fn daemon_subcommand_and_standalone_flag() {
+        assert_eq!(p(&["daemon"]), Ok(Parsed::Daemon));
+        assert_eq!(p(&["daemon", "--help"]), Ok(Parsed::DaemonHelp));
+        assert!(p(&["daemon", "x"]).is_err());
+        // Only the first argument can be the subcommand.
+        assert!(p(&["--title", "t", "daemon"]).is_err());
+        assert!(run(&["--standalone"]).standalone);
+        assert_eq!(run(&["-e", "daemon"]).exec.unwrap(), ["daemon"]);
     }
 }

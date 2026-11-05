@@ -14,7 +14,9 @@ mod input;
 mod routing;
 mod term;
 
+pub(crate) use host::Host;
 pub use host::run;
+pub(crate) use routing::TermId;
 
 use crate::config::Settings;
 

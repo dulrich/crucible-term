@@ -3,13 +3,16 @@
 //! line is in [`cli`], the KDL configuration and `-o` overrides in [`config`].
 
 mod cli;
+mod client;
 mod clipboard;
 mod config;
+mod daemon;
 mod font;
 mod outbox;
 mod render;
 mod selection;
 mod window;
+mod wire;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -60,6 +63,11 @@ fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
+        Ok(cli::Parsed::DaemonHelp) => {
+            print!("{}", cli::DAEMON_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Daemon) => return daemon::run(),
         Ok(cli::Parsed::Run(c)) => c,
         Err(e) => {
             eprintln!("crucible-term: {e}\n{}", cli::USAGE);
@@ -80,16 +88,38 @@ fn main() -> ExitCode {
         cwd: working_directory(cli.working_directory),
         ..window::Config::default()
     };
-    if let Some(id) = cli.app_id {
-        cfg.app_id = id;
+    if let Some(id) = &cli.app_id {
+        cfg.app_id = id.clone();
     }
-    if let Some(t) = cli.title {
-        cfg.title = t;
+    if let Some(t) = &cli.title {
+        cfg.title = t.clone();
     }
     let argv = cli
         .exec
         .unwrap_or_else(|| vec![shell(std::env::var_os("SHELL"))]);
-    match window::run(&cfg, argv) {
+    // The grant is for this spawn only: no child environment ever carries it.
+    let grant = std::env::var_os(client::GRANT_VAR).map(|g| g.to_string_lossy().into_owned());
+    let env = client::strip_grant(crucible_term_core::pty::inherited_env());
+    if client::route(cfg.settings.mode, grant.is_some(), cli.standalone) == client::Route::Daemon {
+        let open = wire::Open {
+            argv: argv.clone(),
+            cwd: cfg.cwd.clone(),
+            env: env.clone(),
+            overrides: cli.overrides,
+            app_id: cli.app_id,
+            title: cli.title,
+            grant,
+        };
+        match client::run(open) {
+            client::Outcome::Exit(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            client::Outcome::Failed(e) => {
+                eprintln!("crucible-term: daemon: {e}");
+                return ExitCode::from(1);
+            }
+            client::Outcome::Fallback(w) => eprintln!("crucible-term: {w}; running standalone"),
+        }
+    }
+    match window::run(&cfg, argv, env) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("crucible-term: {e}");
