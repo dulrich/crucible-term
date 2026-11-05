@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=cterm
+GenericName=Terminal
+Comment=CDE's terminal emulator (crucible-term)
+Exec=cterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;terminal;
+StartupWMClass=crucible-term

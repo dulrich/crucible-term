@@ -1,7 +1,7 @@
 //! The command line CDE spawns the terminal through: a pure parser over the argument vector.
 //!
 //! ```text
-//! crucible-term [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
+//! cterm [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
 //! ```
 //!
 //! Everything after `-e` is the child's argv, verbatim (CDE's `exec-flag`), so `--help` after
@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The usage text (`--help` prints it on stdout; errors print it on stderr).
-pub const USAGE: &str = "usage: crucible-term [OPTIONS] [-e CMD [ARG]...]\n\nOpen a terminal window running CMD (default: $SHELL, fallback /bin/sh); the exit status is\nthe child's (128 + signal when killed).\n\n  -e CMD [ARG]...          run CMD with its arguments; everything after -e is the argv\n  --working-directory DIR  start the child in DIR (a missing DIR warns and uses the current dir)\n  -o, --override KEY=VAL   override a config key (repeatable), e.g. -o pad=6x6\\ center\n                           -o font=Mono:size=12 -o colors.alpha=0.9 -o scrollback=5000\n  --app-id ID              xdg app id (default crucible-term)\n  --title TITLE            initial window title (the child can still change it)\n  --build                  print the tool-scoped build id (40-hex commit, `-dirty` if modified)\n  --version                print `crucible-term <semver> (<build id>)`\n  -h, --help               print this usage and exit 0\n\nConfig: $XDG_CONFIG_HOME/crucible-term/config.kdl (fallback ~/.config/crucible-term/config.kdl).\n";
+pub const USAGE: &str = "usage: cterm [OPTIONS] [-e CMD [ARG]...]\n\nOpen a terminal window running CMD (default: $SHELL, fallback /bin/sh); the exit status is\nthe child's (128 + signal when killed).\n\n  -e CMD [ARG]...          run CMD with its arguments; everything after -e is the argv\n  --working-directory DIR  start the child in DIR (a missing DIR warns and uses the current dir)\n  -o, --override KEY=VAL   override a config key (repeatable), e.g. -o pad=6x6\\ center\n                           -o font=Mono:size=12 -o colors.alpha=0.9 -o scrollback=5000\n  --app-id ID              xdg app id (default crucible-term)\n  --title TITLE            initial window title (the child can still change it)\n  --build                  print the tool-scoped build id (40-hex commit, `-dirty` if modified)\n  --version                print `cterm <semver> (<build id>)`\n  -h, --help               print this usage and exit 0\n\nConfig: $XDG_CONFIG_HOME/crucible-term/config.kdl (fallback ~/.config/crucible-term/config.kdl).\n";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]

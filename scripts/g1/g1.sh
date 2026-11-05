@@ -22,7 +22,7 @@ Measure each subject (`crucible-term`, `foot`), back-to-back in the order given,
 Scratch lives in /tmp/cde-g1-<subject> (removed at exit); artifacts under target/g1/. Only pids recorded by this
 script are ever signalled; nothing is started against the live session directly.
 
-Environment (defaults): G1_CRUCIBLE (crucible-dev-env/target/release/crucible), G1_CT (target/release/crucible-term),
+Environment (defaults): G1_CRUCIBLE (crucible-dev-env/target/release/crucible), G1_CT (target/release/cterm),
 G1_FOOT (~/.local/bin/foot), G1_FOOT_INI (~/.config/foot/foot.ini), G1_CORPUS (crucible-dev-env/target/spike-core/corpus),
 G1_GAP (10), G1_PARENT_WL (/run/user/1001/wayland-1), G1_RUNS (5), G1_IDLE_S (60), G1_WAIT_S (120, per throughput run).
 Bash reasons: arrays for argv, process substitution, trap cleanup.
@@ -43,7 +43,7 @@ HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
 CDE=crucible-dev-env
 BIN=${G1_CRUCIBLE:-$CDE/target/release/crucible}
-CT=${G1_CT:-$R/target/release/crucible-term}
+CT=${G1_CT:-$R/target/release/cterm}
 FOOT=${G1_FOOT:-$HOME/.local/bin/foot}
 FOOT_INI=${G1_FOOT_INI:-$HOME/.config/foot/foot.ini}
 CORPUS=${G1_CORPUS:-$CDE/target/spike-core/corpus}

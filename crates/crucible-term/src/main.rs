@@ -1,4 +1,4 @@
-//! `crucible-term`: CDE's terminal emulator. It opens a Wayland window running `-e <cmd>` (or
+//! `cterm` (crate `crucible-term`): CDE's terminal emulator. It opens a Wayland window running `-e <cmd>` (or
 //! `$SHELL`, fallback `/bin/sh`) on a PTY and exits with the child's exit status. The command
 //! line is in [`cli`], the KDL configuration and `-o` overrides in [`config`].
 
@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 /// The `--version` line, in the `"version": "semver"` format the fleet help gate matches.
 fn version_line(version: &str, build_id: &str) -> String {
-    format!("crucible-term {version} ({build_id})")
+    format!("cterm {version} ({build_id})")
 }
 
 /// The shell to run: `$SHELL` if set and non-empty, else `/bin/sh`.
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn version_line_has_the_semver_gate_shape() {
-        assert_eq!(version_line("0.0.0", "abc"), "crucible-term 0.0.0 (abc)");
+        assert_eq!(version_line("0.0.0", "abc"), "cterm 0.0.0 (abc)");
     }
 
     #[test]

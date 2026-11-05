@@ -2,12 +2,12 @@
 
 The terminal for Crucible Dev Env (CDE): a Rust Wayland terminal built on the rio-vt core, with a fast CPU renderer and light resource use. It is designed to grow into a per-user daemon whose sessions survive window loss and can be attached to from other hosts.
 
-Status: plan 01 (the per-window terminal) is in progress. The roadmap is in [`plans/00-roadmap.md`](plans/00-roadmap.md).
+The executable is `cterm` (the crate and project are `crucible-term`). Status: plan 01 (the per-window terminal) is implemented as 0.1.0; the executable was renamed to `cterm` in 0.2.0. The roadmap is in [`plans/00-roadmap.md`](plans/00-roadmap.md).
 
 ## Usage
 
 ```
-crucible-term [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
+cterm [--working-directory DIR] [-o KEY=VALUE]... [--app-id ID] [--title T] [-e CMD [ARG]...]
 ```
 
 - `-e CMD [ARG]...` runs CMD; everything after `-e` is the child's argv, verbatim. Without it the window runs `$SHELL` (fallback `/bin/sh`).
@@ -57,11 +57,11 @@ A broken file never stops the terminal: each problem prints one `crucible-term: 
 CDE spawns the terminal directly (no shell) as `[terminal, <terminal-args…>, <exec-flag>, <cmd…>]` and sets the working directory itself. In `the private config repo/cde/config-<host>.kdl`:
 
 ```kdl
-terminal "~/.local/bin/crucible-term" exec-flag="-e"
+terminal "~/.local/bin/cterm" exec-flag="-e"
 ```
 
-with the existing `terminal-args "-o" "pad={gap}x{gap} center"` unchanged. Switching CDE to crucible-term is the user's decision after the G1 measurement against foot.
+with the existing `terminal-args "-o" "pad={gap}x{gap} center"` unchanged. Switching CDE to cterm is the user's decision.
 
 ## Deploy
 
-`scripts/deploy.sh <host-a|host-b|all>` builds the release binary, installs `~/.local/bin/crucible-term` (keeping `crucible-term.prev`), syncs the other host by git bundle (a first deploy clones the repo there), and prints `RESULT: <host> crucible-term <version> (<build-id>)`. It never pushes and never restarts CDE.
+`scripts/deploy.sh <host-a|host-b|all>` builds the release binary, installs `~/.local/bin/cterm` (keeping `cterm.prev`, and removing a binary left under the old name `crucible-term`), installs the launcher entry `share/cterm.desktop` into `~/.local/share/applications` (CDE's `Super+Return` launcher lists it as a TERM row), syncs the other host by git bundle (a first deploy clones the repo there), and prints `RESULT: <host> cterm <version> (<build-id>)`. It never pushes and never restarts CDE.

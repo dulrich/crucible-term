@@ -128,7 +128,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crucible-term-core",
  "kdl",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-term-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cursor-icon",
  "libc",

@@ -4,6 +4,20 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.2.0 — 2026-11-05
+
+### Changed
+
+- The executable is now `cterm` (the crate and project stay `crucible-term`; the config path, app id and stderr prefix are unchanged). `--help` and `--version` name `cterm`. `scripts/deploy.sh` installs `~/.local/bin/cterm` and removes a binary left under the old name. A CDE config pointing at `crucible-term` must point at `cterm` instead.
+
+### Added
+
+- Launcher entry `share/cterm.desktop` (`Categories=System;TerminalEmulator;`), installed by `scripts/deploy.sh` into `~/.local/share/applications`, so CDE's program launcher (`Super+Return`) lists `cterm` as a TERM row.
+
+### G1
+
+- The user accepted the measured part of G1 despite the memory miss (PSS +60% vs foot, limit +25%); the roadmap continues.
+
 ## 0.1.0 — 2026-11-05
 
 ### Added

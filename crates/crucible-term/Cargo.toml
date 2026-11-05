@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "cterm"
+path = "src/main.rs"
+
 [dependencies]
 crucible-term-core.workspace = true
 rustix.workspace = true
