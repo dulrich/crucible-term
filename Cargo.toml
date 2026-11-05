@@ -51,3 +51,12 @@ all = { level = "warn", priority = -1 }
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_docs = "warn"
+
+# Release: whole-program LTO in one codegen unit (smaller text, measured in plan 02 WP-9).
+# `panic = "abort"`: no crate uses `catch_unwind`, no thread is joined for its panic, and the
+# only `Drop` (fontconfig `FcFini`) has no effect that outlives the process; PTY child reaping
+# and SIGHUP are explicit (`App::close`), not drop-driven.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

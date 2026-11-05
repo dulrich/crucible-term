@@ -9,6 +9,7 @@
 //! ([`CompositorHandler::frame`]) draws again only if new damage arrived meanwhile. With no
 //! PTY output and no blink the loop blocks in `dispatch(None)`: no timers, idle CPU ~0.
 
+mod damage;
 mod input;
 
 use crate::config::Settings;
@@ -34,7 +35,7 @@ use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
-use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
+use smithay_client_toolkit::shm::slot::{Buffer, Slot, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
     delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_shm,
@@ -207,6 +208,7 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         shm,
         pool,
         buffers: Vec::new(),
+        frames: damage::FrameLog::default(),
         window,
         viewport,
         has_fractional: fractional.is_some(),
@@ -230,7 +232,6 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         scale: 1.0,
         int_scale: 1,
         buf: (0, 0),
-        image: Vec::new(),
         configured: false,
         dirty: false,
         full: true,
@@ -244,7 +245,6 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         exit: None,
         mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
         mem_first: true,
-        noimage_debug: std::env::var_os("CTERM_DEBUG_NOIMAGE").is_some_and(|v| v == "1"),
     };
     app.apply_cursor_defaults();
     if app.mem_debug {
@@ -288,7 +288,11 @@ pub struct App {
     output: OutputState,
     shm: Shm,
     pool: SlotPool,
-    buffers: Vec<Buffer>,
+    /// Live shm buffers, oldest first, each with the number of the frame it holds (`None`:
+    /// never painted). The paint target is the buffer itself; there is no frame image.
+    buffers: Vec<(Buffer, Option<u64>)>,
+    /// Committed-frame numbering and the last frame's damage, for buffer-age repair.
+    frames: damage::FrameLog,
     window: Window,
     viewport: Option<WpViewport>,
     _fractional: Option<WpFractionalScaleV1>,
@@ -315,9 +319,6 @@ pub struct App {
     has_fractional: bool,
     /// Buffer size in pixels.
     buf: (u32, u32),
-    /// The persistent frame image; damage-limited paint updates it, then it is copied whole
-    /// into whichever shm buffer is free (so either buffer is always fully up to date).
-    image: Vec<u32>,
     configured: bool,
     dirty: bool,
     full: bool,
@@ -333,14 +334,50 @@ pub struct App {
     /// `CTERM_DEBUG_MEM=1`: print memory attribution to stderr (first frame, then 4 s idle).
     mem_debug: bool,
     mem_first: bool,
-    /// Debug-only (`CTERM_DEBUG_NOIMAGE=1`, measurement of the "no persistent frame image" reduction): every frame is a full
-    /// repaint into a transient image that is freed right after the shm copy. Off by default; not a product behaviour.
-    noimage_debug: bool,
 }
 
 fn exit_code(s: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+}
+
+/// Copy full-width bands of rows (`(y, height)`, `stride` bytes per row) from one slot of the
+/// pool to another, one row at a time through a row-sized scratch (the two slots share one
+/// mapping, so they cannot be borrowed together; a frame-sized temporary would be the frame
+/// image again). The source may still be held by the compositor: it is only read.
+fn copy_bands(
+    pool: &mut SlotPool,
+    src: &Slot,
+    dst: &Slot,
+    stride: usize,
+    bands: &[(usize, usize)],
+) {
+    let mut row = vec![0u8; stride];
+    for &(y, h) in bands {
+        for r in y..y + h {
+            let at = r * stride;
+            let Some(s) = pool.raw_data_mut(src).get(at..at + stride) else {
+                break;
+            };
+            row.copy_from_slice(s);
+            let Some(d) = pool.raw_data_mut(dst).get_mut(at..at + stride) else {
+                break;
+            };
+            d.copy_from_slice(&row);
+        }
+    }
+}
+
+/// View a shm canvas as `Argb8888` pixels. The format is little-endian, so on a little-endian
+/// host a native `u32` is the wire layout; big-endian hosts are not supported (no draw).
+fn as_pixels(bytes: &mut [u8]) -> Option<&mut [u32]> {
+    if cfg!(target_endian = "big") {
+        return None;
+    }
+    // SAFETY: every bit pattern is a valid `u32`; `align_to_mut` only yields the aligned middle.
+    #[allow(unsafe_code)]
+    let (head, px, tail) = unsafe { bytes.align_to_mut::<u32>() };
+    (head.is_empty() && tail.is_empty()).then_some(px)
 }
 
 impl App {
@@ -506,8 +543,8 @@ impl App {
         );
         if buf != self.buf {
             self.buf = buf;
-            self.image = vec![0; (buf.0 * buf.1) as usize];
             self.buffers.clear();
+            self.frames.reset();
         }
         let m: Metrics = self.fonts.metrics();
         let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.base_pad());
@@ -566,13 +603,44 @@ impl App {
         // Scrolled back: damage rows are screen rows, not viewport rows, so repaint everything.
         let scrolled = self.session.display_offset() > 0;
         let grid = self.session.viewport();
-        let rows = if self.full || scrolled {
+        let mut rows = if self.full || scrolled {
             None
         } else {
             render::rows_to_paint(&damage, self.last_cursor, grid.cursor.1)
         };
         self.full = false;
         self.last_cursor = Some(grid.cursor.1);
+        if rows.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        // Paint target: a free shm buffer, first brought up to the last committed frame.
+        let Some((buffer, held)) = self.free_buffer() else {
+            eprintln!("crucible-term: no shm buffer available");
+            self.dirty = true;
+            self.full = true;
+            return;
+        };
+        let (w, h) = (self.buf.0 as usize, self.buf.1 as usize);
+        let current = self.frames.current();
+        let source = self
+            .buffers
+            .iter()
+            .find(|(_, f)| *f == Some(current))
+            .map(|(b, _)| b.slot());
+        match self.frames.repair(held, source.is_some()) {
+            damage::Repair::Nothing => {}
+            damage::Repair::Repaint => rows = None,
+            damage::Repair::Bands(bands) => {
+                if let Some(src) = &source {
+                    copy_bands(&mut self.pool, src, &buffer.slot(), w * 4, &bands);
+                }
+            }
+            damage::Repair::All => {
+                if let Some(src) = &source {
+                    copy_bands(&mut self.pool, src, &buffer.slot(), w * 4, &[(0, h)]);
+                }
+            }
+        }
         // Fallback fonts for new text: the only I/O around a frame, kept outside `paint`.
         for r in rows.clone().unwrap_or_else(|| (0..grid.rows).collect()) {
             if let Some(row) = grid.screen.get(r) {
@@ -590,17 +658,20 @@ impl App {
             focused: self.focused,
             blink_on: self.blink_on,
         };
-        let (w, h) = (self.buf.0 as usize, self.buf.1 as usize);
-        if self.noimage_debug && self.image.len() != w * h {
-            self.image = vec![0; w * h];
-        }
         let pad = self.pad_px();
         let top = self.session.viewport_top();
         let sel = self.inp.selection.as_ref();
         let selected = |r: usize, c: usize| sel.is_some_and(|s| s.contains(top + r, c));
+        let Some(px) = buffer.canvas(&mut self.pool).and_then(as_pixels) else {
+            eprintln!("crucible-term: shm buffer not drawable");
+            self.buffers.push((buffer, None));
+            self.dirty = true;
+            self.full = true;
+            return;
+        };
         let bands = render::paint(
             &mut Canvas {
-                px: &mut self.image,
+                px,
                 width: w,
                 height: h,
             },
@@ -613,24 +684,13 @@ impl App {
             sel.is_some().then_some(&selected as render::Selected<'_>),
         );
         if bands.is_empty() {
+            // Nothing painted, but the repair above brought the buffer up to the current frame.
+            self.buffers
+                .push((buffer, Some(current).filter(|&c| c > 0)));
             return;
-        }
-        let Some(buffer) = self.free_buffer() else {
-            eprintln!("crucible-term: no shm buffer available");
-            self.dirty = true;
-            return;
-        };
-        if let Some(canvas) = self.pool.canvas(&buffer) {
-            for (dst, src) in canvas.chunks_exact_mut(4).zip(&self.image) {
-                dst.copy_from_slice(&src.to_le_bytes());
-            }
-        }
-        if self.noimage_debug {
-            self.image = Vec::new();
-            self.full = true;
         }
         let surface = self.window.wl_surface().clone();
-        for (y, bh) in bands {
+        for &(y, bh) in &bands {
             surface.damage_buffer(0, y as i32, w as i32, bh as i32);
         }
         surface.frame(&self.qh, surface.clone());
@@ -639,7 +699,8 @@ impl App {
         }
         self.window.commit();
         self.frame_pending = true;
-        self.buffers.push(buffer);
+        let n = self.frames.commit(bands);
+        self.buffers.push((buffer, Some(n)));
         if self.buffers.len() > 2 {
             self.buffers.remove(0);
         }
@@ -653,9 +714,13 @@ impl App {
     fn print_mem(&self, when: &str) {
         let (faces, emoji, nfaces, nshapes, nglyphs, gbytes) = self.fonts.mem_stats();
         let (cols, rows) = self.session.size();
+        let buffer_bytes: usize = self
+            .buffers
+            .iter()
+            .map(|(b, _)| (b.height() * b.stride()) as usize)
+            .sum();
         eprintln!(
-            "crucible-term: mem: {when} image_bytes={} buf={}x{} pool_bytes={} live_buffers={}",
-            self.image.len() * 4,
+            "crucible-term: mem: {when} buffer_bytes={buffer_bytes} buf={}x{} pool_bytes={} live_buffers={}",
             self.buf.0,
             self.buf.1,
             self.pool.len(),
@@ -672,19 +737,20 @@ impl App {
         );
     }
 
-    /// A buffer the compositor has released, or a new one (double buffering: at most two live).
-    fn free_buffer(&mut self) -> Option<Buffer> {
+    /// A buffer the compositor has released, or a new one (double buffering: at most two live;
+    /// a third only while the compositor holds both). Returns it with the frame it holds.
+    fn free_buffer(&mut self) -> Option<(Buffer, Option<u64>)> {
         if let Some(i) = self
             .buffers
             .iter()
-            .position(|b| self.pool.canvas(b).is_some())
+            .position(|(b, _)| self.pool.canvas(b).is_some())
         {
             return Some(self.buffers.remove(i));
         }
         let (w, h) = (self.buf.0 as i32, self.buf.1 as i32);
         self.pool
             .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
-            .map(|(b, _)| b)
+            .map(|(b, _)| (b, None))
             .map_err(|e| eprintln!("crucible-term: create buffer: {e}"))
             .ok()
     }
