@@ -7,7 +7,7 @@
 use super::input::{self, SeatInput};
 use super::routing::{Routes, TermId};
 use super::term::{Term, exit_code};
-use super::{Config, WindowError, damage, wl};
+use super::{Config, WindowError, damage, lifecycle, wl};
 use crate::font::FontPool;
 use crate::outbox::Outbox;
 use crucible_term_core::Session;
@@ -76,6 +76,9 @@ pub struct Host {
     exits: BTreeMap<TermId, i32>,
     /// Closed windows whose child is still in its SIGHUP grace.
     closing: usize,
+    /// Host-wide pool for the 1×1 placeholder buffers suspended windows show (created lazily on
+    /// the first suspend, shared by all windows).
+    pub(super) tiny_pool: Option<SlotPool>,
 }
 
 /// One step of the close grace: the child's `try_wait` result at `now` against `deadline`.
@@ -157,6 +160,7 @@ impl Host {
             next_id: 1,
             exits: BTreeMap::new(),
             closing: 0,
+            tiny_pool: None,
         };
         Ok((event_loop, host))
     }
@@ -298,6 +302,14 @@ impl Host {
             close_requested: false,
             mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
             mem_first: true,
+            life: lifecycle::Lifecycle::default(),
+            draining: Vec::new(),
+            drain_timer: false,
+            tiny: None,
+            sum_debug: std::env::var_os("CTERM_DEBUG_FRAME_SUM").is_some_and(|v| v == "1"),
+            sum_full_pending: false,
+            commits: 0,
+            force_present: false,
         };
         term.apply_cursor_defaults();
         if term.mem_debug {
@@ -499,6 +511,28 @@ impl WindowHandler for Host {
             t.arm_blink();
         }
         t.configured = true;
+        // `suspended` transitions (never taken on a compositor that does not send it). sctk has
+        // already acked this configure, so the commits below follow the ack. Suspend runs before
+        // the relayout (whose draw is then a no-op); resume clears the stale frame-pending
+        // before it, so the relayout's draw repaints and commits the whole grid right here.
+        match t
+            .life
+            .transition(configure.state.contains(WindowState::SUSPENDED))
+        {
+            lifecycle::Transition::Suspend => {
+                if self.tiny_pool.is_none() {
+                    match SlotPool::new(4096, &self.shm) {
+                        Ok(p) => self.tiny_pool = Some(p),
+                        Err(e) => eprintln!("crucible-term: placeholder pool: {e}"),
+                    }
+                }
+                if let Some(tiny) = self.tiny_pool.as_mut() {
+                    t.suspend(tiny, &self.shm);
+                }
+            }
+            lifecycle::Transition::Resume => t.resume(),
+            lifecycle::Transition::None => {}
+        }
         t.relayout(&mut self.fonts);
     }
 }

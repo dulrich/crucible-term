@@ -504,3 +504,44 @@ fn centered_splits_the_spare_pixels() {
         Pad { x: 2, y: 1 }
     );
 }
+
+/// The `CTERM_DEBUG_FRAME_SUM` checksum of an incrementally painted buffer equals the
+/// forced-full-repaint checksum of the same grid (what WP-8 compares after un-hiding).
+#[test]
+fn frame_sum_of_incremental_paint_equals_full_repaint() {
+    use crate::window::lifecycle::fnv1a64_px;
+    let mut f = fonts(false);
+    let mut s = Session::new(8, 2, 0);
+    s.feed(b"abc\r\ndef");
+    let m = f.metrics();
+    let (w, h) = (8 * m.cell_w as usize, 2 * m.cell_h as usize);
+    let theme = Theme::default();
+    let mut paint_into = |px: &mut [u32], g: &crucible_term_core::Grid, rows: Option<&[usize]>| {
+        paint(
+            &mut Canvas {
+                px,
+                width: w,
+                height: h,
+            },
+            g,
+            &theme,
+            &mut f,
+            0,
+            FOCUSED,
+            rows,
+            None,
+        );
+    };
+    let mut inc = vec![0u32; w * h];
+    let first = s.screen();
+    paint_into(&mut inc, &first, None);
+    let _ = s.take_damage();
+    s.feed(b"\x1b[1;1HXY");
+    let rows = rows_to_paint(&s.take_damage(), Some(first.cursor.1), s.cursor().1).expect("rows");
+    let next = s.screen();
+    paint_into(&mut inc, &next, Some(&rows));
+    let mut full = vec![0u32; w * h];
+    paint_into(&mut full, &next, None);
+    assert_eq!(fnv1a64_px(&inc), fnv1a64_px(&full));
+    assert_ne!(fnv1a64_px(&inc), fnv1a64_px(&vec![0u32; w * h]));
+}

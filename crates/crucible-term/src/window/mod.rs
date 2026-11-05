@@ -11,6 +11,7 @@
 mod damage;
 mod host;
 mod input;
+pub(crate) mod lifecycle;
 mod routing;
 mod term;
 
