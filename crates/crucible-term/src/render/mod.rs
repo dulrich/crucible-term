@@ -181,9 +181,24 @@ impl Band<'_, '_> {
     }
 }
 
+/// Which cells are selected: `(viewport row, column) -> bool`. Selected cells are painted with
+/// foreground and background swapped.
+pub type Selected<'a> = &'a dyn Fn(usize, usize) -> bool;
+
+/// The grid cell `(col, row)` under a pixel position (buffer pixels, padding aware), clamped to
+/// the `cols` x `rows` grid.
+pub fn cell_at(x: f64, y: f64, m: &Metrics, pad: u32, cols: usize, rows: usize) -> (usize, usize) {
+    let axis = |v: f64, cell: u32, n: usize| {
+        let c = ((v - f64::from(pad)) / f64::from(cell.max(1))).floor();
+        (c.max(0.0) as usize).min(n.saturating_sub(1))
+    };
+    (axis(x, m.cell_w, cols), axis(y, m.cell_h, rows))
+}
+
 /// Paint `grid` into `canvas`: every row when `rows` is `None` (padding too), otherwise only the
 /// listed rows (each repainted across the full canvas width, side padding included). Returns
 /// the repainted pixel bands as `(y, height)` for the window's buffer damage.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut Canvas<'_>,
     grid: &Grid,
@@ -192,6 +207,7 @@ pub fn paint(
     pad: u32,
     cursor: CursorDraw,
     rows: Option<&[usize]>,
+    selected: Option<Selected<'_>>,
 ) -> Vec<(usize, usize)> {
     let m = fonts.metrics();
     let bg = premul(theme.bg, theme.alpha);
@@ -216,6 +232,7 @@ pub fn paint(
         }
         let cur = (grid.cursor.1 == r).then_some(grid.cursor.0);
         let mut band = Band { c: canvas, y0, y1 };
+        let sel_row = |c: usize| selected.is_some_and(|f| f(r, c));
         paint_row(
             &mut band,
             &grid.screen[r].cells,
@@ -225,6 +242,7 @@ pub fn paint(
             pad,
             cur,
             cursor,
+            &sel_row,
         );
         bands.push((y0, y1 - y0));
     }
@@ -238,6 +256,13 @@ pub fn paint(
 struct CellColors {
     fg: Rgb,
     bg: Option<Rgb>,
+}
+
+/// Selection look: swap foreground and background (the default background when unset).
+fn invert(c: &mut CellColors, t: &Theme) {
+    let bg = c.bg.unwrap_or(t.bg);
+    c.bg = Some(c.fg);
+    c.fg = bg;
 }
 
 fn colors(cell: &Cell, t: &Theme) -> CellColors {
@@ -268,6 +293,7 @@ fn paint_row(
     pad: u32,
     cur: Option<usize>,
     cursor: CursorDraw,
+    sel: &dyn Fn(usize) -> bool,
 ) {
     let (cw, ch) = (i64::from(m.cell_w), i64::from(m.cell_h));
     let y = b.y0 as i64;
@@ -278,6 +304,9 @@ fn paint_row(
     for (x, cell) in cells.iter().enumerate() {
         let cx = i64::from(pad) + x as i64 * cw;
         let mut col = colors(cell, t);
+        if sel(x) {
+            invert(&mut col, t);
+        }
         if block && cur == Some(x) {
             col.bg = Some(t.cursor);
         }
@@ -292,6 +321,9 @@ fn paint_row(
         let cx = i64::from(pad) + x as i64 * cw;
         let span = if cell.width == Width::Wide { 2 } else { 1 };
         let mut col = colors(cell, t);
+        if sel(x) {
+            invert(&mut col, t);
+        }
         if block && cur == Some(x) {
             col.fg = col.bg.unwrap_or(t.bg);
         }

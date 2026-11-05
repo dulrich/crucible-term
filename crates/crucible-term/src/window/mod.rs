@@ -1,17 +1,22 @@
 //! The Wayland window: an sctk xdg-toplevel (server-side decorations requested, none drawn by
 //! us), `wl_shm` buffers from a `SlotPool`, frame-callback paced redraws, fractional scale
 //! through `wp_fractional_scale_v1` + `wp_viewporter` (integer `wl_output` scale otherwise),
-//! and the PTY master as a calloop source. Keyboard and pointer input are WP-3.
+//! and the PTY master as a calloop source. Keyboard, pointer, selection and clipboard are in
+//! [`input`]; all PTY writes go through [`App::send`] and its outbox.
 //!
 //! Frame pacing: [`App::request_redraw`] marks the window dirty; a frame is drawn only when
 //! dirty and no frame callback is outstanding ([`App::draw`]); the `wl_surface.frame` callback
 //! ([`CompositorHandler::frame`]) draws again only if new damage arrived meanwhile. With no
 //! PTY output and no blink the loop blocks in `dispatch(None)`: no timers, idle CPU ~0.
 
+mod input;
+
 use crate::font::{Fonts, Metrics};
+use crate::outbox::Outbox;
 use crate::render::{self, Canvas, CursorDraw, Theme};
+use crate::selection::{invalidated, merge_damage};
 use crucible_term_core::pty::{Pty, SpawnSpec};
-use crucible_term_core::{Event, Session};
+use crucible_term_core::{Damage, Event, Session};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
@@ -39,7 +44,7 @@ use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 use wayland_client::globals::{GlobalList, registry_queue_init};
 use wayland_client::protocol::{wl_output, wl_seat, wl_shm, wl_surface};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -194,6 +199,10 @@ pub fn run(cfg: &Config, argv: Vec<OsString>) -> Result<i32, WindowError> {
         cfg: cfg.clone(),
         session: Session::new(usize::from(cfg.cols), usize::from(cfg.rows), cfg.scrollback),
         pty,
+        outbox: Outbox::default(),
+        write_armed: false,
+        pending_damage: None,
+        inp: input::Input::new(&globals, &qh),
         fonts,
         theme: Theme::default(),
         logical,
@@ -255,6 +264,13 @@ pub struct App {
     cfg: Config,
     session: Session,
     pty: Pty,
+    /// Every byte for the child queues here (see [`App::send`]).
+    outbox: Outbox,
+    /// A writable-interest source is registered to drain the outbox.
+    write_armed: bool,
+    /// Damage taken from the core after PTY output, held until the next paint.
+    pending_damage: Option<Damage>,
+    inp: input::Input,
     fonts: Fonts,
     theme: Theme,
     /// Logical window size.
@@ -304,6 +320,7 @@ impl App {
     fn on_pty_readable(&mut self) {
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0;
+        let history_before = self.session.history_len();
         loop {
             match self.pty.read(&mut buf) {
                 Ok(0) => return self.child_gone(),
@@ -320,20 +337,34 @@ impl App {
             }
         }
         let replies = self.session.take_replies();
-        if !replies.is_empty()
-            && let Err(e) = self.pty.write_all(&replies)
-        {
-            eprintln!("crucible-term: pty write: {e}");
-        }
+        self.send(&replies);
         for ev in self.session.take_events() {
-            if let Event::Title(t) = ev {
-                self.window.set_title(if t.is_empty() {
+            match ev {
+                Event::Title(t) => self.window.set_title(if t.is_empty() {
                     self.cfg.title.clone()
                 } else {
                     t
-                });
+                }),
+                other => self.on_clipboard_event(&other),
             }
         }
+        // Output over selected rows (or scrolling the history) makes the selection stale.
+        let damage = self.session.take_damage();
+        if let Some(sel) = &self.inp.selection
+            && invalidated(
+                sel,
+                &damage,
+                self.session.history_len(),
+                self.session.history_len() != history_before,
+            )
+        {
+            self.inp.selection = None;
+            self.full = true;
+        }
+        self.pending_damage = Some(match self.pending_damage.take() {
+            Some(p) => merge_damage(p, damage),
+            None => damage,
+        });
         self.blink_on = true;
         self.arm_blink();
         self.request_redraw();
@@ -394,6 +425,7 @@ impl App {
         let m: Metrics = self.fonts.metrics();
         let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.pad_px());
         if (cols, rows) != self.session.size() {
+            self.inp.selection = None;
             self.session.resize(cols, rows);
             let size = (
                 u16::try_from(cols).unwrap_or(u16::MAX),
@@ -438,9 +470,16 @@ impl App {
             self.sync_since = None;
         }
         self.dirty = false;
-        let damage = self.session.take_damage();
-        let grid = self.session.screen();
-        let rows = if self.full {
+        let damage = merge_damage(
+            self.pending_damage
+                .take()
+                .unwrap_or(Damage::Rows(Vec::new())),
+            self.session.take_damage(),
+        );
+        // Scrolled back: damage rows are screen rows, not viewport rows, so repaint everything.
+        let scrolled = self.session.display_offset() > 0;
+        let grid = self.session.viewport();
+        let rows = if self.full || scrolled {
             None
         } else {
             render::rows_to_paint(&damage, self.last_cursor, grid.cursor.1)
@@ -455,13 +494,20 @@ impl App {
                 }
             }
         }
+        let mut style = self.session.cursor_style();
+        if scrolled {
+            style.shape = crucible_term_core::CursorKind::Hidden;
+        }
         let cursor = CursorDraw {
-            style: self.session.cursor_style(),
+            style,
             focused: self.focused,
             blink_on: self.blink_on,
         };
         let (w, h) = (self.buf.0 as usize, self.buf.1 as usize);
         let pad = self.pad_px();
+        let top = self.session.viewport_top();
+        let sel = self.inp.selection.as_ref();
+        let selected = |r: usize, c: usize| sel.is_some_and(|s| s.contains(top + r, c));
         let bands = render::paint(
             &mut Canvas {
                 px: &mut self.image,
@@ -474,6 +520,7 @@ impl App {
             pad,
             cursor,
             rows.as_deref(),
+            sel.is_some().then_some(&selected as render::Selected<'_>),
         );
         if bands.is_empty() {
             return;
@@ -627,23 +674,65 @@ impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat
     }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.inp.bind_devices(qh, &seat);
+    }
     fn new_capability(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: Capability,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        cap: Capability,
     ) {
-        // Keyboard and pointer binding arrive with WP-3.
+        match cap {
+            Capability::Keyboard if self.inp.keyboard.is_none() => {
+                // xkbcommon keymap from the compositor; sctk's calloop timer drives repeat
+                // from `repeat_info` (no busy loop, no timer while no key is held).
+                let kbd = self.seat.get_keyboard_with_repeat(
+                    qh,
+                    &seat,
+                    None,
+                    self.handle.clone(),
+                    Box::new(|app: &mut App, _, event| app.on_key_repeat(&event)),
+                );
+                match kbd {
+                    Ok(k) => self.inp.keyboard = Some(k),
+                    Err(e) => eprintln!("crucible-term: keyboard: {e}"),
+                }
+            }
+            Capability::Pointer if self.inp.pointer.is_none() => {
+                match self.seat.get_pointer(qh, &seat) {
+                    Ok(p) => self.inp.pointer = Some(p),
+                    Err(e) => eprintln!("crucible-term: pointer: {e}"),
+                }
+            }
+            _ => {}
+        }
     }
     fn remove_capability(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
         _: wl_seat::WlSeat,
-        _: Capability,
+        cap: Capability,
     ) {
+        match cap {
+            Capability::Keyboard => {
+                if let Some(k) = self.inp.keyboard.take()
+                    && k.version() >= 3
+                {
+                    k.release();
+                }
+            }
+            Capability::Pointer => {
+                if let Some(p) = self.inp.pointer.take()
+                    && p.version() >= 3
+                {
+                    p.release();
+                }
+            }
+            _ => {}
+        }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }

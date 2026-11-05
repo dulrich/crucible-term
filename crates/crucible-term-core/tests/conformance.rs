@@ -228,3 +228,60 @@ fn cursor_style_and_sync_output_accessors() {
     s.feed(b"\x1b[?2026l");
     assert!(!s.synchronized_output());
 }
+
+#[test]
+fn mode_accessors_and_viewport() {
+    use crucible_term_core::{MouseEncoding, MouseMode};
+    let mut s = Session::new(10, 3, 100);
+    let base = s.modes();
+    // rio-vt starts with alternate scroll (1007) on.
+    assert!(base.alternate_scroll && !base.app_cursor && base.kitty_flags == 0);
+    assert_eq!(base.mouse, MouseMode::Off);
+    assert_eq!(base.mouse_encoding, MouseEncoding::Default);
+    s.feed(b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1006h\x1b[>1u");
+    let m = s.modes();
+    assert!(m.app_cursor && m.app_keypad && m.bracketed_paste && m.focus_events);
+    assert!(m.alternate_scroll && !m.alt_screen);
+    assert_eq!(
+        (m.mouse, m.mouse_encoding),
+        (MouseMode::Click, MouseEncoding::Sgr)
+    );
+    assert_eq!(m.kitty_flags, 1);
+    s.feed(b"\x1b[?1007l");
+    assert!(!s.modes().alternate_scroll);
+    s.feed(b"\x1b[?1002h");
+    assert_eq!(s.modes().mouse, MouseMode::Drag);
+    s.feed(b"\x1b[?1003h");
+    assert_eq!(s.modes().mouse, MouseMode::Any);
+    s.feed(b"\x1b[?1049h");
+    assert!(s.modes().alt_screen);
+    s.feed(b"\x1b[?1049l\x1b[<u\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+    let m = s.modes();
+    assert_eq!(
+        (m.mouse, m.mouse_encoding, m.kitty_flags),
+        (MouseMode::Off, MouseEncoding::Default, 0)
+    );
+    assert!(!m.app_keypad);
+
+    // Viewport: scroll back through history; the cursor/live screen is untouched.
+    let mut s = Session::new(10, 3, 100);
+    s.feed(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5");
+    assert_eq!(s.history_len(), 3);
+    assert_eq!(s.display_offset(), 0);
+    assert_eq!(s.viewport().screen[0].text(), "l3");
+    let _ = s.take_damage();
+    s.scroll_display(2);
+    assert_eq!(s.display_offset(), 2);
+    assert_eq!(s.viewport().screen[0].text(), "l1");
+    assert_eq!(s.viewport_top(), 1);
+    assert_eq!(s.take_damage(), crucible_term_core::Damage::Full);
+    assert_eq!(s.screen_row(0).text(), "l3");
+    assert_eq!(s.abs_row(0).map(|r| r.text()).as_deref(), Some("l0"));
+    assert_eq!(s.abs_row(6), None);
+    s.scroll_to_top();
+    assert_eq!(s.display_offset(), 3);
+    s.scroll_to_bottom();
+    assert_eq!(s.display_offset(), 0);
+    s.scroll_page(true);
+    assert!(s.display_offset() > 0);
+}

@@ -91,7 +91,7 @@ fn render(cols: usize, rows: usize, input: &[u8], f: &mut Fonts, cur: CursorDraw
         width: w,
         height: h,
     };
-    paint(&mut c, &grid, &Theme::default(), f, pad, cur, None);
+    paint(&mut c, &grid, &Theme::default(), f, pad, cur, None, None);
     Out { px, w, h }
 }
 
@@ -147,7 +147,7 @@ fn padding_and_background_alpha_are_premultiplied() {
         width: w,
         height: h,
     };
-    paint(&mut c, &grid, &theme, &mut f, pad, NO_CURSOR, None);
+    paint(&mut c, &grid, &theme, &mut f, pad, NO_CURSOR, None, None);
     // Default bg #111111 at alpha 0x80, premultiplied: 0x11 * 0x80 / 255 = 0x09.
     assert_eq!(px[0], 0x8009_0909, "padding corner");
     assert_eq!(px[(h - 1) * w + w - 1], 0x8009_0909, "padding far corner");
@@ -297,6 +297,7 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
         0,
         FOCUSED,
         None,
+        None,
     );
     let before = inc.clone();
     s.feed(b"\x1b[2;1HROW");
@@ -315,6 +316,7 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
         0,
         FOCUSED,
         Some(&rows),
+        None,
     );
     assert_eq!(
         bands,
@@ -341,6 +343,7 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
         0,
         FOCUSED,
         None,
+        None,
     );
     assert_eq!(inc, full, "incremental == full repaint");
 }
@@ -352,6 +355,44 @@ fn grid_size_rounds_down_to_whole_cells() {
     let (w, h) = (m.cell_w * 80 + 2 * 5 + m.cell_w - 1, m.cell_h * 24 + 2 * 5);
     assert_eq!(grid_size(w, h, &m, 5), (80, 24));
     assert_eq!(grid_size(1, 1, &m, 5), (1, 1));
+}
+
+#[test]
+fn selected_cells_swap_colours_and_pointer_maps_to_cells() {
+    let mut f = fonts(false);
+    let mut sess = Session::new(3, 1, 0);
+    sess.feed(b"   ");
+    let grid = sess.screen();
+    let m = f.metrics();
+    let (w, h) = (3 * m.cell_w as usize, m.cell_h as usize);
+    let mut px = vec![0u32; w * h];
+    let sel = |_r: usize, c: usize| c == 1;
+    paint(
+        &mut Canvas {
+            px: &mut px,
+            width: w,
+            height: h,
+        },
+        &grid,
+        &Theme::default(),
+        &mut f,
+        0,
+        NO_CURSOR,
+        None,
+        Some(&sel),
+    );
+    let o = Out { px, w, h };
+    let mid = |c: usize| at(&o, c * m.cell_w as usize + 1, m.cell_h as usize / 2);
+    assert_eq!(mid(0), 0xff11_1111, "unselected default bg");
+    assert_eq!(mid(1), 0xffdc_dccc, "selected: fg shows as bg");
+    // Pointer mapping: padding aware, clamped to the grid.
+    let (cw, ch) = (f64::from(m.cell_w), f64::from(m.cell_h));
+    assert_eq!(
+        cell_at(4.0 + cw * 2.5, 4.0 + ch * 1.5, &m, 4, 80, 24),
+        (2, 1)
+    );
+    assert_eq!(cell_at(-9.0, 1.0, &m, 4, 80, 24), (0, 0));
+    assert_eq!(cell_at(1e6, 1e6, &m, 4, 80, 24), (79, 23));
 }
 
 /// Step 0 (plan 01 WP-2): swash shaped + rasterized 200x50 mixed-content frame, cold and warm.
@@ -414,6 +455,7 @@ fn bench_swash_frame() {
             f,
             0,
             FOCUSED,
+            None,
             None,
         );
         t.elapsed().as_secs_f64() * 1e3

@@ -19,12 +19,17 @@
 
 pub mod delta;
 mod ed1;
+pub mod input;
 pub mod model;
 pub mod pty;
 mod session;
 pub mod snapshot;
 
 pub use delta::Delta;
+pub use input::{
+    Key, Mods, MouseAction, MouseButton, MouseEncoding, MouseEvent, MouseMode, TermModes,
+    encode_key, encode_mouse,
+};
 pub use model::{
     Attrs, Cell, Color, CursorKind, CursorStyle, Damage, Event, Grid, PromptMark, Row, Underline,
     Width,

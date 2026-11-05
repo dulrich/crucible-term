@@ -2,8 +2,11 @@
 //! `/bin/sh`) on a PTY in a new Wayland window and exits with the shell's exit status. It
 //! answers `--help`, `--build` and `--version`; every other argument is refused until WP-4's CLI.
 
+mod clipboard;
 mod font;
+mod outbox;
 mod render;
+mod selection;
 mod window;
 
 use std::ffi::OsString;

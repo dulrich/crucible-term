@@ -1,0 +1,907 @@
+//! Seat input for the window: `wl_keyboard` (xkbcommon keymap and repeat via sctk), `wl_pointer`,
+//! the selection, and the clipboard and primary-selection devices. Everything decision-like is
+//! a pure function elsewhere ([`crate::selection`], [`crate::clipboard`],
+//! `crucible_term_core::input`); this module translates sctk events into those types and acts
+//! on the results.
+//!
+//! Routing summary (foot's rules):
+//! - Keys: `Ctrl+Shift+C/V` copy and paste, `Shift+PageUp/PageDown/Home/End` scroll the
+//!   viewport; those chords are consumed. Everything else is encoded by `encode_key`, scrolls
+//!   the viewport to the bottom and goes through the one PTY outbox.
+//! - Pointer: when the child requested mouse reporting and Shift is NOT held, events are
+//!   encoded and sent. **Shift always overrides reporting** and does local selection.
+//! - Wheel: reporting and no Shift, report; else alternate screen with 1007, arrow keys (3 per
+//!   notch); else scroll the scrollback viewport (3 lines per notch).
+
+use super::App;
+use crate::clipboard::{self, MIME_TYPES, Osc52};
+use crate::render;
+use crate::selection::{Clicks, Kind, Point, Selection};
+use crucible_term_core::{
+    Key, Mods, MouseAction, MouseButton, MouseEvent, MouseMode, encode_key, encode_mouse,
+};
+use smithay_client_toolkit::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
+use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
+use smithay_client_toolkit::data_device_manager::data_source::{CopyPasteSource, DataSourceHandler};
+use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, ReadPipe, WritePipe};
+use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
+use smithay_client_toolkit::primary_selection::device::{
+    PrimarySelectionDevice, PrimarySelectionDeviceHandler,
+};
+use smithay_client_toolkit::primary_selection::selection::{
+    PrimarySelectionSource, PrimarySelectionSourceHandler,
+};
+use smithay_client_toolkit::reexports::calloop::PostAction;
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::{Interest, Mode};
+use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
+use smithay_client_toolkit::seat::keyboard::{
+    KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
+};
+use smithay_client_toolkit::seat::pointer::{
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
+};
+use smithay_client_toolkit::{
+    delegate_data_device, delegate_keyboard, delegate_pointer, delegate_primary_selection,
+};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
+use std::time::Duration;
+use wayland_client::protocol::wl_data_device::WlDataDevice;
+use wayland_client::protocol::wl_data_device_manager::DndAction;
+use wayland_client::protocol::wl_data_source::WlDataSource;
+use wayland_client::protocol::{wl_keyboard, wl_pointer, wl_surface};
+use wayland_client::{Connection, QueueHandle};
+
+/// Lines scrolled per wheel notch, and arrow keys sent per notch on the alternate screen.
+const WHEEL_LINES: i32 = 3;
+/// Two presses within this long on one cell count as a double (then triple) click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// A paste larger than this is dropped (and logged) rather than held in memory.
+const MAX_PASTE: usize = 64 << 20;
+
+/// Seat objects and gesture state, owned by [`App`].
+pub struct Input {
+    pub(super) keyboard: Option<wl_keyboard::WlKeyboard>,
+    pub(super) pointer: Option<wl_pointer::WlPointer>,
+    pub(super) mods: Mods,
+    /// The latest input serial, used for `set_selection`.
+    serial: u32,
+    data_mgr: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    primary_mgr: Option<PrimarySelectionManagerState>,
+    primary_device: Option<PrimarySelectionDevice>,
+    copy_source: Option<CopyPasteSource>,
+    primary_source: Option<PrimarySelectionSource>,
+    clip_text: Arc<str>,
+    primary_text: Arc<str>,
+    /// Pointer position in logical surface coordinates.
+    pos: (f64, f64),
+    /// The button whose press was reported to the child (its release and drags follow).
+    reported: Option<MouseButton>,
+    pub(super) selection: Option<Selection>,
+    /// A char/block selection that starts once the pointer leaves its first cell.
+    pending: Option<(Kind, Point)>,
+    selecting: bool,
+    clicks: Clicks,
+    wheel: f64,
+}
+
+impl Input {
+    pub(super) fn new(
+        globals: &wayland_client::globals::GlobalList,
+        qh: &QueueHandle<App>,
+    ) -> Input {
+        Input {
+            keyboard: None,
+            pointer: None,
+            mods: Mods::default(),
+            serial: 0,
+            data_mgr: DataDeviceManagerState::bind(globals, qh).ok(),
+            data_device: None,
+            primary_mgr: PrimarySelectionManagerState::bind(globals, qh).ok(),
+            primary_device: None,
+            copy_source: None,
+            primary_source: None,
+            clip_text: Arc::from(""),
+            primary_text: Arc::from(""),
+            pos: (0.0, 0.0),
+            reported: None,
+            selection: None,
+            pending: None,
+            selecting: false,
+            clicks: Clicks::default(),
+            wheel: 0.0,
+        }
+    }
+
+    /// Create the data and primary-selection devices for the first seat (missing globals: skip).
+    pub(super) fn bind_devices(
+        &mut self,
+        qh: &QueueHandle<App>,
+        seat: &wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+        if self.data_device.is_none() {
+            self.data_device = self.data_mgr.as_ref().map(|m| m.get_data_device(qh, seat));
+        }
+        if self.primary_device.is_none() {
+            self.primary_device = self
+                .primary_mgr
+                .as_ref()
+                .map(|m| m.get_selection_device(qh, seat));
+        }
+    }
+}
+
+/// Decode a keysym (and the compositor's composed text) into a core key. `None`: not encodable.
+/// The bool is "this keysym implies Shift" (`ISO_Left_Tab`).
+pub fn translate(sym: Keysym, utf8: Option<&str>) -> Option<(Key, bool)> {
+    let key = match sym {
+        Keysym::Return | Keysym::KP_Enter => Key::Enter,
+        Keysym::Tab => Key::Tab,
+        Keysym::ISO_Left_Tab => return Some((Key::Tab, true)),
+        Keysym::BackSpace => Key::Backspace,
+        Keysym::Escape => Key::Escape,
+        Keysym::Up => Key::Up,
+        Keysym::Down => Key::Down,
+        Keysym::Left => Key::Left,
+        Keysym::Right => Key::Right,
+        Keysym::Home => Key::Home,
+        Keysym::End => Key::End,
+        Keysym::Page_Up => Key::PageUp,
+        Keysym::Page_Down => Key::PageDown,
+        Keysym::Insert => Key::Insert,
+        Keysym::Delete => Key::Delete,
+        s if (Keysym::F1.raw()..=Keysym::F12.raw()).contains(&s.raw()) => {
+            Key::F((s.raw() - Keysym::F1.raw() + 1) as u8)
+        }
+        s => {
+            // Composed text wins (dead keys); control characters (Ctrl held) fall back to the keysym.
+            let mut it = utf8.unwrap_or("").chars().filter(|c| !c.is_control());
+            let composed = it.next().filter(|_| it.next().is_none());
+            Key::Char(composed.or_else(|| s.key_char().filter(|c| !c.is_control()))?)
+        }
+    };
+    Some((key, false))
+}
+
+impl App {
+    // ---- PTY writes ---------------------------------------------------------------------
+
+    /// Queue `bytes` for the child and write what the PTY accepts now. Every PTY write goes
+    /// through here (replies, keys, paste).
+    pub(super) fn send(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.outbox.push(bytes);
+        if !self.write_armed && !self.drain_outbox() {
+            self.arm_writable();
+        }
+    }
+
+    /// Flush the outbox; true when nothing is left to wait for (drained, or a hard error that
+    /// dropped the queue).
+    pub(super) fn drain_outbox(&mut self) -> bool {
+        let mut master: &File = self.pty.master();
+        match self.outbox.flush(&mut master) {
+            Ok(done) => done,
+            Err(e) => {
+                eprintln!("crucible-term: pty write: {e}");
+                self.outbox.clear();
+                true
+            }
+        }
+    }
+
+    /// Wait for the master to become writable, then drain the rest of the outbox.
+    fn arm_writable(&mut self) {
+        let Ok(fd) = self.pty.master().try_clone() else {
+            self.outbox.clear();
+            return;
+        };
+        self.write_armed = true;
+        let r = self.handle.insert_source(
+            Generic::new(fd, Interest::WRITE, Mode::Level),
+            |_, _, app| {
+                if app.drain_outbox() {
+                    app.write_armed = false;
+                    Ok(PostAction::Remove)
+                } else {
+                    Ok(PostAction::Continue)
+                }
+            },
+        );
+        if let Err(e) = r {
+            eprintln!("crucible-term: pty writable source: {e}");
+            self.write_armed = false;
+            self.outbox.clear();
+        }
+    }
+
+    // ---- keyboard -----------------------------------------------------------------------
+
+    /// Key repeat from sctk's calloop timer.
+    pub(super) fn on_key_repeat(&mut self, event: &KeyEvent) {
+        self.on_key(event, true);
+    }
+
+    fn on_key(&mut self, event: &KeyEvent, repeat: bool) {
+        let Some((key, implied_shift)) = translate(event.keysym, event.utf8.as_deref()) else {
+            return;
+        };
+        let mut mods = self.inp.mods;
+        mods.shift |= implied_shift;
+        let (ctrl_shift, shift_only) = (
+            mods.ctrl && mods.shift && !mods.alt && !mods.logo,
+            mods.shift && !mods.ctrl && !mods.alt && !mods.logo,
+        );
+        if ctrl_shift && let Key::Char(c) = key {
+            match c.to_ascii_lowercase() {
+                'c' => {
+                    if !repeat {
+                        self.copy_selection();
+                    }
+                    return;
+                }
+                'v' => {
+                    if !repeat {
+                        self.paste_clipboard();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if shift_only {
+            match key {
+                Key::PageUp => return self.scroll_viewport(|s| s.scroll_page(true)),
+                Key::PageDown => return self.scroll_viewport(|s| s.scroll_page(false)),
+                Key::Home => return self.scroll_viewport(|s| s.scroll_to_top()),
+                Key::End => return self.scroll_viewport(|s| s.scroll_to_bottom()),
+                _ => {}
+            }
+        }
+        let modes = self.session.modes();
+        let bytes = match encode_key(key, mods, &modes) {
+            Some(b) => b,
+            None => return,
+        };
+        self.snap_to_bottom();
+        self.send(&bytes);
+    }
+
+    /// Run a viewport scroll and redraw (a changed offset is full damage in the core).
+    fn scroll_viewport(&mut self, f: impl FnOnce(&mut crucible_term_core::Session)) {
+        let before = self.session.display_offset();
+        f(&mut self.session);
+        if self.session.display_offset() != before {
+            self.full = true;
+            self.request_redraw();
+        }
+    }
+
+    /// Typing (or a paste) returns the viewport to the live screen.
+    fn snap_to_bottom(&mut self) {
+        if self.session.display_offset() > 0 {
+            self.scroll_viewport(|s| s.scroll_to_bottom());
+        }
+    }
+
+    // ---- pointer ------------------------------------------------------------------------
+
+    /// The grid cell `(col, row)` under the pointer, clamped to the grid.
+    fn pointer_cell(&self) -> (usize, usize) {
+        let s = self.effective_scale();
+        let (cols, rows) = self.session.size();
+        render::cell_at(
+            self.inp.pos.0 * s,
+            self.inp.pos.1 * s,
+            &self.fonts.metrics(),
+            self.pad_px(),
+            cols,
+            rows,
+        )
+    }
+
+    fn abs_point(&self, (col, row): (usize, usize)) -> Point {
+        Point {
+            row: self.session.viewport_top() + row,
+            col,
+        }
+    }
+
+    fn report(&mut self, action: MouseAction, button: MouseButton) -> bool {
+        let modes = self.session.modes();
+        let (col, row) = self.pointer_cell();
+        let ev = MouseEvent {
+            action,
+            button,
+            mods: self.inp.mods,
+            col,
+            row,
+        };
+        match encode_mouse(ev, &modes) {
+            Some(b) => {
+                self.send(&b);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn on_pointer(&mut self, ev: &PointerEvent) {
+        self.inp.pos = ev.position;
+        let reporting = self.session.modes().mouse != MouseMode::Off && !self.inp.mods.shift;
+        match ev.kind {
+            PointerEventKind::Motion { .. } => {
+                if self.inp.selecting {
+                    self.drag_selection();
+                } else if reporting {
+                    let held = self.inp.reported.unwrap_or(MouseButton::None);
+                    self.report(MouseAction::Motion, held);
+                }
+            }
+            PointerEventKind::Press {
+                button,
+                serial,
+                time,
+            } => {
+                self.inp.serial = serial;
+                let b = match button {
+                    BTN_LEFT => MouseButton::Left,
+                    BTN_MIDDLE => MouseButton::Middle,
+                    BTN_RIGHT => MouseButton::Right,
+                    _ => return,
+                };
+                if reporting {
+                    if self.report(MouseAction::Press, b) {
+                        self.inp.reported = Some(b);
+                    }
+                    return;
+                }
+                let _ = time;
+                match b {
+                    MouseButton::Left => self.begin_selection(),
+                    MouseButton::Middle => self.paste_primary(),
+                    _ => {}
+                }
+            }
+            PointerEventKind::Release { button, serial, .. } => {
+                self.inp.serial = serial;
+                let b = match button {
+                    BTN_LEFT => MouseButton::Left,
+                    BTN_MIDDLE => MouseButton::Middle,
+                    BTN_RIGHT => MouseButton::Right,
+                    _ => return,
+                };
+                // A reported press always gets its release, even if Shift is held by now.
+                if self.inp.reported == Some(b) {
+                    self.inp.reported = None;
+                    self.report(MouseAction::Release, b);
+                } else if b == MouseButton::Left && self.inp.selecting {
+                    self.end_selection(serial);
+                }
+            }
+            PointerEventKind::Axis { vertical, .. } => {
+                let units = if vertical.value120 != 0 {
+                    f64::from(vertical.value120)
+                } else if vertical.discrete != 0 {
+                    f64::from(vertical.discrete) * 120.0
+                } else {
+                    vertical.absolute * 8.0
+                };
+                self.inp.wheel += units;
+                let notches = (self.inp.wheel / 120.0).trunc();
+                self.inp.wheel -= notches * 120.0;
+                if notches != 0.0 {
+                    self.on_wheel(notches as i32);
+                }
+            }
+            PointerEventKind::Enter { serial } => self.inp.serial = serial,
+            PointerEventKind::Leave { .. } => {}
+        }
+    }
+
+    /// `notches` > 0 is a wheel step down (toward newer output), < 0 up.
+    fn on_wheel(&mut self, notches: i32) {
+        let modes = self.session.modes();
+        let down = notches > 0;
+        let count = notches.unsigned_abs();
+        if modes.mouse != MouseMode::Off && !self.inp.mods.shift {
+            let b = if down {
+                MouseButton::WheelDown
+            } else {
+                MouseButton::WheelUp
+            };
+            for _ in 0..count {
+                self.report(MouseAction::Press, b);
+            }
+        } else if modes.alt_screen && modes.alternate_scroll {
+            let key = if down { Key::Down } else { Key::Up };
+            if let Some(seq) = encode_key(key, Mods::default(), &modes) {
+                for _ in 0..count * WHEEL_LINES as u32 {
+                    self.send(&seq);
+                }
+            }
+        } else {
+            let lines = WHEEL_LINES * notches.saturating_abs();
+            self.scroll_viewport(|s| s.scroll_display(if down { -lines } else { lines }));
+        }
+    }
+
+    // ---- selection ----------------------------------------------------------------------
+
+    fn begin_selection(&mut self) {
+        let cell = self.pointer_cell();
+        let p = self.abs_point(cell);
+        let n = self
+            .inp
+            .clicks
+            .press(std::time::Instant::now(), p, MULTI_CLICK);
+        let had = self.inp.selection.take().is_some();
+        self.inp.pending = None;
+        let kind = match n {
+            2 => Some(Kind::Word),
+            3 => Some(Kind::Line),
+            _ => None,
+        };
+        let rows = |r: usize| self.session.abs_row(r);
+        match kind {
+            Some(k) => {
+                self.inp.selection = Some(Selection::start(k, p, &rows));
+                self.inp.selecting = true;
+            }
+            None => {
+                let k = if self.inp.mods.ctrl {
+                    Kind::Block
+                } else {
+                    Kind::Char
+                };
+                self.inp.pending = Some((k, p));
+                self.inp.selecting = true;
+            }
+        }
+        if had || self.inp.selection.is_some() {
+            self.full = true;
+            self.request_redraw();
+        }
+    }
+
+    fn drag_selection(&mut self) {
+        let p = self.abs_point(self.pointer_cell());
+        let rows = |r: usize| self.session.abs_row(r);
+        if let Some((kind, origin)) = self.inp.pending
+            && p != origin
+        {
+            self.inp.selection = Some(Selection::start(kind, origin, &rows));
+            self.inp.pending = None;
+        }
+        if let Some(sel) = &mut self.inp.selection {
+            let before = sel.clone();
+            sel.update(p, &rows);
+            if *sel == before {
+                return;
+            }
+        } else {
+            return;
+        }
+        self.full = true;
+        self.request_redraw();
+    }
+
+    fn end_selection(&mut self, serial: u32) {
+        self.inp.selecting = false;
+        self.inp.pending = None;
+        let Some(sel) = &self.inp.selection else {
+            return;
+        };
+        let text = sel.text(&|r| self.session.abs_row(r));
+        if !text.is_empty() {
+            self.set_primary(text, serial);
+        }
+    }
+
+    // ---- clipboard and primary selection -----------------------------------------------
+
+    fn copy_selection(&mut self) {
+        let Some(sel) = &self.inp.selection else {
+            return;
+        };
+        let text = sel.text(&|r| self.session.abs_row(r));
+        if !text.is_empty() {
+            let serial = self.inp.serial;
+            self.set_clipboard(text, serial);
+        }
+    }
+
+    fn set_clipboard(&mut self, text: String, serial: u32) {
+        let (Some(mgr), Some(dev)) = (&self.inp.data_mgr, &self.inp.data_device) else {
+            return;
+        };
+        let src = mgr.create_copy_paste_source(&self.qh, MIME_TYPES);
+        src.set_selection(dev, serial);
+        self.inp.clip_text = Arc::from(text);
+        self.inp.copy_source = Some(src);
+    }
+
+    fn set_primary(&mut self, text: String, serial: u32) {
+        let (Some(mgr), Some(dev)) = (&self.inp.primary_mgr, &self.inp.primary_device) else {
+            return;
+        };
+        let src = mgr.create_selection_source(&self.qh, MIME_TYPES);
+        src.set_selection(dev, serial);
+        self.inp.primary_text = Arc::from(text);
+        self.inp.primary_source = Some(src);
+    }
+
+    /// Apply the OSC 52 policy to a core event.
+    pub(super) fn on_clipboard_event(&mut self, ev: &crucible_term_core::Event) {
+        let serial = self.inp.serial;
+        match clipboard::osc52_policy(ev, self.focused) {
+            Osc52::Clipboard(t) => self.set_clipboard(t, serial),
+            Osc52::Primary(t) => self.set_primary(t, serial),
+            Osc52::Ignore => {}
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(offer) = self
+            .inp
+            .data_device
+            .as_ref()
+            .and_then(|d| d.data().selection_offer())
+        else {
+            return;
+        };
+        let Some(mime) = offer.with_mime_types(clipboard::pick_mime) else {
+            return;
+        };
+        match offer.receive(mime.to_string()) {
+            Ok(pipe) => self.read_paste(pipe),
+            Err(e) => eprintln!("crucible-term: paste: {e}"),
+        }
+    }
+
+    fn paste_primary(&mut self) {
+        let Some(offer) = self
+            .inp
+            .primary_device
+            .as_ref()
+            .and_then(|d| d.data().selection_offer())
+        else {
+            return;
+        };
+        let Some(mime) = offer.with_mime_types(clipboard::pick_mime) else {
+            return;
+        };
+        match offer.receive(mime.to_string()) {
+            Ok(pipe) => self.read_paste(pipe),
+            Err(e) => eprintln!("crucible-term: paste: {e}"),
+        }
+    }
+
+    /// Read a selection pipe to EOF on the event loop (never blocking it), then paste.
+    fn read_paste(&mut self, pipe: ReadPipe) {
+        let mut data: Vec<u8> = Vec::new();
+        let r = self.handle.insert_source(pipe, move |_, f, app| {
+            let mut chunk = [0u8; 64 * 1024];
+            match rustix::io::read(&*f, &mut chunk) {
+                Ok(0) => {
+                    app.paste(&std::mem::take(&mut data));
+                    PostAction::Remove
+                }
+                Ok(n) => {
+                    data.extend_from_slice(&chunk[..n]);
+                    if data.len() > MAX_PASTE {
+                        eprintln!("crucible-term: paste larger than {MAX_PASTE} bytes dropped");
+                        PostAction::Remove
+                    } else {
+                        PostAction::Continue
+                    }
+                }
+                Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
+                    PostAction::Continue
+                }
+                Err(e) => {
+                    eprintln!("crucible-term: paste read: {e}");
+                    PostAction::Remove
+                }
+            }
+        });
+        if let Err(e) = r {
+            eprintln!("crucible-term: paste source: {e}");
+        }
+    }
+
+    fn paste(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let bytes = clipboard::paste_bytes(data, self.session.modes().bracketed_paste);
+        self.snap_to_bottom();
+        self.send(&bytes);
+    }
+
+    /// Answer a data request on a background thread so a slow reader cannot stall the UI.
+    fn serve(fd: OwnedFd, text: Arc<str>) {
+        let _ = std::thread::Builder::new()
+            .name("selection-write".into())
+            .spawn(move || {
+                let _ = File::from(fd).write_all(text.as_bytes());
+            });
+    }
+}
+
+// ---- handlers ---------------------------------------------------------------------------
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        serial: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        self.inp.serial = serial;
+        self.focused = true;
+        if self.session.modes().focus_events {
+            self.send(b"\x1b[I");
+        }
+        self.arm_blink();
+        self.mark_cursor();
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        self.focused = false;
+        self.inp.mods = Mods::default();
+        if self.session.modes().focus_events {
+            self.send(b"\x1b[O");
+        }
+        self.mark_cursor();
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: KeyEvent,
+    ) {
+        self.inp.serial = serial;
+        self.on_key(&event, false);
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        self.on_key(&event, true);
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        m: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+        self.inp.mods = Mods {
+            shift: m.shift,
+            alt: m.alt,
+            ctrl: m.ctrl,
+            logo: m.logo,
+        };
+    }
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for ev in events {
+            self.on_pointer(ev);
+        }
+    }
+}
+
+impl DataDeviceHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataDevice,
+        _: f64,
+        _: f64,
+        _: &wl_surface::WlSurface,
+    ) {
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for App {
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for App {
+    fn accept_mime(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataSource,
+        _: Option<String>,
+    ) {
+    }
+
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &WlDataSource,
+        mime: String,
+        fd: WritePipe,
+    ) {
+        if self
+            .inp
+            .copy_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+            && MIME_TYPES.contains(&mime.as_str())
+        {
+            Self::serve(OwnedFd::from(fd), self.inp.clip_text.clone());
+        }
+    }
+
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if self
+            .inp
+            .copy_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.inp.copy_source = None;
+        }
+    }
+
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
+}
+
+impl PrimarySelectionDeviceHandler for App {
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    ) {
+    }
+}
+
+impl PrimarySelectionSourceHandler for App {
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+        mime: String,
+        fd: WritePipe,
+    ) {
+        if self
+            .inp
+            .primary_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+            && MIME_TYPES.contains(&mime.as_str())
+        {
+            Self::serve(OwnedFd::from(fd), self.inp.primary_text.clone());
+        }
+    }
+
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+    ) {
+        if self
+            .inp
+            .primary_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.inp.primary_source = None;
+        }
+    }
+}
+
+delegate_keyboard!(App);
+delegate_pointer!(App);
+delegate_data_device!(App);
+delegate_primary_selection!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keysyms_translate_to_core_keys() {
+        assert_eq!(
+            translate(Keysym::Return, Some("\r")),
+            Some((Key::Enter, false))
+        );
+        assert_eq!(
+            translate(Keysym::ISO_Left_Tab, None),
+            Some((Key::Tab, true))
+        );
+        assert_eq!(translate(Keysym::F5, None), Some((Key::F(5), false)));
+        assert_eq!(translate(Keysym::Page_Up, None), Some((Key::PageUp, false)));
+        assert_eq!(
+            translate(Keysym::a, Some("a")),
+            Some((Key::Char('a'), false))
+        );
+        // Ctrl+a: the compositor's text is a control character, so the keysym decides.
+        assert_eq!(
+            translate(Keysym::a, Some("\u{1}")),
+            Some((Key::Char('a'), false))
+        );
+        // A dead-key composition arrives as text on a different keysym.
+        assert_eq!(
+            translate(Keysym::e, Some("é")),
+            Some((Key::Char('é'), false))
+        );
+        assert_eq!(translate(Keysym::Shift_L, None), None);
+    }
+}
