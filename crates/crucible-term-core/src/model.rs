@@ -173,3 +173,26 @@ pub enum Damage {
     /// Redraw these visible rows (ascending, deduplicated; may be empty).
     Rows(Vec<usize>),
 }
+
+/// The cursor shape to draw (DECSCUSR), or hidden (DECTCEM off).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CursorKind {
+    /// A full-cell block.
+    #[default]
+    Block,
+    /// An underline bar.
+    Underline,
+    /// A vertical beam at the left edge.
+    Beam,
+    /// Not drawn.
+    Hidden,
+}
+
+/// How the cursor should be drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CursorStyle {
+    /// Shape, or hidden.
+    pub shape: CursorKind,
+    /// DECSCUSR asked for a blinking cursor.
+    pub blinking: bool,
+}

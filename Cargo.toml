@@ -30,6 +30,17 @@ rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio"
 # `close_range(2)` in the PTY child before exec (rustix has no wrapper). Already in the lock.
 libc = "0.2"
 
+# Font stack (plan 01 "Dependency posture"): fontconfig for discovery and fallback (system lib,
+# linked through pkg-config), swash for shaping and rasterization including colour emoji.
+swash = "0.2"
+yeslogic-fontconfig-sys = "6.0.1"
+
+# Wayland client, matching CDE's lock (sctk 0.20.0, wayland-client 0.31.14, wayland-protocols 0.32).
+# calloop comes through sctk's re-export so the versions cannot drift apart.
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
 # Lints are defined once here and inherited by every crate with `[lints] workspace = true`.
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

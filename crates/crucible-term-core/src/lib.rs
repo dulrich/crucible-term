@@ -25,5 +25,8 @@ mod session;
 pub mod snapshot;
 
 pub use delta::Delta;
-pub use model::{Attrs, Cell, Color, Damage, Event, Grid, PromptMark, Row, Underline, Width};
+pub use model::{
+    Attrs, Cell, Color, CursorKind, CursorStyle, Damage, Event, Grid, PromptMark, Row, Underline,
+    Width,
+};
 pub use session::Session;

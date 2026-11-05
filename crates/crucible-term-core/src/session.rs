@@ -2,7 +2,10 @@
 //! out is a CDE-owned type from [`crate::model`].
 
 use crate::ed1::Ed1Fix;
-use crate::model::{Attrs, Cell, Color, Damage, Event, Grid, PromptMark, Row, Underline, Width};
+use crate::model::{
+    Attrs, Cell, Color, CursorKind, CursorStyle, Damage, Event, Grid, PromptMark, Row, Underline,
+    Width,
+};
 use rio_vt::ansi::CursorShape;
 use rio_vt::clipboard::ClipboardType;
 use rio_vt::config::colors::AnsiColor;
@@ -149,6 +152,27 @@ impl Session {
     pub fn cursor(&self) -> (usize, usize) {
         let p = self.term.grid.cursor.pos;
         (p.col.0, usize::try_from(p.row.0).unwrap_or(0))
+    }
+
+    /// The cursor as the renderer should draw it: shape (DECSCUSR), `Hidden` under DECTCEM
+    /// off, and whether DECSCUSR asked for blinking.
+    pub fn cursor_style(&self) -> CursorStyle {
+        let shape = match self.term.cursor().content {
+            CursorShape::Block => CursorKind::Block,
+            CursorShape::Underline => CursorKind::Underline,
+            CursorShape::Beam => CursorKind::Beam,
+            CursorShape::Hidden => CursorKind::Hidden,
+        };
+        CursorStyle {
+            shape,
+            blinking: self.term.blinking_cursor,
+        }
+    }
+
+    /// True while the child holds a mode 2026 synchronized update (BSU without ESU yet).
+    /// The window holds presenting while this is set, under its own timeout.
+    pub fn synchronized_output(&self) -> bool {
+        self.term.synchronized_output()
     }
 
     /// Rows of scrollback currently held.

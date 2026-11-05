@@ -1,6 +1,6 @@
 [package]
 name = "crucible-term"
-description = "CDE's terminal emulator (headless until plan 01 WP-2)"
+description = "CDE's terminal emulator: a Wayland client over the crucible-term-core session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crucible-term-core.workspace = true
+rustix.workspace = true
+swash.workspace = true
+yeslogic-fontconfig-sys.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 
 [lints]
 workspace = true

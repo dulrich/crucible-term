@@ -209,3 +209,22 @@ fn damage_is_line_level_and_resets() {
     s.resize(100, 30);
     assert_eq!(s.take_damage(), Damage::Full);
 }
+
+#[test]
+fn cursor_style_and_sync_output_accessors() {
+    use crucible_term_core::{CursorKind, Session};
+    let mut s = Session::new(10, 2, 0);
+    assert_eq!(s.cursor_style().shape, CursorKind::Block);
+    s.feed(b"\x1b[5 q");
+    assert_eq!(s.cursor_style().shape, CursorKind::Beam);
+    assert!(s.cursor_style().blinking);
+    s.feed(b"\x1b[4 q\x1b[?25l");
+    assert_eq!(s.cursor_style().shape, CursorKind::Hidden);
+    s.feed(b"\x1b[?25h");
+    assert_eq!(s.cursor_style().shape, CursorKind::Underline);
+    assert!(!s.cursor_style().blinking);
+    s.feed(b"\x1b[?2026h");
+    assert!(s.synchronized_output());
+    s.feed(b"\x1b[?2026l");
+    assert!(!s.synchronized_output());
+}
