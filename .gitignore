@@ -1,0 +1,41 @@
+# --- agents: agent-local state, never commit ---
+.claude/
+.codex/
+.gemini/
+.cursor/
+.continue/
+.windsurf/
+.cline/
+.roo/
+.roocode/
+.aider*
+.augment/
+.qwen/
+.kiro/
+.opencode/
+.crush/
+CLAUDE.local.md
+GEMINI.local.md
+# --- lang-rust: Cargo workspace ---
+# note: Cargo.lock IS committed (binaries/workspaces) — do not ignore it
+target/
+**/*.rs.bk
+
+# env
+.env
+.env.*
+# --- editors: editor and OS junk ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+# --- personal: user conventions — extend with your own local-tooling patterns ---
+.cond.pyhistory
+.gpuedit.json
+.gpuedit.session
+.perplexity-research
+
+# --- project-specific ---
+runs/
