@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+authors = ["David Ulrich <david@ulrichdev.com>"]
+repository = ""
+rust-version = "1.85"
+
+# Shared dependency versions. Crates opt in via `dep.workspace = true`.
+[workspace.dependencies]
+crucible-term-core = { path = "crates/crucible-term-core" }
+
+# The VT core (parser, grid, scrollback, reflow, damage). Exact pin: a 0.x crate whose public
+# internals are not a stable API (plan 01 "Dependency posture"). No default features: no `pty`
+# (corcovado/teletypewriter), no clipboard, renderer or windowing.
+rio-vt = { version = "=0.5.29", default-features = false }
+
+# Type-only dependencies of rio-vt's `Handler` trait, named by the ED 1 interception wrapper in
+# `crucible-term-core`. Both are already in the lock through rio-vt, so no new lock entries.
+rio-graphics = { version = "=0.5.29", default-features = false }
+cursor-icon = { version = "1.1.0", default-features = false }
+
+# The owned PTY: openpty, ioctls (TIOCSWINSZ, TIOCSCTTY), fd flags, process wait.
+rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio"] }
+
+# `close_range(2)` in the PTY child before exec (rustix has no wrapper). Already in the lock.
+libc = "0.2"
+
+# Lints are defined once here and inherited by every crate with `[lints] workspace = true`.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"

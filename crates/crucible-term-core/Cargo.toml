@@ -1,0 +1,19 @@
+[package]
+name = "crucible-term-core"
+description = "CDE-owned terminal session seam over rio-vt, plus an owned PTY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rio-vt.workspace = true
+rio-graphics.workspace = true
+cursor-icon.workspace = true
+rustix.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

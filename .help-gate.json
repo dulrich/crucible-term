@@ -1,0 +1,6 @@
+{
+  "entrypoints": [
+    { "path": "crates/crucible-term/src/main.rs", "version": "semver" }
+  ],
+  "exclude": []
+}

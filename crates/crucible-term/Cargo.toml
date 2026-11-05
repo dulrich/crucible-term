@@ -1,0 +1,14 @@
+[package]
+name = "crucible-term"
+description = "CDE's terminal emulator (headless until plan 01 WP-2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
