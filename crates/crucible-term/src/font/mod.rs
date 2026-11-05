@@ -563,3 +563,168 @@ fn fit(w: u32, h: u32, data: Vec<u8>, max_w: u32, max_h: u32) -> (u32, u32, Vec<
     }
     (nw, nh, out)
 }
+
+/// A font pool key: family, size in points and output scale (the float bits, so exact).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontKey {
+    family: String,
+    size_bits: u32,
+    scale_bits: u32,
+}
+
+impl FontKey {
+    /// The key for `family` at `size_pt` points and output `scale`.
+    pub fn new(family: &str, size_pt: f32, scale: f32) -> FontKey {
+        FontKey {
+            family: family.to_string(),
+            size_bits: size_pt.to_bits(),
+            scale_bits: scale.to_bits(),
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+}
+
+/// One window's handle on a pool entry: the key it is filed under and the shared fonts.
+pub struct PooledFonts {
+    /// The pool key these fonts were built for.
+    pub key: FontKey,
+    /// The shared fonts (single-threaded host, so `Rc<RefCell>`).
+    pub fonts: Rc<std::cell::RefCell<Fonts>>,
+}
+
+/// Fonts shared by the windows of one host, one [`Fonts`] per `(family, size_pt, scale)`.
+/// The pool holds weak references: an entry dies with its last window.
+#[derive(Default)]
+pub struct FontPool {
+    entries: HashMap<FontKey, std::rc::Weak<std::cell::RefCell<Fonts>>>,
+}
+
+impl FontPool {
+    /// The shared fonts for `key`, built with `make` when no live window uses that key.
+    pub fn get_with(
+        &mut self,
+        key: FontKey,
+        make: impl FnOnce(&FontKey) -> Result<Fonts, FontError>,
+    ) -> Result<PooledFonts, FontError> {
+        self.prune();
+        if let Some(fonts) = self.entries.get(&key).and_then(std::rc::Weak::upgrade) {
+            return Ok(PooledFonts { key, fonts });
+        }
+        let fonts = Rc::new(std::cell::RefCell::new(make(&key)?));
+        self.entries.insert(key.clone(), Rc::downgrade(&fonts));
+        Ok(PooledFonts { key, fonts })
+    }
+
+    /// The shared fonts for `family` at `size_pt` and `scale`, discovered through fontconfig.
+    pub fn get(
+        &mut self,
+        family: &str,
+        size_pt: f32,
+        scale: f32,
+    ) -> Result<PooledFonts, FontError> {
+        self.get_with(FontKey::new(family, size_pt, scale), |_| {
+            Fonts::discover(family, size_pt, scale)
+        })
+    }
+
+    /// Move `held` to the entry for its family and size at `scale`: share a live entry if one
+    /// exists; if `held` is the only user, rescale it in place and re-file it; otherwise build a
+    /// new entry with `make`. A shared instance is never rescaled. On a build error `held` stays.
+    pub fn rescale_with(
+        &mut self,
+        held: &mut PooledFonts,
+        scale: f32,
+        make: impl FnOnce(&FontKey) -> Result<Fonts, FontError>,
+    ) -> Result<(), FontError> {
+        let key = FontKey {
+            scale_bits: scale.to_bits(),
+            ..held.key.clone()
+        };
+        if key == held.key {
+            return Ok(());
+        }
+        self.prune();
+        if let Some(fonts) = self.entries.get(&key).and_then(std::rc::Weak::upgrade) {
+            *held = PooledFonts { key, fonts };
+            return Ok(());
+        }
+        if Rc::strong_count(&held.fonts) == 1 {
+            self.entries.remove(&held.key);
+            held.fonts.borrow_mut().set_scale(key.scale());
+            self.entries.insert(key.clone(), Rc::downgrade(&held.fonts));
+            held.key = key;
+            return Ok(());
+        }
+        let next = self.get_with(key, make)?;
+        *held = next;
+        Ok(())
+    }
+
+    /// [`FontPool::rescale_with`] discovering through fontconfig.
+    pub fn rescale(&mut self, held: &mut PooledFonts, scale: f32) -> Result<(), FontError> {
+        self.rescale_with(held, scale, |k| {
+            Fonts::discover(
+                &k.family,
+                f32::from_bits(k.size_bits),
+                f32::from_bits(k.scale_bits),
+            )
+        })
+    }
+
+    /// Forget entries whose last window has gone.
+    pub fn prune(&mut self) {
+        self.entries.retain(|_, w| w.strong_count() > 0);
+    }
+
+    /// Live entries (tests and debugging).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_face(_: &FontKey) -> Result<Fonts, FontError> {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "DejaVu Sans Mono"])
+            .output()
+            .expect("fc-match");
+        let path = String::from_utf8(out.stdout).expect("utf8");
+        let face = Face::from_bytes(std::fs::read(path).expect("read"), 0).expect("parse");
+        Ok(Fonts::from_faces(vec![face], [0; 4], None, 11.0, 1.0))
+    }
+
+    /// Two windows at one key share one instance; a scale change on a shared instance moves the
+    /// window to a new entry (the other keeps its metrics), an unshared one rescales in place,
+    /// and the entry dies with its last window.
+    #[test]
+    fn pool_shares_by_key_and_moves_on_rescale() {
+        let mut pool = FontPool::default();
+        let key = FontKey::new("x", 11.0, 1.0);
+        let mut a = pool.get_with(key.clone(), one_face).expect("a");
+        let b = pool
+            .get_with(key.clone(), |_| panic!("must share"))
+            .expect("b");
+        assert!(Rc::ptr_eq(&a.fonts, &b.fonts));
+        let w1 = b.fonts.borrow().metrics().cell_w;
+        pool.rescale_with(&mut a, 2.0, one_face).expect("rescale");
+        assert!(!Rc::ptr_eq(&a.fonts, &b.fonts));
+        assert_eq!(b.fonts.borrow().metrics().cell_w, w1);
+        assert_eq!(pool.len(), 2);
+        drop(b);
+        let before = Rc::as_ptr(&a.fonts);
+        pool.rescale_with(&mut a, 1.0, |_| panic!("unshared rescales in place"))
+            .expect("in place");
+        assert_eq!(Rc::as_ptr(&a.fonts), before);
+        assert_eq!(a.key, key);
+        drop(a);
+        pool.prune();
+        assert_eq!(pool.len(), 0);
+    }
+}
