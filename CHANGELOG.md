@@ -4,6 +4,23 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.4.0 — 2026-11-05
+
+### Added
+
+- Loss recovery (plan 03, phase 3): the cterm daemon is detached from its Wayland connection, so when the compositor goes away its PTYs and sessions live on and it reconnects when a compositor comes back.
+- Reattach by session key: CDE gives each terminal spawn a `CRUCIBLE_TERM_SESSION` key; a thin client that presents a key the daemon already holds reattaches that live session instead of starting a new shell. A newer client for the same key takes over and the older one gets `Superseded` and exits 0.
+- Config key `detached-timeout` (seconds, default 30, `0` = never): how long a detached session waits after a reconnect for its client to reattach before it is closed.
+- `scripts/g3/g3.sh`: the G3 fault-injection harness (daemon SIGKILL, daemon SIGSEGV, compositor kill and restart).
+
+### Changed
+
+- **Breaking:** the daemon wire protocol is now v2. A 0.4.0 client that finds a v1 (0.3.x) daemon falls back to standalone; restart the daemon after upgrading.
+
+### G3
+
+- Measured in `docs/g3-measurement.md`: pass, 2 of 2 runs per leg. After a daemon SIGKILL or SIGSEGV, no workspace entries are lost and lost placeholders show in their original slots. After a compositor restart, the live shells reattach. Harness note: Rust's runtime swallows the first SIGSEGV, so the harness sends a second one.
+
 ## 0.3.0 — 2026-11-05
 
 ### Added
