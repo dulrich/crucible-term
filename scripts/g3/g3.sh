@@ -14,7 +14,7 @@ usage() {
 	cat <<'USAGE'
 Usage: g3.sh [--help|-h] [--build|--version] [LEG...]
 
-Legs (default: kill segv restart): kill, segv, restart, summarize.
+Legs (default: kill segv restart logout): kill, segv, restart, logout, summarize.
 Every leg runs in its own fresh nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
 XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/tmp/cde-g3w), so the nested daemon socket and
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE in daemon mode (`-o mode=auto`, CDE `restore-session #true`) onto a
@@ -32,6 +32,9 @@ Only pids this script recorded (with their start time) are ever signalled.
              (b) the saved workspace keeps the three slots; (c) the orphaned old thin clients exited 0: the compositor runs under a
              perl wrapper that is a child subreaper (prctl PR_SET_CHILD_SUBREAPER), so the killed compositor's children reparent to it and
              their wait statuses are logged; the display name after the restart must equal the one before (Assumption 1).
+  logout     the restart leg as a real logout does it: SIGHUP the recorded thin clients and quit the compositor cleanly (`msg exec quit`,
+             SIGTERM after 5 s), so the clients' hang-ups can reach the daemon before its Wayland connection goes. (a), (b) and the
+             display check as for restart; (c) the old thin clients exited 129 (128 + SIGHUP, no `close` sent).
   summarize  read target/g3/g3-*.raw and print the G3 table (target/g3/g3-summary.txt).
 
 Output: raw lines in target/g3/g3-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g3/logs/.
@@ -49,9 +52,9 @@ case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
 
 LEGS=("$@")
-[ "$#" -gt 0 ] || LEGS=(kill segv restart)
+[ "$#" -gt 0 ] || LEGS=(kill segv restart logout)
 for s in "${LEGS[@]}"; do
-	case $s in kill | segv | restart | summarize) ;; *) echo "g3.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
+	case $s in kill | segv | restart | logout | summarize) ;; *) echo "g3.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
 done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
@@ -508,6 +511,7 @@ leg_fault() { # kill|segv
 	g3_stop
 }
 leg_kill() { leg_fault kill; }
+leg_logout() { leg_restart; }
 leg_segv() { leg_fault segv; }
 
 leg_restart() {
@@ -523,7 +527,14 @@ leg_restart() {
 	watch_sample
 	echo "RESTART SIGKILL compositor $CPID at $(date +%T.%N | cut -c1-12)"
 	old_cpid=$CPID
-	sigrec KILL "$CPID" || { g3_stop; return 1; }
+	if [ "$LEG" = logout ]; then
+		for p in $pre_clients; do sigrec HUP "$p" || true; done
+		msg exec quit >/dev/null 2>&1 || true
+		for i in 1 2 3 4 5 6 7 8 9 10; do alive "$CPID" || break; sleep 0.5; done
+		if alive "$CPID"; then sigrec TERM "$CPID" || true; fi
+	else
+		sigrec KILL "$CPID" || { g3_stop; return 1; }
+	fi
 	sleep 3
 	echo "RESTART after kill: daemon alive=$(alive "$pre_d" && echo yes || echo no) wrappers alive: $(for p in $pre_r; do if alive "$p"; then echo -n "$p "; fi; done) old clients alive: $(for p in $pre_clients; do if alive "$p"; then echo -n "$p "; fi; done)"
 	echo "RESTART daemon.log so far:"
@@ -585,7 +596,7 @@ leg_restart() {
 		line=$(grep "REAPED pid=$c " "$T/reaped.log" 2>/dev/null | head -1 || true)
 		if [ -z "$line" ]; then detail="$detail old client $c: no wait status observed (alive=$(alive "$c" && echo yes || echo no));"; st="$st U"; continue; fi
 		detail="$detail old client $c: ${line#REAPED };"
-		case $line in *"exit=0 signal=0"*) st="$st 0" ;; *) st="$st X" ;; esac
+		case $LEG:$line in restart:*"exit=0 signal=0"* | logout:*"exit=129 signal=0"*) st="$st 0" ;; *) st="$st X" ;; esac
 	done
 	case $st in
 	*U*) result c UNMEASURED "$detail" ;;
@@ -602,11 +613,11 @@ leg_restart() {
 leg_summarize() {
 	perl -e '
   my $dir=shift; my (%r);
-  for my $leg (qw(kill segv restart)){ open(F,"<","$dir/g3-$leg.raw") or next;
+  for my $leg (qw(kill segv restart logout)){ open(F,"<","$dir/g3-$leg.raw") or next;
     while(<F>){ next unless /^RESULT leg=(\S+) run=(\d+) assert=(\S+) (PASS|FAIL|UNMEASURED) :: (.*)/; $r{$1}{$2}{$3}=[$4,$5]; } close F }
   print "G3 RESULT\n";
-  for my $leg (qw(kill segv restart)){ my $runs=$r{$leg}; unless($runs){ print "leg $leg: not run\n"; next }
-    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = $leg eq "restart" ? [qw(a b c display)] : [qw(a b)];
+  for my $leg (qw(kill segv restart logout)){ my $runs=$r{$leg}; unless($runs){ print "leg $leg: not run\n"; next }
+    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = ($leg eq "restart" || $leg eq "logout") ? [qw(a b c display)] : [qw(a b)];
       my $v="PASS"; for my $k (@$core){ my $s=$a->{$k} ? $a->{$k}[0] : "UNMEASURED"; $v="FAIL" if $s eq "FAIL"; $v="UNMEASURED" if $s eq "UNMEASURED" && $v eq "PASS" }
       printf "leg %-8s run %d: %s\n",$leg,$run,$v;
       for my $k (sort keys %$a){ printf "    %-10s %-10s %s\n",$k,$a->{$k}[0],substr($a->{$k}[1],0,200) } } }
