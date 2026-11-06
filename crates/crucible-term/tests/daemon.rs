@@ -276,3 +276,54 @@ fn daemon_help_is_usage_on_stdout() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("usage: cterm daemon"));
 }
+
+/// The fake Wayland connection is lost 300 ms after the daemon starts: a client killed while
+/// its session is detached does not close it (the child finishes and leaves its marker), and a
+/// child that exits while detached is relayed to its connected client.
+#[test]
+fn a_detached_session_outlives_its_client_and_exits_are_relayed() {
+    let e = Env::new("detach");
+    let marker = e.root.join("marker");
+    let mut c = e.sh(&format!("sleep 1.5; touch {}", marker.display()));
+    c.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "300");
+    let mut client = c.spawn().expect("client");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(e.log().contains("session(s) detached"), "{}", e.log());
+    client.kill().expect("kill client");
+    let _ = client.wait();
+    assert!(
+        wait_for(&marker, Duration::from_secs(5)),
+        "the detached session was closed on client EOF"
+    );
+    // Still detached (no reconnect configured): this open is refused and falls back.
+    let mut late = e.sh("exit 0");
+    late.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "300");
+    let (_, err) = status(late);
+    assert!(err.contains("no window identity"), "{err}");
+}
+
+/// A child exiting while detached is relayed as `exited` to its client.
+#[test]
+fn an_exit_while_detached_is_relayed() {
+    let e = Env::new("detach-exit");
+    let mut c = e.sh("sleep 0.8; exit 5");
+    c.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "200");
+    assert_eq!(status(c).0, 5);
+    assert!(e.log().contains("session(s) detached"), "{}", e.log());
+}
+
+/// The reconnect timer brings the (fake) display back and later opens are served again.
+#[test]
+fn the_daemon_reconnects_after_a_loss() {
+    let e = Env::new("reconnect");
+    let mut c = e.sh("sleep 0.5; exit 0");
+    c.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "100")
+        .env("CTERM_DEBUG_HEADLESS_RECONNECT_MS", "200");
+    assert_eq!(status(c).0, 0);
+    let t = Instant::now();
+    while !e.log().contains("daemon: reconnected") && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(e.log().contains("daemon: reconnected"), "{}", e.log());
+    assert_eq!(status(e.sh("exit 4")).0, 4);
+}

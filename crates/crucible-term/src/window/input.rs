@@ -79,6 +79,8 @@ pub struct SeatInput {
     primary_source: Option<PrimarySelectionSource>,
     clip_text: Arc<str>,
     primary_text: Arc<str>,
+    /// The connection the devices belong to (`None`: detached, every device gone).
+    qh: Option<QueueHandle<Host>>,
 }
 
 /// Per-window pointer gesture and selection state, owned by its [`Term`].
@@ -114,6 +116,26 @@ impl SeatInput {
             primary_source: None,
             clip_text: Arc::from(""),
             primary_text: Arc::from(""),
+            qh: Some(qh.clone()),
+        }
+    }
+
+    /// No connection: no devices, no selection sources (the detached host's seat).
+    pub(super) fn detached() -> SeatInput {
+        SeatInput {
+            keyboard: None,
+            pointer: None,
+            mods: Mods::default(),
+            serial: 0,
+            data_mgr: None,
+            data_device: None,
+            primary_mgr: None,
+            primary_device: None,
+            copy_source: None,
+            primary_source: None,
+            clip_text: Arc::from(""),
+            primary_text: Arc::from(""),
+            qh: None,
         }
     }
 
@@ -134,8 +156,8 @@ impl SeatInput {
         }
     }
 
-    fn set_clipboard(&mut self, qh: &QueueHandle<Host>, text: String, serial: u32) {
-        let (Some(mgr), Some(dev)) = (&self.data_mgr, &self.data_device) else {
+    fn set_clipboard(&mut self, text: String, serial: u32) {
+        let (Some(mgr), Some(dev), Some(qh)) = (&self.data_mgr, &self.data_device, &self.qh) else {
             return;
         };
         let src = mgr.create_copy_paste_source(qh, MIME_TYPES);
@@ -144,8 +166,9 @@ impl SeatInput {
         self.copy_source = Some(src);
     }
 
-    fn set_primary(&mut self, qh: &QueueHandle<Host>, text: String, serial: u32) {
-        let (Some(mgr), Some(dev)) = (&self.primary_mgr, &self.primary_device) else {
+    fn set_primary(&mut self, text: String, serial: u32) {
+        let (Some(mgr), Some(dev), Some(qh)) = (&self.primary_mgr, &self.primary_device, &self.qh)
+        else {
             return;
         };
         let src = mgr.create_selection_source(qh, MIME_TYPES);
@@ -517,7 +540,7 @@ impl Term {
         };
         let text = sel.text(&|r| self.session.abs_row(r));
         if !text.is_empty() {
-            seat.set_primary(&self.qh, text, serial);
+            seat.set_primary(text, serial);
         }
     }
 
@@ -530,7 +553,7 @@ impl Term {
         let text = sel.text(&|r| self.session.abs_row(r));
         if !text.is_empty() {
             let serial = seat.serial;
-            seat.set_clipboard(&self.qh, text, serial);
+            seat.set_clipboard(text, serial);
         }
     }
 
@@ -543,8 +566,8 @@ impl Term {
     ) {
         let serial = seat.serial;
         match clipboard::osc52_policy(ev, focused) {
-            Osc52::Clipboard(t) => seat.set_clipboard(&self.qh, t, serial),
-            Osc52::Primary(t) => seat.set_primary(&self.qh, t, serial),
+            Osc52::Clipboard(t) => seat.set_clipboard(t, serial),
+            Osc52::Primary(t) => seat.set_primary(t, serial),
             Osc52::Ignore => {}
         }
     }

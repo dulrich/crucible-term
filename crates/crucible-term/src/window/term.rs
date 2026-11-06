@@ -36,9 +36,9 @@ const BLINK: Duration = Duration::from_millis(500);
 /// Poll period for held buffers to be released after a suspend (only while some are held).
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-/// Per-window state.
-pub struct Term {
-    pub(super) id: TermId,
+/// The surface half of a [`Term`]: everything bound to one Wayland connection. Dropped (the
+/// session half stays) when the connection is lost; a rebind builds a new one.
+pub struct Surf {
     pub(super) pool: SlotPool,
     /// Live shm buffers, oldest first, each with the number of the frame it holds (`None`:
     /// never painted). The paint target is the buffer itself; there is no frame image.
@@ -49,6 +49,62 @@ pub struct Term {
     pub(super) viewport: Option<WpViewport>,
     pub(super) fractional: Option<WpFractionalScaleV1>,
     pub(super) qh: QueueHandle<Host>,
+    pub(super) configured: bool,
+    pub(super) frame_pending: bool,
+    /// Suspended state and the held buffers still draining (see [`lifecycle`]).
+    pub(super) life: Lifecycle,
+    /// Full-size buffers dropped from `buffers` on suspend that the compositor still held; each
+    /// is destroyed once its release is observed, then the pool may be recreated.
+    pub(super) draining: Vec<Buffer>,
+    /// The drain poll timer is registered.
+    pub(super) drain_timer: bool,
+    /// The 1×1 placeholder (from the host pool) attached while suspended.
+    pub(super) tiny: Option<Buffer>,
+}
+
+impl Surf {
+    /// A fresh surface half for `window` (role created and committed by the caller).
+    pub(super) fn new(
+        pool: SlotPool,
+        window: Window,
+        viewport: Option<WpViewport>,
+        fractional: Option<WpFractionalScaleV1>,
+        qh: QueueHandle<Host>,
+    ) -> Surf {
+        Surf {
+            pool,
+            buffers: Vec::new(),
+            frames: damage::FrameLog::default(),
+            window,
+            viewport,
+            fractional,
+            qh,
+            configured: false,
+            frame_pending: false,
+            life: Lifecycle::default(),
+            draining: Vec::new(),
+            drain_timer: false,
+            tiny: None,
+        }
+    }
+
+    /// Destroy the scaling objects; the window, surface and buffers go on drop.
+    pub(super) fn teardown(self) {
+        if let Some(vp) = self.viewport {
+            vp.destroy();
+        }
+        if let Some(f) = self.fractional {
+            f.destroy();
+        }
+    }
+}
+
+/// Per-window state: the session half (`Session`, PTY, pidfd and PTY sources, outbox, exit)
+/// plus an optional surface half ([`Surf`], `None` while detached).
+pub struct Term {
+    pub(super) id: TermId,
+    /// The surface half; `None` while detached (no connection, or not rebound yet).
+    pub(super) surf: Option<Surf>,
     pub(super) handle: LoopHandle<'static, Host>,
     pub(super) cfg: Config,
     pub(super) session: Session,
@@ -73,10 +129,8 @@ pub struct Term {
     pub(super) has_fractional: bool,
     /// Buffer size in pixels.
     pub(super) buf: (u32, u32),
-    pub(super) configured: bool,
     pub(super) dirty: bool,
     pub(super) full: bool,
-    pub(super) frame_pending: bool,
     pub(super) focused: bool,
     pub(super) blink_on: bool,
     pub(super) blink_armed: bool,
@@ -91,15 +145,6 @@ pub struct Term {
     /// `CTERM_DEBUG_MEM=1`: print memory attribution to stderr (first frame, then 4 s idle).
     pub(super) mem_debug: bool,
     pub(super) mem_first: bool,
-    /// Suspended state and the held buffers still draining (see [`lifecycle`]).
-    pub(super) life: Lifecycle,
-    /// Full-size buffers dropped from `buffers` on suspend that the compositor still held; each
-    /// is destroyed once its release is observed, then the pool may be recreated.
-    pub(super) draining: Vec<Buffer>,
-    /// The drain poll timer is registered.
-    pub(super) drain_timer: bool,
-    /// The 1×1 placeholder (from the host pool) attached while suspended.
-    pub(super) tiny: Option<Buffer>,
     /// `CTERM_DEBUG_FRAME_SUM=1`: log a checksum of every committed full-size buffer.
     pub(super) sum_debug: bool,
     /// Log a forced-full-repaint checksum after the next commit (set on resume).
@@ -218,11 +263,15 @@ impl Term {
         self.send(&replies);
         for ev in self.session.take_events() {
             match ev {
-                Event::Title(t) => self.window.set_title(if t.is_empty() {
-                    self.cfg.title.clone()
-                } else {
-                    t
-                }),
+                Event::Title(t) => {
+                    if let Some(s) = &self.surf {
+                        s.window.set_title(if t.is_empty() {
+                            self.cfg.title.clone()
+                        } else {
+                            t
+                        });
+                    }
+                }
                 other => self.on_clipboard_event(seat, &other, kbd_focus),
             }
         }
@@ -311,7 +360,7 @@ impl Term {
 
     pub(super) fn request_redraw(&mut self) {
         self.dirty = true;
-        if !self.frame_pending {
+        if !self.surf.as_ref().is_some_and(|s| s.frame_pending) {
             self.draw();
         }
     }
@@ -329,8 +378,10 @@ impl Term {
         );
         if buf != self.buf {
             self.buf = buf;
-            self.buffers.clear();
-            self.frames.reset();
+            if let Some(sf) = self.surf.as_mut() {
+                sf.buffers.clear();
+                sf.frames.reset();
+            }
         }
         let m: Metrics = self.metrics();
         let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.base_pad());
@@ -345,10 +396,12 @@ impl Term {
                 eprintln!("crucible-term: pty resize: {e}");
             }
         }
-        if let Some(vp) = &self.viewport {
-            vp.set_destination(self.logical.0 as i32, self.logical.1 as i32);
-        } else {
-            self.window.wl_surface().set_buffer_scale(self.int_scale);
+        if let Some(s) = &self.surf {
+            if let Some(vp) = &s.viewport {
+                vp.set_destination(self.logical.0 as i32, self.logical.1 as i32);
+            } else {
+                s.window.wl_surface().set_buffer_scale(self.int_scale);
+            }
         }
         self.full = true;
         self.request_redraw();
@@ -357,8 +410,16 @@ impl Term {
     /// Paint and present one frame if allowed: configured, dirty, no frame callback pending,
     /// and not inside a mode 2026 hold younger than [`SYNC_TIMEOUT`].
     pub(super) fn draw(&mut self) {
+        // Detached (no surface): the session keeps parsing PTY output; nothing is drawn.
+        if let Some(mut s) = self.surf.take() {
+            self.draw_on(&mut s);
+            self.surf = Some(s);
+        }
+    }
+
+    fn draw_on(&mut self, s: &mut Surf) {
         // Suspended: nothing is drawn; PTY output keeps feeding the session and marking dirty.
-        if !self.configured || !self.dirty || self.frame_pending || !self.life.may_draw() {
+        if !s.configured || !self.dirty || s.frame_pending || !s.life.may_draw() {
             return;
         }
         let force = std::mem::take(&mut self.force_present);
@@ -405,30 +466,30 @@ impl Term {
             return;
         }
         // Paint target: a free shm buffer, first brought up to the last committed frame.
-        let Some((buffer, held)) = self.free_buffer() else {
+        let Some((buffer, held)) = self.free_buffer(s) else {
             eprintln!("crucible-term: no shm buffer available");
             self.dirty = true;
             self.full = true;
             return;
         };
         let (w, h) = (self.buf.0 as usize, self.buf.1 as usize);
-        let current = self.frames.current();
-        let source = self
+        let current = s.frames.current();
+        let source = s
             .buffers
             .iter()
             .find(|(_, f)| *f == Some(current))
             .map(|(b, _)| b.slot());
-        match self.frames.repair(held, source.is_some()) {
+        match s.frames.repair(held, source.is_some()) {
             damage::Repair::Nothing => {}
             damage::Repair::Repaint => rows = None,
             damage::Repair::Bands(bands) => {
                 if let Some(src) = &source {
-                    copy_bands(&mut self.pool, src, &buffer.slot(), w * 4, &bands);
+                    copy_bands(&mut s.pool, src, &buffer.slot(), w * 4, &bands);
                 }
             }
             damage::Repair::All => {
                 if let Some(src) = &source {
-                    copy_bands(&mut self.pool, src, &buffer.slot(), w * 4, &[(0, h)]);
+                    copy_bands(&mut s.pool, src, &buffer.slot(), w * 4, &[(0, h)]);
                 }
             }
         }
@@ -456,9 +517,9 @@ impl Term {
         let top = self.session.viewport_top();
         let sel = self.inp.selection.as_ref();
         let selected = |r: usize, c: usize| sel.is_some_and(|s| s.contains(top + r, c));
-        let Some(px) = buffer.canvas(&mut self.pool).and_then(as_pixels) else {
+        let Some(px) = buffer.canvas(&mut s.pool).and_then(as_pixels) else {
             eprintln!("crucible-term: shm buffer not drawable");
-            self.buffers.push((buffer, None));
+            s.buffers.push((buffer, None));
             self.dirty = true;
             self.full = true;
             return;
@@ -479,14 +540,13 @@ impl Term {
         );
         if bands.is_empty() {
             // Nothing painted, but the repair above brought the buffer up to the current frame.
-            self.buffers
-                .push((buffer, Some(current).filter(|&c| c > 0)));
+            s.buffers.push((buffer, Some(current).filter(|&c| c > 0)));
             return;
         }
         // Debug-only checksums, taken before the attach (the canvas is writable until then).
         if self.sum_debug {
             self.commits += 1;
-            if let Some(bytes) = buffer.canvas(&mut self.pool) {
+            if let Some(bytes) = buffer.canvas(&mut s.pool) {
                 eprintln!(
                     "crucible-term: frame-sum: {} {} {:016x}",
                     self.id.0,
@@ -517,24 +577,24 @@ impl Term {
                 );
             }
         }
-        let surface = self.window.wl_surface().clone();
+        let surface = s.window.wl_surface().clone();
         for &(y, bh) in &bands {
             surface.damage_buffer(0, y as i32, w as i32, bh as i32);
         }
-        surface.frame(&self.qh, surface.clone());
+        surface.frame(&s.qh, surface.clone());
         if let Err(e) = buffer.attach_to(&surface) {
             eprintln!("crucible-term: attach: {e}");
         }
-        self.window.commit();
-        self.frame_pending = true;
-        let n = self.frames.commit(bands);
-        self.buffers.push((buffer, Some(n)));
-        if self.buffers.len() > 2 {
-            self.buffers.remove(0);
+        s.window.commit();
+        s.frame_pending = true;
+        let n = s.frames.commit(bands);
+        s.buffers.push((buffer, Some(n)));
+        if s.buffers.len() > 2 {
+            s.buffers.remove(0);
         }
         if self.mem_debug && self.mem_first {
             self.mem_first = false;
-            self.print_mem("first-frame");
+            self.print_mem(Some(&*s), "first-frame");
         }
     }
 
@@ -542,25 +602,32 @@ impl Term {
     /// the host pool `tiny`, give up every full-size buffer, and return the pool's memory once
     /// no full-size buffer is held. Rendering stops until [`Term::resume`].
     pub(super) fn suspend(&mut self, tiny: &mut SlotPool, shm: &Shm) {
-        let states: Vec<BufState> = self
+        if let Some(mut s) = self.surf.take() {
+            self.suspend_on(&mut s, tiny, shm);
+            self.surf = Some(s);
+        }
+    }
+
+    fn suspend_on(&mut self, s: &mut Surf, tiny: &mut SlotPool, shm: &Shm) {
+        let states: Vec<BufState> = s
             .buffers
             .iter()
             .map(|(b, _)| {
-                if self.pool.canvas(b).is_some() {
+                if s.pool.canvas(b).is_some() {
                     BufState::Released
                 } else {
                     BufState::Held
                 }
             })
             .collect();
-        let plan = self.life.suspend(&states);
+        let plan = s.life.suspend(&states);
         // Placeholder first, so the commit replacing the full-size buffer is on the wire before
         // anything is dropped (the compositor releases the old buffer on that replacement).
         match tiny.create_buffer(1, 1, 4, wl_shm::Format::Argb8888) {
             Ok((b, canvas)) => {
                 canvas.fill(0);
-                let surface = self.window.wl_surface().clone();
-                if let Some(vp) = &self.viewport {
+                let surface = s.window.wl_surface().clone();
+                if let Some(vp) = &s.viewport {
                     // Keep the window geometry: the 1×1 is scaled to the logical size.
                     vp.set_destination(self.logical.0 as i32, self.logical.1 as i32);
                 } else {
@@ -571,48 +638,55 @@ impl Term {
                     eprintln!("crucible-term: attach placeholder: {e}");
                 }
                 surface.damage_buffer(0, 0, 1, 1);
-                self.window.commit();
+                s.window.commit();
                 // The previous placeholder (if any) is destroyed by sctk on its release.
-                self.tiny = Some(b);
+                s.tiny = Some(b);
             }
             Err(e) => eprintln!("crucible-term: placeholder buffer: {e}"),
         }
         // Released buffers are destroyed now (sctk destroys an inactive `Buffer` on drop); held
         // ones wait in `draining` until their release is observed.
-        let all: Vec<(Buffer, Option<u64>)> = std::mem::take(&mut self.buffers);
+        let all: Vec<(Buffer, Option<u64>)> = std::mem::take(&mut s.buffers);
         for (i, (b, _)) in all.into_iter().enumerate() {
             if plan.drain.contains(&i) {
-                self.draining.push(b);
+                s.draining.push(b);
             }
         }
-        self.frames.reset();
+        s.frames.reset();
         if plan.recreate_pool {
-            self.recreate_pool(shm);
+            Term::recreate_pool(s, shm);
         }
-        if self.mem_debug && self.life.suspended() {
-            self.print_mem("suspended");
+        if self.mem_debug && s.life.suspended() {
+            self.print_mem(Some(&*s), "suspended");
         }
-        self.arm_drain();
+        self.arm_drain(s);
     }
 
     /// The compositor shows the window again: forget the stale frame callback (one requested
     /// before the hide may never fire), restore the integer scale, and force a full repaint into
     /// fresh buffers. The caller's relayout then draws and commits it in the same handler.
     pub(super) fn resume(&mut self) {
-        let Some(plan) = self.life.resume() else {
+        if let Some(mut s) = self.surf.take() {
+            self.resume_on(&mut s);
+            self.surf = Some(s);
+        }
+    }
+
+    fn resume_on(&mut self, s: &mut Surf) {
+        let Some(plan) = s.life.resume() else {
             return;
         };
         if plan.clear_frame_pending {
-            self.frame_pending = false;
+            s.frame_pending = false;
         }
-        if self.viewport.is_none() {
-            self.window.wl_surface().set_buffer_scale(self.int_scale);
+        if s.viewport.is_none() {
+            s.window.wl_surface().set_buffer_scale(self.int_scale);
         }
         // The compositor releases the placeholder when the full-size buffer replaces it; sctk
         // defers its destroy until then and its slot returns to the host pool.
-        self.tiny = None;
+        s.tiny = None;
         if plan.full_repaint {
-            self.frames.reset();
+            s.frames.reset();
             self.full = true;
             self.dirty = true;
             self.force_present = true;
@@ -622,10 +696,10 @@ impl Term {
 
     /// Replace the pool by an empty one, returning its mapping to the OS. Only called when no
     /// buffer of this pool is held or kept (`buffers` and `draining` are empty).
-    fn recreate_pool(&mut self, shm: &Shm) {
-        debug_assert!(self.buffers.is_empty() && self.draining.is_empty());
+    fn recreate_pool(s: &mut Surf, shm: &Shm) {
+        debug_assert!(s.buffers.is_empty() && s.draining.is_empty());
         match SlotPool::new(4096, shm) {
-            Ok(p) => self.pool = p,
+            Ok(p) => s.pool = p,
             Err(e) => eprintln!("crucible-term: recreate pool: {e}"),
         }
     }
@@ -633,70 +707,83 @@ impl Term {
     /// Destroy the draining buffers the compositor has released; on the last release while
     /// still suspended, recreate the pool. Returns whether any are left to wait for.
     pub(super) fn poll_drain(&mut self, shm: &Shm) -> bool {
+        let Some(mut s) = self.surf.take() else {
+            return false;
+        };
+        let left = self.poll_drain_on(&mut s, shm);
+        self.surf = Some(s);
+        left
+    }
+
+    fn poll_drain_on(&mut self, s: &mut Surf, shm: &Shm) -> bool {
         let mut i = 0;
         let mut recreate = false;
-        while i < self.draining.len() {
-            if self.pool.canvas(&self.draining[i]).is_some() {
+        while i < s.draining.len() {
+            if s.pool.canvas(&s.draining[i]).is_some() {
                 // Released: dropping an inactive `Buffer` destroys its wl_buffer now.
-                drop(self.draining.remove(i));
-                recreate |= self.life.release();
+                drop(s.draining.remove(i));
+                recreate |= s.life.release();
             } else {
                 i += 1;
             }
         }
-        if recreate && self.buffers.is_empty() {
-            self.recreate_pool(shm);
+        if recreate && s.buffers.is_empty() {
+            Term::recreate_pool(s, shm);
             if self.mem_debug {
-                self.print_mem("suspended-drained");
+                self.print_mem(Some(&*s), "suspended-drained");
             }
         }
-        debug_assert_eq!(self.draining.len(), self.life.draining());
-        self.life.draining() > 0
+        debug_assert_eq!(s.draining.len(), s.life.draining());
+        s.life.draining() > 0
     }
 
     /// Poll the draining buffers until all are released (sctk handles `wl_buffer.release`
     /// internally, so the window observes it through the slot state).
-    fn arm_drain(&mut self) {
-        if self.drain_timer || self.draining.is_empty() {
+    fn arm_drain(&mut self, s: &mut Surf) {
+        if s.drain_timer || s.draining.is_empty() {
             return;
         }
-        self.drain_timer = true;
+        s.drain_timer = true;
         let id = self.id;
         let r = self
             .handle
             .insert_source(Timer::from_duration(DRAIN_POLL), move |_, _, host| {
-                let shm = &host.shm;
+                let Some(shm) = host.wl.as_ref().map(|w| &w.shm) else {
+                    return TimeoutAction::Drop;
+                };
                 let Some(t) = host.terms.get_mut(&id) else {
                     return TimeoutAction::Drop;
                 };
                 if t.poll_drain(shm) {
                     TimeoutAction::ToDuration(DRAIN_POLL)
                 } else {
-                    t.drain_timer = false;
+                    if let Some(s) = t.surf.as_mut() {
+                        s.drain_timer = false;
+                    }
                     TimeoutAction::Drop
                 }
             });
         if r.is_err() {
-            self.drain_timer = false;
+            s.drain_timer = false;
         }
     }
 
     /// Debug-only (`CTERM_DEBUG_MEM=1`): byte sizes of the big per-window and shareable pieces.
-    pub(super) fn print_mem(&self, when: &str) {
+    pub(super) fn print_mem(&self, s: Option<&Surf>, when: &str) {
         let (faces, emoji, nfaces, nshapes, nglyphs, gbytes) =
             self.fonts.fonts.borrow().mem_stats();
         let (cols, rows) = self.session.size();
-        let buffer_bytes: usize = self
-            .buffers
+        let buffer_bytes: usize = s
             .iter()
+            .flat_map(|s| s.buffers.iter())
             .map(|(b, _)| (b.height() * b.stride()) as usize)
             .sum();
         eprintln!(
             "crucible-term: mem: {when} buffer_bytes={buffer_bytes} buf={}x{} pool_bytes={} live_buffers={}",
             self.buf.0,
             self.buf.1,
-            self.pool.len(),
-            self.buffers.len()
+            s.map_or(0, |s| s.pool.len()),
+            s.map_or(0, |s| s.buffers.len())
         );
         eprintln!(
             "crucible-term: mem: {when} face_bytes={faces} emoji_face_bytes={emoji} faces={nfaces} \
@@ -711,16 +798,16 @@ impl Term {
 
     /// A buffer the compositor has released, or a new one (double buffering: at most two live;
     /// a third only while the compositor holds both). Returns it with the frame it holds.
-    fn free_buffer(&mut self) -> Option<(Buffer, Option<u64>)> {
-        if let Some(i) = self
+    fn free_buffer(&mut self, s: &mut Surf) -> Option<(Buffer, Option<u64>)> {
+        if let Some(i) = s
             .buffers
             .iter()
-            .position(|(b, _)| self.pool.canvas(b).is_some())
+            .position(|(b, _)| s.pool.canvas(b).is_some())
         {
-            return Some(self.buffers.remove(i));
+            return Some(s.buffers.remove(i));
         }
         let (w, h) = (self.buf.0 as i32, self.buf.1 as i32);
-        self.pool
+        s.pool
             .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
             .map(|(b, _)| (b, None))
             .map_err(|e| eprintln!("crucible-term: create buffer: {e}"))
@@ -736,11 +823,8 @@ impl Term {
         if let Some(t) = self.write_source {
             self.handle.remove(t);
         }
-        if let Some(vp) = self.viewport {
-            vp.destroy();
-        }
-        if let Some(f) = self.fractional {
-            f.destroy();
+        if let Some(s) = self.surf {
+            s.teardown();
         }
         self.pty
     }

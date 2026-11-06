@@ -3,7 +3,11 @@
 //! client's `open` into a window on its backend (the Wayland [`Host`], or the test-only
 //! [`headless`] one), relaying `exited` when the child ends. `close` or EOF from the client
 //! closes the window through the SIGHUP grace. It stays resident after its last window
-//! (`daemon-linger N` exits after N idle seconds) and exits when the Wayland connection is lost.
+//! (`daemon-linger N` exits after N idle seconds). When the Wayland connection is lost it
+//! *detaches*: every session (PTY, child, `Session`) stays live and keeps draining its PTY, a
+//! client EOF no longer closes it, a child exit is still relayed, and the display it started on
+//! is retried every second ([`RECONNECT`]). An `open` while detached first tries the display
+//! once and is refused if it is still gone.
 //!
 //! State (connections, window → connection) is held in an `Rc<RefCell<State>>` captured by the
 //! calloop sources, so the window host carries no daemon fields.
@@ -39,6 +43,8 @@ pub const DETACH_VAR: &str = "CTERM_DAEMON_DETACH";
 pub const HEADLESS_VAR: &str = "CTERM_DEBUG_DAEMON_HEADLESS";
 /// TEST-ONLY: N > 0 defers the first granted `open` by N ms (on a calloop timer, never a sleep).
 pub const OPEN_DELAY_VAR: &str = "CTERM_DEBUG_OPEN_DELAY_MS";
+/// Retry period of the reconnect after a Wayland loss.
+const RECONNECT: Duration = Duration::from_secs(1);
 
 /// What the daemon needs from a window backend.
 pub trait Backend: 'static {
@@ -66,6 +72,28 @@ pub trait Backend: 'static {
     fn poll_hint(&self) -> Option<Duration> {
         None
     }
+    /// The loop failed (the Wayland connection is lost): detach every session and return true,
+    /// or return false to end the daemon.
+    fn on_lost(&mut self) -> bool {
+        false
+    }
+    /// No Wayland connection (detached).
+    fn is_lost(&self) -> bool {
+        false
+    }
+    /// Connected, or reconnected now to the display the daemon started on.
+    fn reconnect(&mut self) -> bool {
+        true
+    }
+    /// Window `id` has no surface (its session survives a client EOF).
+    fn is_detached(&self, _id: u64) -> bool {
+        false
+    }
+    /// Bind a new surface to the existing, surface-less session `id` (binding the window
+    /// identity with `grant`); returns its root pid.
+    // WP-2 calls this from the keyed `open`; until then only tests do.
+    #[allow(dead_code)]
+    fn attach(&mut self, id: u64, grant: Option<String>) -> Result<u32, String>;
 }
 
 impl Backend for Host {
@@ -97,6 +125,21 @@ impl Backend for Host {
     }
     fn is_idle(&self) -> bool {
         Host::is_idle(self)
+    }
+    fn on_lost(&mut self) -> bool {
+        self.detach()
+    }
+    fn is_lost(&self) -> bool {
+        Host::is_lost(self)
+    }
+    fn reconnect(&mut self) -> bool {
+        Host::reconnect(self)
+    }
+    fn is_detached(&self, id: u64) -> bool {
+        Host::is_detached(self, TermId(id))
+    }
+    fn attach(&mut self, id: u64, grant: Option<String>) -> Result<u32, String> {
+        Host::attach(self, TermId(id), grant).map_err(|e| e.to_string())
     }
 }
 
@@ -220,6 +263,18 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 );
                 return true;
             }
+            // Detached: try the display once, synchronously; still lost refuses so the client
+            // falls back to standalone. The client falls back only on `no-identity` until WP-2
+            // adds `no-wayland`, so that is the reason sent.
+            if b.is_lost() && !b.reconnect() {
+                st.send(
+                    conn,
+                    &Msg::Refused {
+                        reason: "no-identity".into(),
+                    },
+                );
+                return true;
+            }
             let decision = identity::decide(o.grant.is_some(), b.has_identity());
             if decision == identity::OpenDecision::Refuse {
                 // No identity global: a granted spawn falls back to standalone.
@@ -259,11 +314,13 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
     }
 }
 
-/// Drop `conn`: its window (if still open) closes through the SIGHUP grace.
+/// Drop `conn`: its window (if still open) closes through the SIGHUP grace, unless it is
+/// detached: a detached session outlives its client (a later rebind reattaches it).
 fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) {
     if let Some(c) = st.conns.remove(&conn)
         && let Some(id) = c.term
         && st.by_term.remove(&id).is_some()
+        && !b.is_detached(id)
     {
         b.close(id);
     }
@@ -544,10 +601,19 @@ pub fn run() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        let b = headless::Headless::new(event_loop.handle());
+        let mut b = headless::Headless::new(event_loop.handle());
+        let ms = |k: &str| {
+            headless::Headless::parse_ms(env(k).and_then(|v| v.into_string().ok()).as_deref())
+        };
+        if let Some(loss) = ms(headless::LOSS_VAR)
+            && let Err(e) = b.fake_wayland(loss, ms(headless::RECONNECT_VAR))
+        {
+            eprintln!("crucible-term: daemon: fake Wayland: {e}");
+            return ExitCode::from(1);
+        }
         serve(event_loop, b, listener, ready, linger, open_delay)
     } else {
-        match Host::new() {
+        match Host::new(true) {
             Ok((event_loop, host)) => serve(event_loop, host, listener, ready, linger, open_delay),
             Err(e) => Err(e.to_string()),
         }
@@ -559,6 +625,21 @@ pub fn run() -> ExitCode {
             eprintln!("crucible-term: daemon: {e}; exiting");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Retry the display every [`RECONNECT`] until the backend is connected again.
+fn arm_reconnect<B: Backend>(handle: &LoopHandle<'static, B>) {
+    let r = handle.insert_source(Timer::from_duration(RECONNECT), |_, _, b: &mut B| {
+        if b.reconnect() {
+            eprintln!("crucible-term: daemon: reconnected");
+            TimeoutAction::Drop
+        } else {
+            TimeoutAction::ToDuration(RECONNECT)
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("crucible-term: daemon: reconnect timer: {e}");
     }
 }
 
@@ -615,9 +696,13 @@ fn serve<B: Backend>(
             (Some(a), Some(c)) => Some(a.min(c)),
             (a, c) => a.or(c),
         };
-        event_loop
-            .dispatch(timeout, &mut b)
-            .map_err(|e| format!("event loop (Wayland connection lost?): {e}"))?;
+        if let Err(e) = event_loop.dispatch(timeout, &mut b) {
+            if !b.on_lost() {
+                return Err(format!("event loop (Wayland connection lost?): {e}"));
+            }
+            eprintln!("crucible-term: daemon: {e}; detached, reconnecting");
+            arm_reconnect(&handle);
+        }
         b.reap();
         let exits = b.drain_exits();
         if !exits.is_empty() {

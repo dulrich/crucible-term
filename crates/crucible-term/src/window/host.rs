@@ -11,8 +11,8 @@ use super::identity::generated::crucible_window_identity_v1::{
 use super::identity::{OpenSteps, open_in_order};
 use super::input::{self, SeatInput};
 use super::routing::{Routes, TermId};
-use super::term::{Term, exit_code};
-use super::{Config, WindowError, damage, lifecycle, wl};
+use super::term::{Surf, Term, exit_code};
+use super::{Config, WindowError, lifecycle, wl};
 use crate::font::FontPool;
 use crate::outbox::Outbox;
 use crucible_term_core::Session;
@@ -22,7 +22,7 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
-    EventLoop, Interest, LoopHandle, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::csd_frame::WindowState;
@@ -41,6 +41,7 @@ use smithay_client_toolkit::{
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
@@ -59,8 +60,10 @@ const CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// Poll period of the close-grace timer (it exists only while a close is pending).
 const CLOSE_POLL: Duration = Duration::from_millis(10);
 
-/// The process's windows and everything they share; the calloop event loop's data.
-pub struct Host {
+/// The connection-bound half of the host: registry, globals, seat, `Shm` and the identity
+/// manager, plus the connection's calloop source. Dropped whole when the connection is lost
+/// (daemon mode) and rebuilt by [`Host::reconnect`].
+pub(crate) struct Wl {
     pub(super) registry: RegistryState,
     pub(super) seat: SeatState,
     pub(super) output: OutputState,
@@ -72,8 +75,21 @@ pub struct Host {
     /// `crucible_window_identity_manager_v1`; used only by the daemon's granted opens.
     pub(super) identity: Option<CrucibleWindowIdentityManagerV1>,
     pub(super) qh: QueueHandle<Host>,
+    /// The connection's `WaylandSource` in the loop (removed on loss).
+    source: RegistrationToken,
+    /// Host-wide pool for the 1×1 placeholder buffers suspended windows show (created lazily on
+    /// the first suspend, shared by all windows).
+    pub(super) tiny_pool: Option<SlotPool>,
+}
+
+/// The process's windows and everything they share; the calloop event loop's data. The
+/// sessions (each [`Term`]'s PTY, pidfd and `Session`) are owned here independently of the
+/// optional Wayland half, so a daemon survives the loss of its connection.
+pub struct Host {
+    /// The Wayland half; `None` while detached.
+    pub(super) wl: Option<Wl>,
     pub(super) handle: LoopHandle<'static, Host>,
-    /// Seat-wide input: devices, modifiers, serial, clipboard sources.
+    /// Seat-wide input: devices, modifiers, serial, clipboard sources (empty while detached).
     pub(super) seat_in: SeatInput,
     pub(super) fonts: FontPool,
     pub(super) terms: BTreeMap<TermId, Term>,
@@ -83,9 +99,20 @@ pub struct Host {
     exits: BTreeMap<TermId, i32>,
     /// Closed windows whose child is still in its SIGHUP grace.
     closing: usize,
-    /// Host-wide pool for the 1×1 placeholder buffers suspended windows show (created lazily on
-    /// the first suspend, shared by all windows).
-    pub(super) tiny_pool: Option<SlotPool>,
+    /// Daemon mode: a lost connection detaches the sessions. Standalone: the loop ends.
+    detachable: bool,
+    /// The display socket captured at start; reconnects go there.
+    display: Option<PathBuf>,
+}
+
+/// The display socket libwayland would connect to: `$WAYLAND_DISPLAY` (default `wayland-0`)
+/// under `$XDG_RUNTIME_DIR`, or itself when absolute.
+pub(crate) fn display_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let name = PathBuf::from(env("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into()));
+    if name.is_absolute() {
+        return Some(name);
+    }
+    Some(PathBuf::from(env("XDG_RUNTIME_DIR")?).join(name))
 }
 
 /// One step of the close grace: the child's `try_wait` result at `now` against `deadline`.
@@ -114,13 +141,14 @@ fn lp(e: impl std::fmt::Display) -> WindowError {
 }
 
 /// Spawn `argv` on a PTY (child environment `env`) in a new window and run until the child exits
-/// or the window closes. Returns the child's exit code (128 + signal when killed).
+/// or the window closes. Returns the child's exit code (128 + signal when killed). A lost
+/// connection ends the loop with an error (standalone never detaches).
 pub fn run(
     cfg: &Config,
     argv: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
 ) -> Result<i32, WindowError> {
-    let (mut event_loop, mut host) = Host::new()?;
+    let (mut event_loop, mut host) = Host::new(false)?;
     let (id, _) = host.open_window(cfg, argv, env, None)?;
     while !host.terms.is_empty() || host.closing > 0 {
         event_loop.dispatch(None, &mut host).map_err(lp)?;
@@ -131,7 +159,7 @@ pub fn run(
 
 /// The real proxy layer behind [`open_in_order`].
 struct RealSteps<'a> {
-    host: &'a Host,
+    wl: &'a Wl,
     id: TermId,
     spec: Option<SpawnSpec>,
     viewport: Option<WpViewport>,
@@ -153,10 +181,10 @@ impl OpenSteps for RealSteps<'_> {
     }
 
     fn create_surface(&mut self) -> Self::Surface {
-        let h = self.host;
-        let qh = &h.qh;
-        let surface = h.compositor.create_surface(qh);
-        if let (Some(vp), Some(fm)) = (&h.viewporter, &h.fractional_mgr) {
+        let w = self.wl;
+        let qh = &w.qh;
+        let surface = w.compositor.create_surface(qh);
+        if let (Some(vp), Some(fm)) = (&w.viewporter, &w.fractional_mgr) {
             self.viewport = Some(vp.get_viewport(&surface, qh, ()));
             self.fractional = Some(fm.get_fractional_scale(&surface, qh, self.id));
         }
@@ -164,16 +192,16 @@ impl OpenSteps for RealSteps<'_> {
     }
 
     fn bind_surface(&mut self, surface: &Self::Surface, grant: &str, root_pid: u32) {
-        if let Some(m) = &self.host.identity {
-            m.bind_surface(surface, grant.to_owned(), root_pid, &self.host.qh, ());
+        if let Some(m) = &self.wl.identity {
+            m.bind_surface(surface, grant.to_owned(), root_pid, &self.wl.qh, ());
         }
     }
 
     fn create_role(&mut self, surface: Self::Surface) -> Self::Role {
         self.surface_id = Some(surface.id());
-        self.host
+        self.wl
             .xdg
-            .create_window(surface, WindowDecorations::RequestServer, &self.host.qh)
+            .create_window(surface, WindowDecorations::RequestServer, &self.wl.qh)
     }
 }
 
@@ -206,19 +234,15 @@ impl Dispatch<CrucibleWindowIdentityV1, ()> for Host {
     }
 }
 
-impl Host {
-    /// Connect to Wayland and bind the globals. The host stays resident with zero windows; the
-    /// caller drives the returned loop (the daemon inserts its own sources through
-    /// [`EventLoop::handle`]) and calls [`Host::reap`] after each dispatch.
-    pub(crate) fn new() -> Result<(EventLoop<'static, Host>, Host), WindowError> {
-        let conn = Connection::connect_to_env().map_err(wl)?;
+impl Wl {
+    /// Bind the globals on `conn` and insert its `WaylandSource` into the loop. Also returns the
+    /// connection's seat input.
+    fn connect(
+        conn: Connection,
+        handle: &LoopHandle<'static, Host>,
+    ) -> Result<(Wl, SeatInput), WindowError> {
         let (globals, queue) = registry_queue_init::<Host>(&conn).map_err(wl)?;
         let qh = queue.handle();
-        let event_loop: EventLoop<Host> = EventLoop::try_new().map_err(lp)?;
-        let handle = event_loop.handle();
-        WaylandSource::new(conn.clone(), queue)
-            .insert(handle.clone())
-            .map_err(lp)?;
         let compositor = CompositorState::bind(&globals, &qh).map_err(wl)?;
         let xdg = XdgShell::bind(&globals, &qh).map_err(wl)?;
         let shm = Shm::bind(&globals, &qh).map_err(wl)?;
@@ -229,28 +253,139 @@ impl Host {
         let identity = globals
             .bind::<CrucibleWindowIdentityManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
-        let host = Host {
-            registry: RegistryState::new(&globals),
-            seat: SeatState::new(&globals, &qh),
-            output: OutputState::new(&globals, &qh),
-            shm,
-            compositor,
-            xdg,
-            viewporter,
-            fractional_mgr,
-            identity,
-            seat_in: SeatInput::new(&globals, &qh),
-            qh,
+        let seat_in = SeatInput::new(&globals, &qh);
+        let registry = RegistryState::new(&globals);
+        let seat = SeatState::new(&globals, &qh);
+        let output = OutputState::new(&globals, &qh);
+        let source = WaylandSource::new(conn, queue)
+            .insert(handle.clone())
+            .map_err(lp)?;
+        Ok((
+            Wl {
+                registry,
+                seat,
+                output,
+                shm,
+                compositor,
+                xdg,
+                viewporter,
+                fractional_mgr,
+                identity,
+                qh,
+                source,
+                tiny_pool: None,
+            },
+            seat_in,
+        ))
+    }
+}
+
+impl Host {
+    /// Connect to Wayland and bind the globals. The host stays resident with zero windows; the
+    /// caller drives the returned loop (the daemon inserts its own sources through
+    /// [`EventLoop::handle`]) and calls [`Host::reap`] after each dispatch. `detachable`
+    /// (daemon mode): a lost connection detaches the sessions ([`Host::detach`]) and
+    /// [`Host::reconnect`] retries the display captured here.
+    pub(crate) fn new(detachable: bool) -> Result<(EventLoop<'static, Host>, Host), WindowError> {
+        let conn = Connection::connect_to_env().map_err(wl)?;
+        let event_loop: EventLoop<Host> = EventLoop::try_new().map_err(lp)?;
+        let handle = event_loop.handle();
+        let (w, seat_in) = Wl::connect(conn, &handle)?;
+        let mut host = Host::detached(handle, detachable, display_path(&|k| std::env::var_os(k)));
+        host.wl = Some(w);
+        host.seat_in = seat_in;
+        Ok((event_loop, host))
+    }
+
+    /// A host with no connection (the detached state; also the compositor-free test host).
+    fn detached(
+        handle: LoopHandle<'static, Host>,
+        detachable: bool,
+        display: Option<PathBuf>,
+    ) -> Host {
+        Host {
+            wl: None,
             handle,
+            seat_in: SeatInput::detached(),
             fonts: FontPool::default(),
             terms: BTreeMap::new(),
             routes: Routes::default(),
             next_id: 1,
             exits: BTreeMap::new(),
             closing: 0,
-            tiny_pool: None,
+            detachable,
+            display,
+        }
+    }
+
+    /// The connection is gone: drop every Wayland object (surfaces, seat, globals, the source)
+    /// and keep every session (PTY source, pidfd, `Session`), which goes on parsing output.
+    /// Returns false (nothing dropped) when the host is not detachable (standalone).
+    pub(crate) fn detach(&mut self) -> bool {
+        if !self.detachable {
+            return false;
+        }
+        for t in self.terms.values_mut() {
+            if let Some(s) = t.surf.take() {
+                s.teardown();
+            }
+            // Unfocused: the blink timer stops instead of ticking for no surface.
+            t.focused = false;
+        }
+        self.routes = Routes::default();
+        self.seat_in = SeatInput::detached();
+        if let Some(w) = self.wl.take() {
+            self.handle.remove(w.source);
+        }
+        eprintln!(
+            "crucible-term: Wayland connection lost; {} session(s) detached",
+            self.terms.len()
+        );
+        true
+    }
+
+    /// No Wayland connection.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.wl.is_none()
+    }
+
+    /// Session `id` has no surface (detached, or not rebound since a reconnect).
+    pub(crate) fn is_detached(&self, id: TermId) -> bool {
+        self.terms.get(&id).is_some_and(|t| t.surf.is_none())
+    }
+
+    /// Connected, or a new connection to the captured display was established now. Detached
+    /// sessions stay surface-less until [`Host::attach`] binds them.
+    pub(crate) fn reconnect(&mut self) -> bool {
+        if self.wl.is_some() {
+            return true;
+        }
+        let Some(path) = self.display.clone() else {
+            return false;
         };
-        Ok((event_loop, host))
+        let conn = match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(s) => match Connection::from_socket(s) {
+                Ok(c) => c,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        match Wl::connect(conn, &self.handle) {
+            Ok((w, seat_in)) => {
+                self.wl = Some(w);
+                self.seat_in = seat_in;
+                eprintln!(
+                    "crucible-term: Wayland reconnected to {}; {} session(s) detached",
+                    path.display(),
+                    self.terms.len()
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("crucible-term: Wayland reconnect: {e}");
+                false
+            }
+        }
     }
 
     /// Open one toplevel running `argv` with environment `env` on a new PTY; returns the window
@@ -262,12 +397,16 @@ impl Host {
         env: Vec<(OsString, OsString)>,
         grant: Option<String>,
     ) -> Result<(TermId, u32), WindowError> {
+        let w = self
+            .wl
+            .as_ref()
+            .ok_or_else(|| WindowError::Wayland("no Wayland connection".into()))?;
         let id = TermId(self.next_id);
         self.next_id += 1;
         // A grant without the global cannot bind: open as an ungranted window.
-        let grant = grant.filter(|_| self.identity.is_some());
+        let grant = grant.filter(|_| w.identity.is_some());
         let mut steps = RealSteps {
-            host: self,
+            wl: w,
             id,
             spec: Some(SpawnSpec {
                 argv,
@@ -292,7 +431,31 @@ impl Host {
         window.set_title(cfg.title.clone());
         window.set_app_id(cfg.app_id.clone());
         window.commit();
+        let pty = match early_pty {
+            Some(pty) => pty,
+            None => Pty::spawn(&spec.expect("spawn spec unused")).map_err(WindowError::Pty)?,
+        };
+        let mut term = self.new_session(id, cfg, pty)?;
+        let shm = &self.wl.as_ref().expect("connected above").shm;
+        let pool =
+            SlotPool::new((term.logical.0 * term.logical.1 * 4) as usize, shm).map_err(wl)?;
+        term.has_fractional = fractional.is_some();
+        term.surf = Some(Surf::new(
+            pool,
+            window,
+            viewport,
+            fractional,
+            self.wl.as_ref().expect("connected above").qh.clone(),
+        ));
+        let root_pid = term.pty.pid();
+        self.routes.insert(surface_id, id);
+        self.terms.insert(id, term);
+        Ok((id, root_pid))
+    }
 
+    /// The session half of window `id` on `pty`: the PTY and pidfd sources and the `Session`,
+    /// with no surface.
+    fn new_session(&mut self, id: TermId, cfg: &Config, pty: Pty) -> Result<Term, WindowError> {
         let fonts = self
             .fonts
             .get(&cfg.settings.family, cfg.settings.size_pt, 1.0)
@@ -302,14 +465,12 @@ impl Host {
             u32::from(cfg.cols) * m.cell_w + 2 * cfg.settings.pad.0,
             u32::from(cfg.rows) * m.cell_h + 2 * cfg.settings.pad.1,
         );
-        let pty = match early_pty {
-            Some(pty) => pty,
-            None => Pty::spawn(&spec.expect("spawn spec unused")).map_err(WindowError::Pty)?,
-        };
         let master = pty.master().try_clone().map_err(lp)?;
         // Non-blocking so one wakeup drains everything the child wrote.
         rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).map_err(lp)?;
         let mut sources = Vec::new();
+        // The PTY source belongs to the session, not the surface: it keeps draining (and the
+        // session keeps parsing) while detached, so the child never blocks on a full PTY.
         sources.push(
             self.handle
                 .insert_source(
@@ -356,17 +517,9 @@ impl Host {
             None => {}
         }
 
-        let pool = SlotPool::new((logical.0 * logical.1 * 4) as usize, &self.shm).map_err(wl)?;
         let mut term = Term {
             id,
-            pool,
-            buffers: Vec::new(),
-            frames: damage::FrameLog::default(),
-            window,
-            viewport,
-            has_fractional: fractional.is_some(),
-            fractional,
-            qh: self.qh.clone(),
+            surf: None,
             handle: self.handle.clone(),
             cfg: cfg.clone(),
             session: Session::new(
@@ -385,11 +538,10 @@ impl Host {
             logical,
             scale: 1.0,
             int_scale: 1,
+            has_fractional: false,
             buf: (0, 0),
-            configured: false,
             dirty: false,
             full: true,
-            frame_pending: false,
             focused: true,
             blink_on: true,
             blink_armed: false,
@@ -400,10 +552,6 @@ impl Host {
             close_requested: false,
             mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
             mem_first: true,
-            life: lifecycle::Lifecycle::default(),
-            draining: Vec::new(),
-            drain_timer: false,
-            tiny: None,
             sum_debug: std::env::var_os("CTERM_DEBUG_FRAME_SUM").is_some_and(|v| v == "1"),
             sum_full_pending: false,
             commits: 0,
@@ -415,21 +563,71 @@ impl Host {
                 Timer::from_duration(Duration::from_secs(4)),
                 move |_, _, host| {
                     if let Some(t) = host.terms.get(&id) {
-                        t.print_mem("idle-4s");
+                        t.print_mem(t.surf.as_ref(), "idle-4s");
                     }
                     TimeoutAction::Drop
                 },
             );
         }
-        let root_pid = term.pty.pid();
-        self.routes.insert(surface_id, id);
-        self.terms.insert(id, term);
-        Ok((id, root_pid))
+        Ok(term)
+    }
+
+    /// Bind a new surface to the existing, surface-less session `id` (the reattach after a
+    /// loss), binding the window identity with `grant` when the global is advertised. Returns
+    /// the session's root pid. The session's grid and scrollback carry over; the new surface
+    /// repaints in full on its first configure.
+    // WP-2 wires this to the keyed `open`; nothing calls it yet outside tests.
+    #[allow(dead_code)]
+    pub(crate) fn attach(&mut self, id: TermId, grant: Option<String>) -> Result<u32, WindowError> {
+        let w = self
+            .wl
+            .as_ref()
+            .ok_or_else(|| WindowError::Wayland("no Wayland connection".into()))?;
+        let t = self
+            .terms
+            .get_mut(&id)
+            .filter(|t| t.exit.is_none() && !t.close_requested)
+            .ok_or_else(|| WindowError::Wayland(format!("no session {}", id.0)))?;
+        if t.surf.is_some() {
+            return Err(WindowError::Wayland(format!("session {} is bound", id.0)));
+        }
+        let root_pid = t.pty.pid();
+        let mut steps = RealSteps {
+            wl: w,
+            id,
+            spec: None,
+            viewport: None,
+            fractional: None,
+            surface_id: None,
+        };
+        let surface = steps.create_surface();
+        if let Some(g) = grant.filter(|_| w.identity.is_some()) {
+            steps.bind_surface(&surface, &g, root_pid);
+        }
+        let window = steps.create_role(surface);
+        let RealSteps {
+            viewport,
+            fractional,
+            surface_id,
+            ..
+        } = steps;
+        window.set_title(t.cfg.title.clone());
+        window.set_app_id(t.cfg.app_id.clone());
+        window.commit();
+        let pool = SlotPool::new((t.logical.0 * t.logical.1 * 4) as usize, &w.shm).map_err(wl)?;
+        t.has_fractional = fractional.is_some();
+        t.surf = Some(Surf::new(pool, window, viewport, fractional, w.qh.clone()));
+        t.buf = (0, 0);
+        t.full = true;
+        t.dirty = true;
+        t.focused = true;
+        self.routes.insert(surface_id.expect("role step ran"), id);
+        Ok(root_pid)
     }
 
     /// Whether the compositor advertises the window-identity global.
     pub(crate) fn has_identity(&self) -> bool {
-        self.identity.is_some()
+        self.wl.as_ref().is_some_and(|w| w.identity.is_some())
     }
 
     /// Ask window `id` to close, as the compositor's close request does: the next [`Host::reap`]
@@ -516,6 +714,14 @@ impl Host {
         }
     }
 
+    /// The Wayland half, for sctk's state accessors. They are only called while dispatching the
+    /// connection's queue, which exists only while the half does (its source is removed with it).
+    fn live(&mut self) -> &mut Wl {
+        self.wl
+            .as_mut()
+            .expect("sctk state is only reached from a live connection's dispatch")
+    }
+
     /// The window owning `surface`.
     pub(super) fn term_of(&mut self, surface: &wl_surface::WlSurface) -> Option<&mut Term> {
         let id = self.routes.term(&surface.id())?;
@@ -560,7 +766,9 @@ impl CompositorHandler for Host {
         _: u32,
     ) {
         if let Some(t) = self.term_of(surface) {
-            t.frame_pending = false;
+            if let Some(s) = t.surf.as_mut() {
+                s.frame_pending = false;
+            }
             t.draw();
         }
     }
@@ -602,35 +810,38 @@ impl WindowHandler for Host {
         let Some(id) = self.routes.term(&window.wl_surface().id()) else {
             return;
         };
-        let Some(t) = self.terms.get_mut(&id) else {
+        let (Some(t), Some(w)) = (self.terms.get_mut(&id), self.wl.as_mut()) else {
             return;
         };
-        if let (Some(w), Some(h)) = configure.new_size {
-            t.logical = (w.get(), h.get());
+        let Some(s) = t.surf.as_mut() else {
+            return;
+        };
+        s.configured = true;
+        let transition = s
+            .life
+            .transition(configure.state.contains(WindowState::SUSPENDED));
+        if let (Some(wd), Some(h)) = configure.new_size {
+            t.logical = (wd.get(), h.get());
         }
         let focused = configure.state.contains(WindowState::ACTIVATED);
         if focused != t.focused {
             t.focused = focused;
             t.arm_blink();
         }
-        t.configured = true;
         // `suspended` transitions (never taken on a compositor that does not send it). sctk has
         // already acked this configure, so the commits below follow the ack. Suspend runs before
         // the relayout (whose draw is then a no-op); resume clears the stale frame-pending
         // before it, so the relayout's draw repaints and commits the whole grid right here.
-        match t
-            .life
-            .transition(configure.state.contains(WindowState::SUSPENDED))
-        {
+        match transition {
             lifecycle::Transition::Suspend => {
-                if self.tiny_pool.is_none() {
-                    match SlotPool::new(4096, &self.shm) {
-                        Ok(p) => self.tiny_pool = Some(p),
+                if w.tiny_pool.is_none() {
+                    match SlotPool::new(4096, &w.shm) {
+                        Ok(p) => w.tiny_pool = Some(p),
                         Err(e) => eprintln!("crucible-term: placeholder pool: {e}"),
                     }
                 }
-                if let Some(tiny) = self.tiny_pool.as_mut() {
-                    t.suspend(tiny, &self.shm);
+                if let Some(tiny) = w.tiny_pool.as_mut() {
+                    t.suspend(tiny, &w.shm);
                 }
             }
             lifecycle::Transition::Resume => t.resume(),
@@ -642,7 +853,7 @@ impl WindowHandler for Host {
 
 impl OutputHandler for Host {
     fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output
+        &mut self.live().output
     }
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -651,7 +862,7 @@ impl OutputHandler for Host {
 
 impl SeatHandler for Host {
     fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat
+        &mut self.live().seat
     }
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         self.seat_in.bind_devices(qh, &seat);
@@ -668,7 +879,10 @@ impl SeatHandler for Host {
                 // xkbcommon keymap from the compositor; sctk's calloop timer drives repeat
                 // from `repeat_info` (no busy loop, no timer while no key is held). Repeat
                 // goes to the window holding keyboard focus.
-                let kbd = self.seat.get_keyboard_with_repeat(
+                let Some(w) = self.wl.as_mut() else {
+                    return;
+                };
+                let kbd = w.seat.get_keyboard_with_repeat(
                     qh,
                     &seat,
                     None,
@@ -681,7 +895,10 @@ impl SeatHandler for Host {
                 }
             }
             Capability::Pointer if self.seat_in.pointer.is_none() => {
-                match self.seat.get_pointer(qh, &seat) {
+                let Some(w) = self.wl.as_mut() else {
+                    return;
+                };
+                match w.seat.get_pointer(qh, &seat) {
                     Ok(p) => self.seat_in.pointer = Some(p),
                     Err(e) => eprintln!("crucible-term: pointer: {e}"),
                 }
@@ -719,13 +936,13 @@ impl SeatHandler for Host {
 
 impl ShmHandler for Host {
     fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
+        &mut self.live().shm
     }
 }
 
 impl ProvidesRegistryState for Host {
     fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
+        &mut self.live().registry
     }
     registry_handlers![OutputState, SeatState];
 }
@@ -816,5 +1033,146 @@ mod tests {
         assert_eq!(grace_step(Ok(None), later, later), Grace::Done(129));
         let err = std::io::Error::other("x");
         assert_eq!(grace_step(Err(err), now, later), Grace::Done(129));
+    }
+}
+
+/// The detach path without a compositor: a [`Host`] whose Wayland half is absent owns sessions
+/// exactly as a detached daemon does.
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    fn host(detachable: bool, display: Option<PathBuf>) -> (EventLoop<'static, Host>, Host) {
+        let ev: EventLoop<Host> = EventLoop::try_new().expect("event loop");
+        let h = Host::detached(ev.handle(), detachable, display);
+        (ev, h)
+    }
+
+    /// A surface-less session on `sh -c script`, as a detached daemon holds it.
+    fn spawn(h: &mut Host, script: &str) -> TermId {
+        let cfg = Config::default();
+        let pty = Pty::spawn(&SpawnSpec {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            cwd: cfg.cwd.clone(),
+            env: vec![("PATH".into(), std::env::var_os("PATH").unwrap_or_default())],
+            size: (cfg.cols, cfg.rows),
+        })
+        .expect("spawn");
+        let id = TermId(h.next_id);
+        h.next_id += 1;
+        let t = h.new_session(id, &cfg, pty).expect("session");
+        h.terms.insert(id, t);
+        id
+    }
+
+    /// Dispatch until `id`'s exit is recorded (or `within` passes); returns it.
+    fn run_until_exit(
+        ev: &mut EventLoop<'static, Host>,
+        h: &mut Host,
+        id: TermId,
+        within: Duration,
+    ) -> Option<i32> {
+        let t0 = Instant::now();
+        while t0.elapsed() < within {
+            ev.dispatch(Some(Duration::from_millis(50)), h)
+                .expect("dispatch");
+            h.reap();
+            if let Some(c) = h.exits.get(&id) {
+                return Some(*c);
+            }
+        }
+        None
+    }
+
+    /// A loss keeps every session: the PTY sources stay registered, the `Session` stays, and
+    /// the session reports detached; the host is lost until a reconnect.
+    #[test]
+    fn a_session_survives_a_loss() {
+        let (mut ev, mut h) = host(true, None);
+        let id = spawn(&mut h, "printf ready; exec cat");
+        assert!(h.detach(), "daemon mode detaches");
+        assert!(h.is_lost() && h.is_detached(id));
+        for _ in 0..5 {
+            ev.dispatch(Some(Duration::from_millis(20)), &mut h)
+                .unwrap();
+            h.reap();
+        }
+        let t = h.terms.get(&id).expect("session kept");
+        assert!(t.exit.is_none() && t.surf.is_none());
+        assert_eq!(t.sources.len(), 2, "PTY and pidfd sources kept");
+        // Cleanup: the session closes through the grace (our own child).
+        h.close(id);
+        h.reap();
+        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
+    }
+
+    /// Detached, the session keeps draining and parsing its PTY: a 4 MiB writer completes (it
+    /// would block forever on a full PTY) and its exit code is recorded for the relay.
+    #[test]
+    fn a_detached_session_drains_a_flooding_child_and_records_its_exit() {
+        let (mut ev, mut h) = host(true, None);
+        let id = spawn(&mut h, "head -c 4194304 /dev/zero | tr '\\0' x; exit 7");
+        assert!(h.detach());
+        assert_eq!(
+            run_until_exit(&mut ev, &mut h, id, Duration::from_secs(30)),
+            Some(7)
+        );
+        assert!(h.terms.is_empty(), "the exited session is removed");
+    }
+
+    /// Standalone never detaches: the loss ends the loop and nothing is dropped.
+    #[test]
+    fn standalone_does_not_detach() {
+        let (mut ev, mut h) = host(false, None);
+        let id = spawn(&mut h, "exec cat");
+        assert!(!h.detach(), "standalone: the loss is the loop error");
+        assert!(h.terms.contains_key(&id));
+        h.close(id);
+        h.reap();
+        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
+    }
+
+    /// Reconnect targets the captured display only; an unreachable one leaves the host lost,
+    /// and an attach while lost is refused without touching the session.
+    #[test]
+    fn reconnect_to_a_missing_display_stays_detached() {
+        let gone = std::env::temp_dir().join(format!("cterm-no-display-{}", std::process::id()));
+        let (mut ev, mut h) = host(true, Some(gone));
+        let id = spawn(&mut h, "exec cat");
+        assert!(!h.reconnect());
+        assert!(h.is_lost());
+        assert!(h.attach(id, None).is_err());
+        assert!(h.is_detached(id));
+        h.close(id);
+        h.reap();
+        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn display_path_follows_libwayland() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        assert_eq!(
+            display_path(&env(&[
+                ("XDG_RUNTIME_DIR", "/run/u"),
+                ("WAYLAND_DISPLAY", "w-1")
+            ])),
+            Some(PathBuf::from("/run/u/w-1"))
+        );
+        assert_eq!(
+            display_path(&env(&[("XDG_RUNTIME_DIR", "/run/u")])),
+            Some(PathBuf::from("/run/u/wayland-0"))
+        );
+        assert_eq!(
+            display_path(&env(&[("WAYLAND_DISPLAY", "/abs/w")])),
+            Some(PathBuf::from("/abs/w"))
+        );
+        assert_eq!(display_path(&env(&[("WAYLAND_DISPLAY", "w")])), None);
     }
 }

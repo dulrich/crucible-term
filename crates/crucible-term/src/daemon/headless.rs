@@ -4,26 +4,39 @@
 //! lock race, exit relay, close → SIGHUP, grant stripping) without a compositor. `open` spawns
 //! the PTY and child with no surface and drains the PTY master so the child never blocks on
 //! output. It is not a user feature and is not documented as one.
+//!
+//! It also fakes a Wayland connection for the detach tests: `CTERM_DEBUG_HEADLESS_LOSS_MS=N`
+//! loses it N ms after start (a socketpair whose peer is dropped, so the loop fails exactly as on
+//! a real loss), and `CTERM_DEBUG_HEADLESS_RECONNECT_MS=M` makes the display reachable again M
+//! ms after the loss (unset: never).
 
 use super::Backend;
 use crucible_term_core::pty::{Pty, SpawnSpec};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
     Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// SIGHUP grace before SIGKILL, as the Wayland host's close grace.
 const GRACE: Duration = Duration::from_millis(500);
+/// TEST-ONLY: lose the fake Wayland connection N ms after start.
+pub const LOSS_VAR: &str = "CTERM_DEBUG_HEADLESS_LOSS_MS";
+/// TEST-ONLY: the fake display is reachable again M ms after the loss.
+pub const RECONNECT_VAR: &str = "CTERM_DEBUG_HEADLESS_RECONNECT_MS";
 
 struct Kid {
     pty: Pty,
     tokens: Vec<RegistrationToken>,
     /// Set once closed: the SIGHUP grace deadline.
     deadline: Option<Instant>,
+    /// Has a (fake) surface; cleared by a loss, set again by [`Backend::attach`].
+    attached: bool,
 }
 
 /// The headless backend; the calloop data in headless mode.
@@ -32,6 +45,12 @@ pub struct Headless {
     next: u64,
     kids: BTreeMap<u64, Kid>,
     exits: Vec<(u64, i32)>,
+    /// The fake connection's source, while connected.
+    fake: Option<RegistrationToken>,
+    /// When the fake connection was lost.
+    lost_at: Option<Instant>,
+    /// How long after a loss the fake display is reachable again (`None`: never).
+    back_after: Option<Duration>,
 }
 
 impl Headless {
@@ -42,7 +61,53 @@ impl Headless {
             next: 1,
             kids: BTreeMap::new(),
             exits: Vec::new(),
+            fake: None,
+            lost_at: None,
+            back_after: None,
         }
+    }
+
+    /// Fake a Wayland connection that is lost `loss` after now; reachable again `back_after`
+    /// after the loss.
+    pub fn fake_wayland(
+        &mut self,
+        loss: Duration,
+        back_after: Option<Duration>,
+    ) -> Result<(), String> {
+        let (ours, peer) = UnixStream::pair().map_err(|e| e.to_string())?;
+        ours.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let mut ours_r = ours.try_clone().map_err(|e| e.to_string())?;
+        let tok = self
+            .handle
+            .insert_source(
+                Generic::new(ours, Interest::READ, Mode::Level),
+                move |_, _, _| {
+                    let mut b = [0u8; 64];
+                    match ours_r.read(&mut b) {
+                        Ok(0) => Err(std::io::Error::other("fake Wayland connection lost")),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            Ok(PostAction::Continue)
+                        }
+                        Ok(_) | Err(_) => Ok(PostAction::Continue),
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let mut peer_slot = Some(peer);
+        self.handle
+            .insert_source(Timer::from_duration(loss), move |_, _, _| {
+                drop(peer_slot.take());
+                TimeoutAction::Drop
+            })
+            .map_err(|e| e.to_string())?;
+        self.fake = Some(tok);
+        self.back_after = back_after;
+        Ok(())
+    }
+
+    /// TEST-ONLY: parse a millisecond env value (unset or unparsable: `None`).
+    pub fn parse_ms(v: Option<&str>) -> Option<Duration> {
+        v?.trim().parse().ok().map(Duration::from_millis)
     }
 }
 
@@ -65,6 +130,9 @@ impl Backend for Headless {
         env: Vec<(OsString, OsString)>,
         _grant: Option<String>,
     ) -> Result<(u64, u32), String> {
+        if self.is_lost() {
+            return Err("no Wayland connection".into());
+        }
         let pty = Pty::spawn(&SpawnSpec {
             argv,
             cwd: cfg.cwd.clone(),
@@ -119,6 +187,7 @@ impl Backend for Headless {
                 pty,
                 tokens,
                 deadline: None,
+                attached: true,
             },
         );
         Ok((id, pid))
@@ -168,5 +237,55 @@ impl Backend for Headless {
             .values()
             .any(|k| k.deadline.is_some())
             .then_some(Duration::from_millis(10))
+    }
+
+    fn on_lost(&mut self) -> bool {
+        let Some(t) = self.fake.take() else {
+            return false;
+        };
+        self.handle.remove(t);
+        for k in self.kids.values_mut() {
+            k.attached = false;
+        }
+        self.lost_at = Some(Instant::now());
+        eprintln!(
+            "crucible-term: Wayland connection lost; {} session(s) detached",
+            self.kids.len()
+        );
+        true
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost_at.is_some()
+    }
+
+    fn reconnect(&mut self) -> bool {
+        let Some(at) = self.lost_at else {
+            return true;
+        };
+        if self.back_after.is_some_and(|d| at.elapsed() >= d) {
+            self.lost_at = None;
+            eprintln!("crucible-term: Wayland reconnected (fake)");
+            return true;
+        }
+        false
+    }
+
+    fn is_detached(&self, id: u64) -> bool {
+        self.kids.get(&id).is_some_and(|k| !k.attached)
+    }
+
+    fn attach(&mut self, id: u64, _grant: Option<String>) -> Result<u32, String> {
+        if self.is_lost() {
+            return Err("no Wayland connection".into());
+        }
+        match self.kids.get_mut(&id) {
+            Some(k) if !k.attached && k.deadline.is_none() => {
+                k.attached = true;
+                Ok(k.pty.pid())
+            }
+            Some(_) => Err(format!("session {id} is bound")),
+            None => Err(format!("no session {id}")),
+        }
     }
 }
