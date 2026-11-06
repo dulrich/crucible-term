@@ -41,6 +41,11 @@ smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
+# The `crucible-window-identity-v1` client bindings (scanner macros). Already in the lock through
+# wayland-client / wayland-protocols, so no new lock entries.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+
 # KDL config (matches CDE: kdl 6, default features).
 kdl = "6"
 

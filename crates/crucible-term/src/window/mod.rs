@@ -10,6 +10,8 @@
 
 mod damage;
 mod host;
+#[path = "../identity.rs"]
+pub(crate) mod identity;
 mod input;
 pub(crate) mod lifecycle;
 mod routing;

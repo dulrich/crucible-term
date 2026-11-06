@@ -22,6 +22,8 @@ yeslogic-fontconfig-sys.workspace = true
 smithay-client-toolkit.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
+wayland-scanner.workspace = true
+wayland-backend.workspace = true
 
 [lints]
 workspace = true

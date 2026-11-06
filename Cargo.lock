@@ -136,8 +136,10 @@ dependencies = [
  "rustix",
  "smithay-client-toolkit",
  "swash",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-scanner",
  "yeslogic-fontconfig-sys",
 ]
 

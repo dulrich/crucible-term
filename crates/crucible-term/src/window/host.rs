@@ -4,6 +4,11 @@
 //! the owning `Term` by `wl_surface` through [`Routes`]. Standalone [`run`] is a host with one
 //! window.
 
+use super::identity::generated::crucible_window_identity_manager_v1::CrucibleWindowIdentityManagerV1;
+use super::identity::generated::crucible_window_identity_v1::{
+    CrucibleWindowIdentityV1, Event as IdentityEvent,
+};
+use super::identity::{OpenSteps, open_in_order};
 use super::input::{self, SeatInput};
 use super::routing::{Routes, TermId};
 use super::term::{Term, exit_code};
@@ -64,6 +69,8 @@ pub struct Host {
     pub(super) xdg: XdgShell,
     pub(super) viewporter: Option<WpViewporter>,
     pub(super) fractional_mgr: Option<WpFractionalScaleManagerV1>,
+    /// `crucible_window_identity_manager_v1`; used only by the daemon's granted opens.
+    pub(super) identity: Option<CrucibleWindowIdentityManagerV1>,
     pub(super) qh: QueueHandle<Host>,
     pub(super) handle: LoopHandle<'static, Host>,
     /// Seat-wide input: devices, modifiers, serial, clipboard sources.
@@ -114,12 +121,89 @@ pub fn run(
     env: Vec<(OsString, OsString)>,
 ) -> Result<i32, WindowError> {
     let (mut event_loop, mut host) = Host::new()?;
-    let (id, _) = host.open_window(cfg, argv, env)?;
+    let (id, _) = host.open_window(cfg, argv, env, None)?;
     while !host.terms.is_empty() || host.closing > 0 {
         event_loop.dispatch(None, &mut host).map_err(lp)?;
         host.reap();
     }
     Ok(host.exits.get(&id).copied().unwrap_or(0))
+}
+
+/// The real proxy layer behind [`open_in_order`].
+struct RealSteps<'a> {
+    host: &'a Host,
+    id: TermId,
+    spec: Option<SpawnSpec>,
+    viewport: Option<WpViewport>,
+    fractional: Option<WpFractionalScaleV1>,
+    surface_id: Option<ObjectId>,
+}
+
+impl OpenSteps for RealSteps<'_> {
+    type Pty = Pty;
+    type Surface = wl_surface::WlSurface;
+    type Role = smithay_client_toolkit::shell::xdg::window::Window;
+    type Err = crucible_term_core::pty::PtyError;
+
+    fn spawn(&mut self) -> Result<(Pty, u32), Self::Err> {
+        let spec = self.spec.take().expect("spawn once");
+        let pty = Pty::spawn(&spec)?;
+        let pid = pty.pid();
+        Ok((pty, pid))
+    }
+
+    fn create_surface(&mut self) -> Self::Surface {
+        let h = self.host;
+        let qh = &h.qh;
+        let surface = h.compositor.create_surface(qh);
+        if let (Some(vp), Some(fm)) = (&h.viewporter, &h.fractional_mgr) {
+            self.viewport = Some(vp.get_viewport(&surface, qh, ()));
+            self.fractional = Some(fm.get_fractional_scale(&surface, qh, self.id));
+        }
+        surface
+    }
+
+    fn bind_surface(&mut self, surface: &Self::Surface, grant: &str, root_pid: u32) {
+        if let Some(m) = &self.host.identity {
+            m.bind_surface(surface, grant.to_owned(), root_pid, &self.host.qh, ());
+        }
+    }
+
+    fn create_role(&mut self, surface: Self::Surface) -> Self::Role {
+        self.surface_id = Some(surface.id());
+        self.host
+            .xdg
+            .create_window(surface, WindowDecorations::RequestServer, &self.host.qh)
+    }
+}
+
+impl Dispatch<CrucibleWindowIdentityManagerV1, ()> for Host {
+    fn event(
+        _: &mut Self,
+        _: &CrucibleWindowIdentityManagerV1,
+        _: <CrucibleWindowIdentityManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<CrucibleWindowIdentityV1, ()> for Host {
+    fn event(
+        _: &mut Self,
+        proxy: &CrucibleWindowIdentityV1,
+        event: IdentityEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The window stays mapped either way (CDE treats an unbound one as an App).
+        if let IdentityEvent::Rejected { reason } = event {
+            eprintln!("crucible-term: window identity rejected: {reason}");
+        }
+        proxy.destroy();
+    }
 }
 
 impl Host {
@@ -142,6 +226,9 @@ impl Host {
         let fractional_mgr = globals
             .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
+        let identity = globals
+            .bind::<CrucibleWindowIdentityManagerV1, _, _>(&qh, 1..=1, ())
+            .ok();
         let host = Host {
             registry: RegistryState::new(&globals),
             seat: SeatState::new(&globals, &qh),
@@ -151,6 +238,7 @@ impl Host {
             xdg,
             viewporter,
             fractional_mgr,
+            identity,
             seat_in: SeatInput::new(&globals, &qh),
             qh,
             handle,
@@ -172,22 +260,35 @@ impl Host {
         cfg: &Config,
         argv: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
+        grant: Option<String>,
     ) -> Result<(TermId, u32), WindowError> {
         let id = TermId(self.next_id);
         self.next_id += 1;
-        let qh = &self.qh;
-        let surface = self.compositor.create_surface(qh);
-        let (viewport, fractional) = match (&self.viewporter, &self.fractional_mgr) {
-            (Some(vp), Some(fm)) => (
-                Some(vp.get_viewport(&surface, qh, ())),
-                Some(fm.get_fractional_scale(&surface, qh, id)),
-            ),
-            _ => (None, None),
+        // A grant without the global cannot bind: open as an ungranted window.
+        let grant = grant.filter(|_| self.identity.is_some());
+        let mut steps = RealSteps {
+            host: self,
+            id,
+            spec: Some(SpawnSpec {
+                argv,
+                cwd: cfg.cwd.clone(),
+                env,
+                size: (cfg.cols, cfg.rows),
+            }),
+            viewport: None,
+            fractional: None,
+            surface_id: None,
         };
-        let surface_id = surface.id();
-        let window = self
-            .xdg
-            .create_window(surface, WindowDecorations::RequestServer, qh);
+        let (early_pty, window) =
+            open_in_order(&mut steps, grant.as_deref()).map_err(WindowError::Pty)?;
+        let RealSteps {
+            spec,
+            viewport,
+            fractional,
+            surface_id,
+            ..
+        } = steps;
+        let surface_id = surface_id.expect("role step ran");
         window.set_title(cfg.title.clone());
         window.set_app_id(cfg.app_id.clone());
         window.commit();
@@ -201,13 +302,10 @@ impl Host {
             u32::from(cfg.cols) * m.cell_w + 2 * cfg.settings.pad.0,
             u32::from(cfg.rows) * m.cell_h + 2 * cfg.settings.pad.1,
         );
-        let pty = Pty::spawn(&SpawnSpec {
-            argv,
-            cwd: cfg.cwd.clone(),
-            env,
-            size: (cfg.cols, cfg.rows),
-        })
-        .map_err(WindowError::Pty)?;
+        let pty = match early_pty {
+            Some(pty) => pty,
+            None => Pty::spawn(&spec.expect("spawn spec unused")).map_err(WindowError::Pty)?,
+        };
         let master = pty.master().try_clone().map_err(lp)?;
         // Non-blocking so one wakeup drains everything the child wrote.
         rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).map_err(lp)?;
@@ -327,6 +425,11 @@ impl Host {
         self.routes.insert(surface_id, id);
         self.terms.insert(id, term);
         Ok((id, root_pid))
+    }
+
+    /// Whether the compositor advertises the window-identity global.
+    pub(crate) fn has_identity(&self) -> bool {
+        self.identity.is_some()
     }
 
     /// Ask window `id` to close, as the compositor's close request does: the next [`Host::reap`]

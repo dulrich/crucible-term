@@ -63,6 +63,7 @@ impl Backend for Headless {
         cfg: &crate::window::Config,
         argv: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
+        _grant: Option<String>,
     ) -> Result<(u64, u32), String> {
         let pty = Pty::spawn(&SpawnSpec {
             argv,

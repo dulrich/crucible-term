@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="crucible_window_identity_v1">
+  <copyright>
+    Copyright 2026 Crucible Dev Env contributors.
+  </copyright>
+
+  <description summary="authenticated per-window identity for CDE-spawned terminals">
+    Lets a client that hosts windows on behalf of a CDE-spawned process (the
+    crucible-term daemon) tie one wl_surface to that spawn. The spawn carries a
+    single-use grant in CRUCIBLE_WINDOW_GRANT; the client presents it with
+    bind_surface before the surface gets any role (before get_xdg_surface and
+    get_toplevel), so the identity exists when the compositor places the window.
+  </description>
+
+  <interface name="crucible_window_identity_manager_v1" version="1">
+    <description summary="binds surfaces to CDE spawn grants">
+      The global through which a client binds a surface to a spawn grant.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroys the manager object. Existing identity objects are unaffected.
+      </description>
+    </request>
+
+    <request name="bind_surface">
+      <description summary="bind a surface to a spawn grant">
+        Binds surface to the spawn that grant was minted for, with root_pid the
+        process the client forked for this window. Must be sent before the
+        surface has a role. The compositor answers on id with exactly one of
+        bound or rejected. It rejects (never a protocol error) when: the
+        surface already has a role; the grant is unknown, already used, or its
+        spawn has been reaped; the peer UID differs from the compositor UID; the
+        peer executable (trailing " (deleted)" stripped) differs from the
+        canonical executable recorded when the grant was minted; or the parent
+        of root_pid is not the peer process. A grant is consumed by a
+        successful bind.
+      </description>
+      <arg name="id" type="new_id" interface="crucible_window_identity_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="grant" type="string"/>
+      <arg name="root_pid" type="uint"/>
+    </request>
+  </interface>
+
+  <interface name="crucible_window_identity_v1" version="1">
+    <description summary="the outcome of one bind_surface">
+      Receives exactly one event: bound or rejected.
+    </description>
+
+    <event name="bound">
+      <description summary="the surface is bound">
+        The surface carries the identity window_id from now on.
+      </description>
+      <arg name="window_id" type="uint"/>
+    </event>
+
+    <event name="rejected">
+      <description summary="the bind was refused">
+        The bind was refused for reason; the surface stays unbound.
+      </description>
+      <arg name="reason" type="string"/>
+    </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the identity object">
+        Destroys this object. The surface's identity, if bound, is unaffected.
+      </description>
+    </request>
+  </interface>
+</protocol>

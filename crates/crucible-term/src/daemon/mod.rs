@@ -13,6 +13,7 @@ pub mod paths;
 
 use crate::client::{GRANT_VAR, strip_grant};
 use crate::config;
+use crate::window::identity;
 use crate::window::{self, Host, TermId};
 use crate::wire::{self, Msg, Open};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
@@ -44,7 +45,12 @@ pub trait Backend: 'static {
         cfg: &window::Config,
         argv: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
+        grant: Option<String>,
     ) -> Result<(u64, u32), String>;
+    /// Whether this backend can bind a window identity (the compositor advertises the global).
+    fn has_identity(&self) -> bool {
+        false
+    }
     /// Close window `id` through the SIGHUP grace.
     fn close(&mut self, id: u64);
     /// Remove finished windows; called after every dispatch.
@@ -65,10 +71,14 @@ impl Backend for Host {
         cfg: &window::Config,
         argv: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
+        grant: Option<String>,
     ) -> Result<(u64, u32), String> {
-        self.open_window(cfg, argv, env)
+        self.open_window(cfg, argv, env, grant)
             .map(|(id, pid)| (id.0, pid))
             .map_err(|e| e.to_string())
+    }
+    fn has_identity(&self) -> bool {
+        self.has_identity()
     }
     fn close(&mut self, id: u64) {
         Host::close(self, TermId(id));
@@ -171,8 +181,9 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 );
                 return true;
             }
-            if o.grant.is_some() {
-                // No identity global until WP-6: a granted spawn falls back to standalone.
+            let decision = identity::decide(o.grant.is_some(), b.has_identity());
+            if decision == identity::OpenDecision::Refuse {
+                // No identity global: a granted spawn falls back to standalone.
                 st.send(
                     conn,
                     &Msg::Refused {
@@ -182,7 +193,11 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 return true;
             }
             let cfg = open_config(&o);
-            match b.open(&cfg, o.argv, strip_grant(o.env)) {
+            let grant = match decision {
+                identity::OpenDecision::OpenBound => o.grant,
+                _ => None,
+            };
+            match b.open(&cfg, o.argv, strip_grant(o.env), grant) {
                 Ok((id, root_pid)) => {
                     if let Some(c) = st.conns.get_mut(&conn) {
                         c.term = Some(id);
