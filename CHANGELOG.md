@@ -4,6 +4,24 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.3.0 — 2026-11-05
+
+### Added
+
+- Daemon mode (plan 02, phase 2): `cterm daemon` owns every PTY and VT session on one Wayland connection with shared font caches; `cterm` becomes a thin client that hands argv/cwd/env to the daemon and exits with the shell's status. The daemon is spawned on demand (socket and lock under `$XDG_RUNTIME_DIR/cterm/`, log under `$XDG_STATE_HOME/crucible-term/daemon.log`) and lingers per `daemon-linger`.
+- Config key `mode` (`standalone` | `auto`) and `--standalone`. **The default stays `standalone`**; `mode "auto"` uses the daemon and falls back to standalone when it is unavailable or refuses.
+- Window identity: in daemon mode each window binds CDE's `crucible-window-identity-v1` grant (minted by CDE at spawn), so CDE places, captures and closes daemon windows by their own shell, not the daemon's pid. Without the global a granted open falls back to standalone.
+- Hidden windows free their full-size shm buffers while CDE marks them `suspended` (standalone and daemon), and repaint in full on re-show.
+- `scripts/g2/g2.sh`: the G2 measurement and end-to-end reversed-arrival harness.
+
+### Changed
+
+- Rendering paints straight into the shm buffer by buffer age (no persistent frame image); release builds use a fat-LTO profile. Standalone memory is now within 10% of foot.
+
+### G2
+
+- Measured in `docs/g2-measurement.md` § G2 result. Passes: reversed-arrival (unit and end to end), standalone window ≤ foot + 10% (+8.6%), hidden-window marginal ≤ 10 MiB (6.97 MiB), re-show content checksums. **Fails**: a visible daemon window is foot + 11.9% (limit + 5%), and warm-daemon first frame is 81.3 ms against G1's 64.2 ms (though below same-batch standalone's 149.9 ms). Per the plan, `mode` stays `standalone` and the user decides whether phase 3 proceeds.
+
 ## 0.2.0 — 2026-11-05
 
 ### Changed
