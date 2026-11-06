@@ -4,6 +4,12 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.4.3 — 2026-11-06
+
+### Added
+
+- A pointer cursor. cterm used to set none, so compositors drew their own placeholder over its windows. It now asks for an I-beam over the window, an arrow while the application has mouse reporting on (Shift held brings the I-beam back), and whatever shape the application requests with OSC 22. The shape goes through `wp_cursor_shape_manager_v1` when the compositor offers it (CDE 0.4.9 and later); otherwise cterm draws it from the system XCursor theme.
+
 ## 0.4.2 — 2026-11-06
 
 ### Fixed
