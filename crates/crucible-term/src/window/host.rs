@@ -22,7 +22,7 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
-    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
+    Dispatcher, EventLoop, EventSource, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::csd_frame::WindowState;
@@ -75,11 +75,44 @@ pub(crate) struct Wl {
     /// `crucible_window_identity_manager_v1`; used only by the daemon's granted opens.
     pub(super) identity: Option<CrucibleWindowIdentityManagerV1>,
     pub(super) qh: QueueHandle<Host>,
-    /// The connection's `WaylandSource` in the loop (removed on loss).
-    source: RegistrationToken,
+    /// The connection's `WaylandSource` in the loop (removed on loss, see [`Registered`]).
+    source: Registered<WaylandSource<Host>>,
     /// Host-wide pool for the 1×1 placeholder buffers suspended windows show (created lazily on
     /// the first suspend, shared by all windows).
     pub(super) tiny_pool: Option<SlotPool>,
+}
+
+/// A calloop source registered through a [`Dispatcher`] we keep a clone of, so removing it
+/// never drops the source inside calloop's `LoopHandle::remove`. `remove` holds the loop's
+/// source table borrowed while it drops its own reference; if that were the last one, a
+/// `Drop` that itself calls `remove` would panic with "RefCell already borrowed". The
+/// `WaylandSource` is such a source: it owns the connection's last reference, and dropping
+/// that drops sctk's keyboard `RepeatData`, whose `Drop` removes its armed key-repeat timer
+/// (a key held when the compositor exits).
+pub(crate) struct Registered<S: EventSource + 'static> {
+    token: RegistrationToken,
+    dispatcher: Dispatcher<'static, S, Host>,
+}
+
+impl<S: EventSource + 'static> Registered<S> {
+    pub(crate) fn insert<F>(
+        handle: &LoopHandle<'static, Host>,
+        source: S,
+        callback: F,
+    ) -> smithay_client_toolkit::reexports::calloop::Result<Self>
+    where
+        F: FnMut(S::Event, &mut S::Metadata, &mut Host) -> S::Ret + 'static,
+    {
+        let dispatcher = Dispatcher::new(source, callback);
+        let token = handle.register_dispatcher(dispatcher.clone())?;
+        Ok(Registered { token, dispatcher })
+    }
+
+    /// Unregister, then drop the source after calloop has released its borrow.
+    pub(crate) fn remove(self, handle: &LoopHandle<'static, Host>) {
+        handle.remove(self.token);
+        drop(self.dispatcher);
+    }
 }
 
 /// The process's windows and everything they share; the calloop event loop's data. The
@@ -257,9 +290,10 @@ impl Wl {
         let registry = RegistryState::new(&globals);
         let seat = SeatState::new(&globals, &qh);
         let output = OutputState::new(&globals, &qh);
-        let source = WaylandSource::new(conn, queue)
-            .insert(handle.clone())
-            .map_err(lp)?;
+        let source = Registered::insert(handle, WaylandSource::new(conn, queue), |_, q, h| {
+            q.dispatch_pending(h)
+        })
+        .map_err(lp)?;
         Ok((
             Wl {
                 registry,
@@ -335,7 +369,8 @@ impl Host {
         self.routes = Routes::default();
         self.seat_in = SeatInput::detached();
         if let Some(w) = self.wl.take() {
-            self.handle.remove(w.source);
+            let Wl { source, .. } = w;
+            source.remove(&self.handle);
         }
         eprintln!(
             "crucible-term: Wayland connection lost; {} session(s) detached",
@@ -1046,6 +1081,60 @@ mod detached_tests {
         let ev: EventLoop<Host> = EventLoop::try_new().expect("event loop");
         let h = Host::detached(ev.handle(), detachable, display);
         (ev, h)
+    }
+
+    /// Stands in for sctk's keyboard `RepeatData`: its `Drop` removes another loop source.
+    struct RemovesOnDrop(LoopHandle<'static, Host>, Option<RegistrationToken>);
+    impl Drop for RemovesOnDrop {
+        fn drop(&mut self) {
+            if let Some(t) = self.1.take() {
+                self.0.remove(t);
+            }
+        }
+    }
+
+    /// A source whose callback owns a [`RemovesOnDrop`] guarding a second timer.
+    fn guarded(
+        h: &Host,
+    ) -> (
+        Timer,
+        impl FnMut(Instant, &mut (), &mut Host) -> TimeoutAction + use<>,
+    ) {
+        let repeat = h
+            .handle
+            .insert_source(Timer::from_duration(Duration::from_secs(60)), |_, _, _| {
+                TimeoutAction::Drop
+            })
+            .expect("repeat timer");
+        let guard = RemovesOnDrop(h.handle.clone(), Some(repeat));
+        let source = Timer::from_duration(Duration::from_secs(60));
+        (source, move |_, _, _| {
+            let _ = &guard;
+            TimeoutAction::Drop
+        })
+    }
+
+    /// The live-session logout panic: removing a source by token alone drops it inside
+    /// `LoopHandle::remove`, and a `Drop` that removes another source panics.
+    #[test]
+    #[should_panic(expected = "already borrowed")]
+    fn removing_by_token_drops_the_source_inside_remove() {
+        let (_ev, h) = host(true, None);
+        let (source, cb) = guarded(&h);
+        let token = h.handle.insert_source(source, cb).expect("insert");
+        h.handle.remove(token);
+    }
+
+    /// [`Registered::remove`] drops the source after `remove` returns, so the nested remove
+    /// (sctk's armed key-repeat timer) runs without a panic.
+    #[test]
+    fn registered_remove_drops_the_source_after_unregistering() {
+        let (mut ev, mut h) = host(true, None);
+        let (source, cb) = guarded(&h);
+        let reg = Registered::insert(&h.handle, source, cb).expect("insert");
+        reg.remove(&h.handle);
+        ev.dispatch(Some(Duration::ZERO), &mut h)
+            .expect("loop still usable");
     }
 
     /// A surface-less session on `sh -c script`, as a detached daemon holds it.
