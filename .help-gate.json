@@ -3,6 +3,7 @@
     { "path": "scripts/deploy.sh" },
     { "path": "scripts/g1/g1.sh" },
     { "path": "scripts/g1/term.sh" },
+    { "path": "scripts/g2/g2.sh" },
     { "path": "scripts/g2/spike-mem.sh" },
     { "path": "crates/crucible-term/src/main.rs", "version": "semver", "subcommands": ["daemon"] }
   ],

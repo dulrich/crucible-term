@@ -17,6 +17,7 @@ use crate::window::identity;
 use crate::window::{self, Host, TermId};
 use crate::wire::{self, Msg, Open};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
     EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
@@ -36,6 +37,8 @@ pub const READY_FD_VAR: &str = "CTERM_DAEMON_READY_FD";
 pub const DETACH_VAR: &str = "CTERM_DAEMON_DETACH";
 /// TEST-ONLY: `1` runs the daemon without Wayland ([`headless`]).
 pub const HEADLESS_VAR: &str = "CTERM_DEBUG_DAEMON_HEADLESS";
+/// TEST-ONLY: N > 0 defers the first granted `open` by N ms (on a calloop timer, never a sleep).
+pub const OPEN_DELAY_VAR: &str = "CTERM_DEBUG_OPEN_DELAY_MS";
 
 /// What the daemon needs from a window backend.
 pub trait Backend: 'static {
@@ -107,6 +110,8 @@ struct Conn {
     buf: Vec<u8>,
     hello: bool,
     term: Option<u64>,
+    /// An `open` is waiting on the test-only delay timer.
+    opening: bool,
     token: Option<RegistrationToken>,
 }
 
@@ -115,6 +120,21 @@ struct State {
     conns: BTreeMap<u64, Conn>,
     by_term: BTreeMap<u64, u64>,
     next_conn: u64,
+    /// TEST-ONLY delay still to apply to the first granted `open`.
+    delay: Option<Duration>,
+    /// A deferred open to schedule: set by `on_msg`, armed by the readable callback.
+    armed: Option<(u64, Duration, Open)>,
+}
+
+/// TEST-ONLY: parse `CTERM_DEBUG_OPEN_DELAY_MS`: unset, `0` or unparsable mean no delay.
+pub fn parse_open_delay(v: Option<&str>) -> Option<Duration> {
+    let n: u64 = v?.trim().parse().ok()?;
+    (n > 0).then(|| Duration::from_millis(n))
+}
+
+/// Which `open` is delayed: the first granted one (consumes the slot); ungranted opens never are.
+fn take_delay(slot: &mut Option<Duration>, granted: bool) -> Option<Duration> {
+    if granted { slot.take() } else { None }
 }
 
 impl State {
@@ -152,6 +172,25 @@ fn open_config(o: &Open) -> window::Config {
     cfg
 }
 
+/// Run an accepted `open`: build the config, open the window, answer the client.
+fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: bool) {
+    let cfg = open_config(&o);
+    let grant = if granted { o.grant } else { None };
+    match b.open(&cfg, o.argv, strip_grant(o.env), grant) {
+        Ok((id, root_pid)) => {
+            if let Some(c) = st.conns.get_mut(&conn) {
+                c.term = Some(id);
+            }
+            st.by_term.insert(id, conn);
+            st.send(conn, &Msg::Opened { root_pid });
+        }
+        Err(reason) => {
+            eprintln!("crucible-term: daemon: open: {reason}");
+            st.send(conn, &Msg::Refused { reason });
+        }
+    }
+}
+
 /// Handle one decoded message from `conn`. Returns false to drop the connection.
 fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
     let Some(c) = st.conns.get_mut(&conn) else {
@@ -172,7 +211,7 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
     }
     match m {
         Msg::Open(o) => {
-            if c.term.is_some() {
+            if c.term.is_some() || c.opening {
                 st.send(
                     conn,
                     &Msg::Refused {
@@ -192,24 +231,19 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 );
                 return true;
             }
-            let cfg = open_config(&o);
-            let grant = match decision {
-                identity::OpenDecision::OpenBound => o.grant,
-                _ => None,
-            };
-            match b.open(&cfg, o.argv, strip_grant(o.env), grant) {
-                Ok((id, root_pid)) => {
-                    if let Some(c) = st.conns.get_mut(&conn) {
-                        c.term = Some(id);
-                    }
-                    st.by_term.insert(id, conn);
-                    st.send(conn, &Msg::Opened { root_pid });
+            let granted = decision == identity::OpenDecision::OpenBound;
+            if let Some(d) = take_delay(&mut st.delay, granted) {
+                eprintln!(
+                    "crucible-term: daemon: client {conn}: open deferred {} ms (CTERM_DEBUG_OPEN_DELAY_MS)",
+                    d.as_millis()
+                );
+                if let Some(c) = st.conns.get_mut(&conn) {
+                    c.opening = true;
                 }
-                Err(reason) => {
-                    eprintln!("crucible-term: daemon: open: {reason}");
-                    st.send(conn, &Msg::Refused { reason });
-                }
+                st.armed = Some((conn, d, o));
+                return true;
             }
+            do_open(st, b, conn, o, granted);
             true
         }
         Msg::Close => {
@@ -285,6 +319,35 @@ fn on_readable<B: Backend>(st: &mut State, b: &mut B, conn: u64) -> PostAction {
     }
 }
 
+/// TEST-ONLY: run the deferred `open` of `conn` after `d`, on a calloop timer (the loop keeps serving).
+fn arm_deferred_open<B: Backend>(
+    state: &Rc<RefCell<State>>,
+    handle: &LoopHandle<'static, B>,
+    conn: u64,
+    d: Duration,
+    o: Open,
+) {
+    let state = state.clone();
+    let mut o = Some(o);
+    let r = handle.insert_source(Timer::from_duration(d), move |_, _, b: &mut B| {
+        let mut st = state.borrow_mut();
+        let alive = st.conns.get_mut(&conn).is_some_and(|c| {
+            let was = c.opening;
+            c.opening = false;
+            was
+        });
+        if let Some(o) = o.take()
+            && alive
+        {
+            do_open(&mut st, b, conn, o, true);
+        }
+        TimeoutAction::Drop
+    });
+    if let Err(e) = r {
+        eprintln!("crucible-term: daemon: open delay timer: {e}");
+    }
+}
+
 fn on_accept<B: Backend>(
     state: &Rc<RefCell<State>>,
     handle: &LoopHandle<'static, B>,
@@ -329,14 +392,23 @@ fn on_accept<B: Backend>(
                 buf: Vec::new(),
                 hello: false,
                 term: None,
+                opening: false,
                 token: None,
             },
         );
         drop(st);
         let s2 = state.clone();
+        let h2 = handle.clone();
         let tok = handle.insert_source(
             Generic::new(fd, Interest::READ, Mode::Level),
-            move |_, _, b: &mut B| Ok(on_readable(&mut s2.borrow_mut(), b, conn)),
+            move |_, _, b: &mut B| {
+                let post = on_readable(&mut s2.borrow_mut(), b, conn);
+                let armed = s2.borrow_mut().armed.take();
+                if let Some((c, d, o)) = armed {
+                    arm_deferred_open(&s2, &h2, c, d, o);
+                }
+                Ok(post)
+            },
         );
         let mut st = state.borrow_mut();
         match tok {
@@ -448,6 +520,11 @@ pub fn run() -> ExitCode {
         }
     };
     let linger = (settings.daemon_linger > 0).then(|| Duration::from_secs(settings.daemon_linger));
+    let open_delay = parse_open_delay(
+        env(OPEN_DELAY_VAR)
+            .and_then(|v| v.into_string().ok())
+            .as_deref(),
+    );
     let headless = std::env::var_os(HEADLESS_VAR).is_some_and(|v| v == "1");
     eprintln!(
         "crucible-term: daemon: pid {} listening on {}{}",
@@ -468,10 +545,10 @@ pub fn run() -> ExitCode {
             }
         };
         let b = headless::Headless::new(event_loop.handle());
-        serve(event_loop, b, listener, ready, linger)
+        serve(event_loop, b, listener, ready, linger, open_delay)
     } else {
         match Host::new() {
-            Ok((event_loop, host)) => serve(event_loop, host, listener, ready, linger),
+            Ok((event_loop, host)) => serve(event_loop, host, listener, ready, linger, open_delay),
             Err(e) => Err(e.to_string()),
         }
     };
@@ -491,8 +568,12 @@ fn serve<B: Backend>(
     listener: UnixListener,
     ready: Option<OwnedFd>,
     linger: Option<Duration>,
+    open_delay: Option<Duration>,
 ) -> Result<(), String> {
-    let state = Rc::new(RefCell::new(State::default()));
+    let state = Rc::new(RefCell::new(State {
+        delay: open_delay,
+        ..State::default()
+    }));
     let own_uid = rustix::process::getuid().as_raw();
     let handle = event_loop.handle();
     let lfd = rustix::io::dup(&listener).map_err(|e| e.to_string())?;
@@ -559,6 +640,29 @@ fn serve<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_granted_open_is_delayed() {
+        let mut slot = parse_open_delay(Some("800"));
+        assert_eq!(slot, Some(Duration::from_millis(800)));
+        assert_eq!(
+            take_delay(&mut slot, false),
+            None,
+            "ungranted opens never wait"
+        );
+        assert_eq!(
+            take_delay(&mut slot, true),
+            Some(Duration::from_millis(800))
+        );
+        assert_eq!(
+            take_delay(&mut slot, true),
+            None,
+            "later opens are not delayed"
+        );
+        for off in [None, Some("0"), Some("x"), Some("")] {
+            assert_eq!(parse_open_delay(off), None);
+        }
+    }
 
     #[test]
     fn only_the_own_uid_is_served() {

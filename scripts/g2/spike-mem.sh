@@ -30,7 +30,7 @@ font (font files, fontconfig caches), file_other; plus the shell child's PSS and
 Scratch lives in /tmp/cde-g2 (removed at exit). Only pids recorded by this script are ever signalled.
 
 Environment (defaults): G2_CRUCIBLE (crucible-dev-env/target/release/crucible), G2_CT (target/release/cterm),
-G2_GAP (10), G2_PARENT_WL (/run/user/1001/wayland-1), G2_RUNS (3), G2_SETTLE_S (4), G2_FOOT, G2_FOOT_INI, G2_WLDEBUG (0), G2_CT_ENV (extra env words for cterm, e.g. CTERM_DEBUG_NOIMAGE=1), G2_TOP (1: print the 6 largest anon mappings per window as ANONTOP lines).
+G2_GAP (10), G2_PARENT_WL (/run/user/1001/wayland-1), G2_RUNS (3), G2_SETTLE_S (4), G2_FOOT, G2_FOOT_INI, G2_WLDEBUG (0), G2_CT_ENV (extra env words for cterm, e.g. CTERM_DEBUG_MEM=1 CTERM_DEBUG_FRAME_SUM=1), G2_TOP (1: print the 6 largest anon mappings per window as ANONTOP lines).
 Bash reasons: process substitution, trap cleanup, BASH_SOURCE.
 USAGE
 }
