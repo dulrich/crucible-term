@@ -14,7 +14,7 @@ usage() {
 	cat <<'USAGE'
 Usage: g2.sh [--help|-h] [--build|--version] [LEG...]
 
-Legs (default: ff mem reshow info e2e): ff, mem, reshow, info, e2e, smoke, summarize.
+Legs (default: ff mem reshow info e2e): ff, mem, reshow, info, e2e, smoke, summarize, rsummarize.
 Every leg runs in its own fresh nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
 XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/tmp/cde-g2w), so the nested daemon socket and
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE (never through scripts/g1/term.sh, which defeats the
@@ -33,11 +33,18 @@ clients with no children) and a silent standalone fallback aborts the session as
              CTERM_DEBUG_OPEN_DELAY_MS, then `crucible msg save`, `crucible mem`, `crucible msg close-pid <C1>`.
   smoke      one auto session, 3 windows, assert daemon mode, print the process tree (quick check).
   summarize  read target/g2/g2-*.raw and print the G2 table against the thresholds (target/g2/g2-summary.txt).
+  rsummarize read $G2_OUT/g2-{ff,mem,cond}.raw and print the re-measurement tables (ff per subject and batch, leg (iii) with foot-server, COND lines) to $G2_OUT/remeasure-summary.txt.
+
+Re-measurement (2026-11-05): G2_OUT=target/g2/remeasure G2_FF_SUBJECTS="foot-wl 0.2.0=<bin> 0.3.0=<bin>@standalone auto" G2_MEM_SUBJECTS="foot foot-server standalone auto" g2.sh ff mem rsummarize.
+  G2_FF_SUBJECTS entries: foot-wl | standalone-wl | auto | LABEL=PATH[@MODE] (cterm binary PATH through the WAYLAND_DEBUG wrapper, `-o mode=MODE` only when @MODE is given: pre-0.3.0 builds have no mode key).
+  G2_MEM_SUBJECTS entries: foot | standalone | auto | foot-server (`foot --server` inside the nested display + footclient as CDE terminal; server subtree + the footclients).
+  Conditions: every nested session records COND lines (date, /proc/loadavg, PSI cpu/memory/io some avg10,avg60, live outputs enabled/dpms/preferred mode) at start and end into the leg raw file, and waits up to G2_CPU_PSI_WAIT_S (60) for CPU PSI avg10 <= G2_CPU_PSI_MAX (5) first (COND_WAIT line).
 
 Output: raw lines in target/g2/g2-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g2/logs/.
 Environment (defaults): G2_CRUCIBLE (crucible-dev-env/target/release/crucible), G2_CT (target/release/cterm), G2_FOOT (~/.local/bin/foot),
 G2_FOOT_INI (~/.config/foot/foot.ini), G2_PARENT_WL (/run/user/1001/wayland-1), G2_GAP (10), G2_BATCHES (3), G2_SETTLE_S (4), G2_FF_RUNS (5),
 G2_N_LO (5), G2_N_HI (20), G2_IDLE_S (60), G2_DELAY_MS (800), G2_BLINK (true; false disables cursor blink in the reshow leg), G2_WAIT_S (120).
+G2_OUT (target/g2), G2_FF_WARM (1; 0 = no window open before the timed runs, as in G1), G2_FF_SUBJECTS, G2_MEM_SUBJECTS, G2_CPU_PSI_MAX (5), G2_CPU_PSI_WAIT_S (60), G2_WAIT_DISPLAY_S (0), G2_SKIP_DISPLAY_CHECK (0).
 Bash reasons: arrays for argv and pid lists, process substitution, local variables, trap cleanup, BASH_SOURCE.
 USAGE
 }
@@ -50,7 +57,7 @@ build_flags "${BASH_SOURCE[0]}" "$@"
 LEGS=("$@")
 [ "$#" -gt 0 ] || LEGS=(ff mem reshow info e2e)
 for s in "${LEGS[@]}"; do
-	case $s in ff | mem | reshow | info | e2e | smoke | summarize) ;; *) echo "g2.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
+	case $s in ff | mem | reshow | info | e2e | smoke | summarize | rsummarize) ;; *) echo "g2.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
 done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
@@ -71,7 +78,14 @@ IDLE_S=${G2_IDLE_S:-60}
 DELAY_MS=${G2_DELAY_MS:-800}
 BLINK=${G2_BLINK:-true}
 WAIT_S=${G2_WAIT_S:-120}
-OUT=$R/target/g2
+OUT=${G2_OUT:-$R/target/g2}
+FOOTCLIENT=$(dirname "$FOOT")/footclient
+FF_WARM=${G2_FF_WARM:-1}
+FF_SUBJECTS=${G2_FF_SUBJECTS:-"foot-wl standalone-wl auto"}
+MEM_SUBJECTS=${G2_MEM_SUBJECTS:-"foot standalone auto"}
+CPU_PSI_MAX=${G2_CPU_PSI_MAX:-5}
+CPU_PSI_WAIT_S=${G2_CPU_PSI_WAIT_S:-60}
+COND_RAW=""
 W=/tmp/cde-g2w
 BIG=$R/target/g1/50mb.txt
 LIVE_RT=/run/user/1001
@@ -134,6 +148,7 @@ first_frame_ms() {
 }
 
 # ---------------------------------------------------------------- nested compositor sessions
+SUBJ_PROG="" SUBJ_MODE=""
 T="" CPID="" DPID="" DISP="" PROGEXE="" KIND="" TAG=""
 CLIENTS=()
 KNOWN=()
@@ -182,13 +197,38 @@ KDL
 
 # the nested compositor's wayland socket name (the *.lock files are skipped)
 # $! may be a forking setsid: the compositor is it or its child running $BIN
-real_cpid() {
-	local p=$1 c
-	if [ "$(readlink -f "/proc/$p/exe" 2>/dev/null)" = "$(readlink -f "$BIN")" ]; then echo "$p"; return 0; fi
+real_cpid() { # pid [exe, default $BIN]
+	local p=$1 c x=${2:-$BIN}
+	if [ "$(readlink -f "/proc/$p/exe" 2>/dev/null)" = "$(readlink -f "$x")" ]; then echo "$p"; return 0; fi
 	for c in $(kids_of "$p"); do
-		if [ "$(readlink -f "/proc/$c/exe" 2>/dev/null)" = "$(readlink -f "$BIN")" ]; then echo "$c"; return 0; fi
+		if [ "$(readlink -f "/proc/$c/exe" 2>/dev/null)" = "$(readlink -f "$x")" ]; then echo "$c"; return 0; fi
 	done
 	echo "$p"
+}
+
+# conditions: one COND line (date, load, PSI avg10/avg60, live outputs enabled/dpms and preferred mode) per call into $COND_RAW (default $OUT/g2-cond.raw)
+cond_psi() { awk -v k="$2" '$1==k {print $2 "," $3}' "/proc/pressure/$1" 2>/dev/null | tr "\n" " " | sed "s/avg10=//;s/avg60=//;s/ $//"; }
+cond_outputs() {
+	local d out=""
+	for d in /sys/class/drm/card*-*; do
+		[ "$(cat "$d/status" 2>/dev/null)" = connected ] || continue
+		out="$out$(basename "$d")=$(cat "$d/enabled" 2>/dev/null)/$(cat "$d/dpms" 2>/dev/null)/$(head -1 "$d/modes" 2>/dev/null) "
+	done
+	echo "${out% }"
+}
+cond_record() { # label
+	echo "COND label=$1 date=$(date -Is) loadavg=\"$(cut -d" " -f1-4 /proc/loadavg)\" cpu_some_avg10_avg60=$(cond_psi cpu some) mem_some_avg10_avg60=$(cond_psi memory some) io_some_avg10_avg60=$(cond_psi io some) outputs=\"$(cond_outputs)\"" | tee -a "${COND_RAW:-$OUT/g2-cond.raw}"
+}
+# wait up to CPU_PSI_WAIT_S for the CPU pressure avg10 (some) to fall to CPU_PSI_MAX percent; record the wait
+wait_calm() { # label
+	local w=0 a
+	a=$(awk '$1=="some" {sub("avg10=","",$2); print $2}' /proc/pressure/cpu)
+	while awk -v a="$a" -v m="$CPU_PSI_MAX" 'BEGIN{exit !(a>m)}' && [ "$w" -lt "$CPU_PSI_WAIT_S" ]; do
+		sleep 5
+		w=$((w + 5))
+		a=$(awk '$1=="some" {sub("avg10=","",$2); print $2}' /proc/pressure/cpu)
+	done
+	echo "COND_WAIT label=$1 waited_s=$w cpu_avg10_now=$a limit=$CPU_PSI_MAX" | tee -a "${COND_RAW:-$OUT/g2-cond.raw}"
 }
 
 # terminal children the compositor started itself (the overlay host): never counted as windows
@@ -208,9 +248,28 @@ nested_display() {
 	return 1
 }
 
-# cde_start TAG KIND: KIND is foot | standalone | auto (direct spawn), or foot-wl | standalone-wl (scratch exec wrapper, WAYLAND_DEBUG on)
+# `foot --server` inside the nested display with the scratch foot.ini; DPID is its pid (recorded), socket $T/run/foot-$DISP.sock
+start_foot_server() {
+	[ -x "$FOOTCLIENT" ] || { echo "STOP foot-server: footclient not found at $FOOTCLIENT"; return 1; }
+	env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$DISP" setsid "$FOOT" --server >/dev/null 2>"$T/foot-server.log" &
+	DPID=$(real_cpid "$!" "$FOOT")
+	rec "$!"
+	rec "$DPID"
+	local i
+	for i in $(seq 1 50); do
+		[ -S "$T/run/foot-$DISP.sock" ] && break
+		sleep 0.2
+	done
+	[ -S "$T/run/foot-$DISP.sock" ] || { echo "foot --server did not come up"; cat "$T/foot-server.log"; return 1; }
+	echo "foot server pid $DPID socket $T/run/foot-$DISP.sock"
+}
+
+# cde_start TAG KIND: KIND is foot | standalone | auto | foot-server (direct spawn; foot-server = `foot --server` started in the nested display + footclient as the terminal),
+# or foot-wl | standalone-wl | ct-wl (scratch exec wrapper, WAYLAND_DEBUG on; ct-wl runs SUBJ_PROG with `-o mode=SUBJ_MODE` unless SUBJ_MODE is empty)
 cde_start() {
 	TAG=$1 KIND=$2
+	wait_calm "$TAG"
+	cond_record "$TAG start"
 	T=$W/$TAG
 	rm -rf "$T"
 	mkdir -p "$T/config/cde" "$T/config/crucible-term" "$T/config/foot" "$T/state/crucible-term" "$T/data" "$T/run"
@@ -221,6 +280,8 @@ cde_start() {
 	local prog targs="" mode=""
 	case $KIND in
 	foot | foot-wl) prog=$FOOT ;;
+	foot-server) prog=$FOOTCLIENT ;;
+	ct-wl) prog=$SUBJ_PROG mode=$SUBJ_MODE ;;
 	standalone | standalone-wl) prog=$CT mode=standalone ;;
 	auto) prog=$CT mode=auto ;;
 	*) die "bad kind $KIND" ;;
@@ -231,6 +292,12 @@ cde_start() {
 	*-wl)
 		term=$T/launch.sh
 		printf '#!/bin/sh\nexec env WAYLAND_DEBUG=1 %s "$@" 2>"%s/wl.$$.log"\n' "$prog" "$T" >"$term"
+		chmod +x "$term"
+		;;
+	foot-server)
+		# the overlay host CDE starts at launch must not join the server as a window: the gate file opens after launch (the others exclude it as a separate process)
+		term=$T/launch.sh
+		printf '#!/bin/sh\n[ -e "%s/go" ] || exit 1\nexec %s "$@"\n' "$T" "$prog" >"$term"
 		chmod +x "$term"
 		;;
 	esac
@@ -253,6 +320,7 @@ KDL
 	done
 	alive "$CPID" || { echo "compositor died: see $T/log"; tail -5 "$T/log"; return 1; }
 	DISP=$(nested_display)
+	[ "$KIND" != foot-server ] || start_foot_server || return 1
 	# Live-session safety: the nested display must not share the live daemon socket (keyed by display basename under XDG_RUNTIME_DIR).
 	[ "$T/run" != "$LIVE_RT" ] || die "nested XDG_RUNTIME_DIR is the live one"
 	if [ "$DISP" = wayland-1 ]; then
@@ -262,10 +330,12 @@ KDL
 	echo "== $TAG kind=$KIND compositor pid $CPID display=$DISP runtime=$T/run"
 	sleep 3
 	snapshot_known
+	[ "$KIND" != foot-server ] || : >"$T/go"
 }
 
 cde_stop() {
 	local p
+	cond_record "$TAG end"
 	for p in "${CLIENTS[@]}"; do alive "$p" && kill "$p" 2>/dev/null || true; done
 	sleep 1
 	msg exec quit >/dev/null 2>&1 || true
@@ -327,6 +397,17 @@ spawn_win() { # [action words, default: exec run-terminal]
 
 nshells() { kids_of "$1" | wc -l; }
 
+# foot --server mode: resident server (the recorded DPID), one shell per window in its subtree, footclients with no children
+assert_server_mode() { # expected window count
+	local want=$1 c
+	alive "$DPID" || { echo "HARNESS FAILURE: foot server is not alive"; return 1; }
+	[ "$(nshells "$DPID")" = "$want" ] || { echo "HARNESS FAILURE: foot server has $(nshells "$DPID") children, expected $want shells"; return 1; }
+	for c in "${CLIENTS[@]}"; do
+		alive "$c" || continue
+		[ "$(nshells "$c")" = 0 ] || { echo "HARNESS FAILURE: footclient $c has a child"; return 1; }
+	done
+	echo "ASSERT server-mode ok: foot server pid $DPID shells=$want footclients=${#CLIENTS[@]} (none with children)"
+}
 # Daemon-mode assertion (c1 E3): resident `cterm daemon` (cmdline exactly "<ct>\0daemon\0"), not a child of any client, one shell per window
 # in its subtree, and no client has a child. A silent standalone fallback is a harness failure.
 assert_daemon_mode() { # expected window count
@@ -358,29 +439,32 @@ mem_row() { # batch subj n
 	if [ "$KIND" = auto ]; then
 		assert_daemon_mode "$n" || return 1
 		pids=("$DPID" "${CLIENTS[@]}")
+	elif [ "$KIND" = foot-server ]; then
+		assert_server_mode "$n" || return 1
+		pids=("$DPID" "${CLIENTS[@]}")
 	elif [ "$KIND" = standalone ]; then
 		assert_standalone_mode "$n" || return 1
 	fi
 	read -r ns sp sr np < <(pss_of "${pids[@]}")
 	echo "MEM batch=$b subj=$subj n=$n nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
-	if [ "$KIND" = auto ]; then
+	if [ "$KIND" = auto ] || [ "$KIND" = foot-server ]; then
 		read -r ns sp sr np < <(pss_of "$DPID")
-		echo "DMEM batch=$b subj=auto-daemon n=$n nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
+		echo "DMEM batch=$b subj=$KIND-daemon n=$n nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
 		read -r ns sp sr np < <(pss_of "${CLIENTS[@]}")
-		echo "CMEM batch=$b subj=auto-clients n=$n nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
+		echo "CMEM batch=$b subj=$KIND-clients n=$n nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
 	fi
 }
 
 leg_mem_session() { # batch kind
 	local b=$1 kind=$2 n
 	XENV=()
-	cde_start "mem-$kind-$b" "$kind"
-	if [ "$kind" = auto ]; then
-		start_daemon
+	cde_start "mem-$kind-$b" "$kind" || { cde_stop; return 1; }
+	if [ "$kind" = auto ] || [ "$kind" = foot-server ]; then
+		[ "$kind" != auto ] || start_daemon
 		sleep "$SETTLE"
 		local ns sp sr np
 		read -r ns sp sr np < <(pss_of "$DPID")
-		echo "DMEM batch=$b subj=auto-daemon n=0 nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
+		echo "DMEM batch=$b subj=$kind-daemon n=0 nonshm=$ns shm_pss=$sp shm_rss=$sr procs=$np" | tee -a "$OUT/g2-mem.raw"
 	fi
 	for n in $(seq 1 "$N_HI"); do
 		spawn_win || { echo "spawn $n failed"; cde_stop; return 1; }
@@ -396,22 +480,35 @@ leg_mem_session() { # batch kind
 
 leg_mem() {
 	local b k
+	COND_RAW=$OUT/g2-mem.raw
 	for b in $(seq 1 "$BATCHES"); do
-		for k in foot standalone auto; do leg_mem_session "$b" "$k" || echo "FAILED mem batch $b $k"; done
+		for k in $MEM_SUBJECTS; do leg_mem_session "$b" "$k" || echo "FAILED mem batch $b $k"; done
 	done
 }
 
-leg_ff_session() { # batch kind
-	local b=$1 kind=$2 i t0 lat lats="" f ps
+leg_ff_session() { # batch subject; subject is foot-wl | standalone-wl | auto | LABEL=PATH[@MODE] (any cterm build through the wrapper; MODE empty = no -o mode)
+	local b=$1 subj=$2 kind=$2 label=$2 i t0 lat lats="" f ps rest
 	XENV=()
-	cde_start "ff-$kind-$b" "$kind"
+	SUBJ_PROG="" SUBJ_MODE=""
+	case $subj in
+	*=*)
+		kind=ct-wl label=${subj%%=*} rest=${subj#*=}
+		SUBJ_PROG=${rest%%@*}
+		case $rest in *@*) SUBJ_MODE=${rest#*@} ;; esac
+		[ -x "$SUBJ_PROG" ] || { echo "ff subject $label: missing $SUBJ_PROG"; return 1; }
+		echo "SUBJECT $label path=$SUBJ_PROG mode=${SUBJ_MODE:-none} version=$("$SUBJ_PROG" --version 2>&1 | head -1)" | tee -a "$OUT/g2-ff.raw"
+		;;
+	esac
+	cde_start "ff-$label-$b" "$kind" || { cde_stop; return 1; }
 	if [ "$kind" = auto ]; then
 		start_daemon WAYLAND_DEBUG=1
 		f=$T/state/crucible-term/daemon.log
 	fi
-	spawn_win || { echo "warm window failed"; cde_stop; return 1; }
+	if [ "$FF_WARM" = 1 ]; then
+		spawn_win || { echo "warm window failed"; cde_stop; return 1; }
+	fi
 	sleep 3
-	[ "$kind" != auto ] || assert_daemon_mode 1 || { cde_stop; return 1; }
+	[ "$kind" != auto ] || assert_daemon_mode "$FF_WARM" || { cde_stop; return 1; }
 	for i in $(seq 1 "$FF_RUNS"); do
 		t0=$(now)
 		spawn_win || { echo "spawn failed"; break; }
@@ -423,20 +520,21 @@ leg_ff_session() { # batch kind
 			lat=$(first_frame_ms "$t0" "$f" 2>/dev/null || true)
 			[ -z "$lat" ] || break
 		done
-		echo "FF batch=$b subj=$kind run=$i ms=${lat:-FAIL}" | tee -a "$OUT/g2-ff.raw"
+		echo "FF batch=$b subj=$label run=$i ms=${lat:-FAIL}" | tee -a "$OUT/g2-ff.raw"
 		[ -z "$lat" ] || lats="$lats$lat"$'\n'
 		kill "$ps" 2>/dev/null || true
 		sleep 1.5
 	done
-	echo "FF_MEDIAN batch=$b subj=$kind ms=$(printf '%s' "$lats" | median)" | tee -a "$OUT/g2-ff.raw"
+	echo "FF_MEDIAN batch=$b subj=$label ms=$(printf '%s' "$lats" | median)" | tee -a "$OUT/g2-ff.raw"
 	if [ "$kind" = auto ]; then cp "$f" "$OUT/logs/ff-auto-$b.daemon-wldebug.log" 2>/dev/null || true; fi
 	cde_stop
 }
 
 leg_ff() {
 	local b k
+	COND_RAW=$OUT/g2-ff.raw
 	for b in $(seq 1 "$BATCHES"); do
-		for k in foot-wl standalone-wl auto; do leg_ff_session "$b" "$k" || echo "FAILED ff batch $b $k"; done
+		for k in $FF_SUBJECTS; do leg_ff_session "$b" "$k" || echo "FAILED ff batch $b $k"; done
 	done
 }
 
@@ -741,6 +839,50 @@ leg_summarize() {
   if(open(F,"<","$dir/g2-reshow.raw")){ while(<F>){ print "$_" if /^RESHOW/ } close F }
   if(open(F,"<","$dir/g2-info.raw")){ while(<F>){ print "$_" if /^(THR|IDLE_CPU)/ } close F }
 ' "$OUT" "$N_LO" "$N_HI" | tee "$OUT/g2-summary.txt"
+}
+
+leg_rsummarize() {
+	perl -e '
+  sub med { my @a=sort {$a<=>$b} @_; return "NA" unless @a; my $n=@a; return $n%2 ? $a[($n-1)/2] : ($a[$n/2-1]+$a[$n/2])/2 }
+  sub kv { my %h; $h{$1}=$2 while $_[0]=~/(\w+)=(\S+)/g; \%h }
+  my ($dir,$lo,$hi)=@ARGV;
+  print "G2 RE-MEASUREMENT SUMMARY\n";
+  my (%ff,@order,%seen);
+  if(open(F,"<","$dir/g2-ff.raw")){ while(<F>){
+    if(/^SUBJECT (.*)/){ my $l=$1; print "subject: $l\n" unless $seen{$l}++ }
+    next unless /^FF_MEDIAN (.*)/; my $rest=$1; my $h=kv($rest); push @order,$h->{subj} unless $ff{$h->{subj}}; push @{$ff{$h->{subj}}},$h->{ms} } close F }
+  print "first frame, batch medians of 5 (ms) and median of batch medians:\n";
+  for my $s (@order){ my @v=grep { $_ ne "NA" } @{$ff{$s}}; printf "  ff %-14s %s => %s\n",$s,join(" / ",@{$ff{$s}}),med(@v) }
+  my (%mem,%ratio);
+  if(open(F,"<","$dir/g2-mem.raw")){ while(<F>){ next unless /^(MEM|DMEM|CMEM) (.*)/; my ($t,$rest)=($1,$2); my $h=kv($rest); $mem{$t}{$h->{subj}}{$h->{n}}{$h->{batch}}=$h;
+      if($t eq "MEM" && $h->{subj} eq "foot" && $h->{n}==1 && $h->{shm_rss}>0){ $ratio{$h->{batch}}=$h->{shm_pss}/$h->{shm_rss} } } close F }
+  my $defratio = %ratio ? med(values %ratio) : 0.747;
+  sub norm { my($h,$b)=@_; my $r=$ratio{$b}//$defratio; return $h->{nonshm}+$h->{shm_rss}*$r }
+  sub bat { my($t,$s,$n)=@_; my $x=$mem{$t}{$s}{$n}; return () unless $x; return map { [$_,norm($x->{$_},$_)] } sort keys %$x }
+  sub nmed { my @b=bat(@_); return @b ? med(map { $_->[1] } @b) : "NA" }
+  sub slope { my($t,$s)=@_; my @v; for my $b (keys %{$mem{$t}{$s}{$lo}||{}}){ next unless $mem{$t}{$s}{$hi}{$b}; push @v,(norm($mem{$t}{$s}{$hi}{$b},$b)-norm($mem{$t}{$s}{$lo}{$b},$b))/($hi-$lo) } return @v ? med(@v) : "NA" }
+  printf "leg (iii) like-for-like, n=1, total normalised kB (shm ratio %.4f from foot per batch):\n",$defratio;
+  my %m1;
+  for my $s (qw(foot foot-server standalone auto)){ my @b=bat("MEM",$s,1); $m1{$s}=\@b; printf "  mem %-12s %s => %s\n",$s,join(" / ",map { sprintf("%.0f",$_->[1]) } @b),(@b ? sprintf("%.0f",nmed("MEM",$s,1)) : "NA") }
+  my ($fs,$au,$ft)=(nmed("MEM","foot-server",1),nmed("MEM","auto",1),nmed("MEM","foot",1));
+  if($fs ne "NA" && $au ne "NA"){
+    my @pb; for my $i (0..$#{$m1{auto}}){ my $a=$m1{auto}[$i][1]; my ($f)=grep { $_->[0] eq $m1{auto}[$i][0] } @{$m1{"foot-server"}}; push @pb,100*($a/$f->[1]-1) if $f }
+    printf "  auto vs foot-server: %+.1f%% on medians (%.0f vs %.0f); per batch %s\n",100*($au/$fs-1),$au,$fs,join(" / ",map { sprintf("%+.1f%%",$_) } @pb);
+    printf "  threshold (<= foot-server + 5%% = %.0f kB): %s\n",1.05*$fs,($au<=1.05*$fs?"PASS":"FAIL");
+  } else { print "  auto vs foot-server: not measured\n" }
+  if($ft ne "NA" && $au ne "NA"){ printf "  auto vs standalone foot: %+.1f%% (%.0f vs %.0f)\n",100*($au/$ft-1),$au,$ft }
+  for my $s (qw(foot-server)){ my @b=bat("DMEM","$s-daemon",0); if(@b){ my $x=$mem{DMEM}{"$s-daemon"}{0}; printf "  foot-server idle, zero windows, nonshm kB: %s => %s\n",join(" / ",map { $x->{$_}{nonshm} } sort keys %$x),med(map { $x->{$_}{nonshm} } keys %$x) } }
+  for my $s (qw(foot foot-server standalone auto)){ my $v=slope("MEM",$s); printf "  slope %d->%d windows, %-11s %s kB (%s MiB) per window\n",$lo,$hi,$s,($v eq "NA" ? ("NA","NA") : (sprintf("%.0f",$v),sprintf("%.2f",$v/1024))) }
+  for my $s (qw(foot foot-server standalone auto)){ printf "  total normalised kB %-11s n=1/%d/%d: %s\n",$s,$lo,$hi,join(" / ",map { my $v=nmed("MEM",$s,$_); $v eq "NA" ? $v : sprintf("%.0f",$v) } (1,$lo,$hi)) }
+  my ($nc,$lmax,$lmin,$waits,$bad)=(0,0,1e9,0,0); my %pmax;
+  for my $f (qw(g2-cond.raw g2-ff.raw g2-mem.raw)){ if(open(F,"<","$dir/$f")){ while(<F>){
+    if(/^COND_WAIT .*waited_s=(\d+)/){ if($1>0){ $waits++; print "$_" } next }
+    next unless /^COND label=/; $nc++;
+    if(/loadavg="([\d.]+)/){ $lmax=$1 if $1>$lmax; $lmin=$1 if $1<$lmin }
+    for my $k (qw(cpu mem io)){ if(/${k}_some_avg10_avg60=([\d.]+),([\d.]+)/){ $pmax{"$k avg10"}=$1 if $1>($pmax{"$k avg10"}//0); $pmax{"$k avg60"}=$2 if $2>($pmax{"$k avg60"}//0) } }
+    $bad++ unless /outputs="[^"]*enabled\/On/ } close F } }
+  printf "conditions over %d COND lines: loadavg(1m) min %.2f max %.2f; PSI some max %s; waits for CPU PSI: %d; lines without an enabled/On output: %d\n",$nc,$lmin,$lmax,join(", ",map { "$_ $pmax{$_}" } sort keys %pmax),$waits,$bad;
+' "$OUT" "$N_LO" "$N_HI" | tee "$OUT/remeasure-summary.txt"
 }
 
 [ -x "$CT" ] || die "missing $CT (cargo build --release)"
