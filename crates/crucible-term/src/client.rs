@@ -6,7 +6,9 @@
 //! with its grace) and the client exits with the relayed code or 128 + signo; SIGHUP only hangs up
 //! (exit 129): the daemon closes the session after its orphan grace unless its own Wayland
 //! connection is lost first, which keeps the session for reattach across a logout. Any failure
-//! before `opened` is a [`Outcome::Fallback`]: the caller runs standalone with one warning.
+//! before `opened` is a [`Outcome::Fallback`]: the caller runs standalone with one warning. Once
+//! `opened`, the client repoints its inherited stdout/stderr ([`detach_stdio`]): it outlives its
+//! compositor by design and must not hold a launcher's output pipe open across a logout.
 
 use crate::config::RunMode;
 use crate::daemon::{self, paths};
@@ -253,7 +255,8 @@ pub fn run(open: Open) -> Outcome {
         Ok(p) => p,
         Err(e) => return Outcome::Fallback(format!("no daemon socket ({e})")),
     };
-    let mut stream = match connect(&p, paths::log_path(&env)) {
+    let log = paths::log_path(&env);
+    let mut stream = match connect(&p, log.clone()) {
         Ok(s) => s,
         Err(e) => return Outcome::Fallback(format!("daemon unavailable ({e})")),
     };
@@ -293,7 +296,32 @@ pub fn run(open: Open) -> Outcome {
         Err(e) => return Outcome::Fallback(format!("daemon open: {e}")),
     }
     let _ = stream.set_read_timeout(None);
+    detach_stdio(log.as_deref());
     wait(stream, buf)
+}
+
+/// Repoint the inherited stdout to `/dev/null` and stderr to the daemon log (append), or to
+/// `/dev/null` when there is no log or it will not open. Called once the window is `opened`.
+///
+/// Why: the launcher-pipe deadlock. A launcher that runs the compositor as `crucible 2>&1 | tee`
+/// waits for the pipe's EOF, which needs every holder of its write end gone. This client outlives
+/// its compositor by design (the daemon keeps the session for reattach), so holding the inherited
+/// fd 1/2 would keep the pipe open and block the logout until the hangup the launcher itself
+/// causes. After this call no inherited fd 1 or 2 stays open; a failed redirect is silent (there
+/// is nowhere to report it) and does not change the outcome. stdin is left alone.
+fn detach_stdio(log: Option<&std::path::Path>) {
+    use std::fs::OpenOptions;
+    let null = OpenOptions::new().write(true).open("/dev/null").ok();
+    let _ = match &null {
+        Some(n) => rustix::stdio::dup2_stdout(n),
+        None => Ok(()),
+    };
+    let errfile = log
+        .and_then(|l| OpenOptions::new().create(true).append(true).open(l).ok())
+        .or(null);
+    if let Some(e) = errfile {
+        let _ = rustix::stdio::dup2_stderr(&e);
+    }
 }
 
 const LOST: &str = "crucible-term: daemon connection lost";

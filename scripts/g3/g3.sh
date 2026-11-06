@@ -32,9 +32,12 @@ Only pids this script recorded (with their start time) are ever signalled.
              (b) the saved workspace keeps the three slots; (c) the orphaned old thin clients exited 0: the compositor runs under a
              perl wrapper that is a child subreaper (prctl PR_SET_CHILD_SUBREAPER), so the killed compositor's children reparent to it and
              their wait statuses are logged; the display name after the restart must equal the one before (Assumption 1).
-  logout     the restart leg as a real logout does it: SIGHUP the recorded thin clients and quit the compositor cleanly (`msg exec quit`,
-             SIGTERM after 5 s), so the clients' hang-ups can reach the daemon before its Wayland connection goes. (a), (b) and the
-             display check as for restart; (c) the old thin clients exited 129 (128 + SIGHUP, no `close` sent).
+  logout     the restart leg as a real logout does it: the first compositor's stdout+stderr go into a pipe (a FIFO; a launcher's `| tee`) whose
+             reader appends to the compositor log and stamps $T/eof.ts at EOF. Quit the compositor cleanly (`msg exec quit`, SIGTERM
+             after 5 s); (eof) the pipe must reach EOF within 5 s of the quit while the recorded thin clients are still alive (they must not
+             hold the inherited stdout/stderr); then SIGHUP the clients (the tty hangup), so their hang-ups reach the daemon before its
+             Wayland connection goes. (a), (b) and the display check as for restart; (c) the old thin clients exited 129 (128 + SIGHUP,
+             no `close` sent).
   summarize  read target/g3/g3-*.raw and print the G3 table (target/g3/g3-summary.txt).
 
 Output: raw lines in target/g3/g3-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g3/logs/.
@@ -193,6 +196,8 @@ select($fh); $| = 1;
 my $pid = fork();
 die "fork: $!" unless defined $pid;
 if (!$pid) { exec @cmd or die "exec: $!" }
+# only the compositor child may hold the (probe) pipe's write end: drop the wrapper's copies
+close(STDOUT); close(STDERR);
 print "SUBREAPER_START compositor_fork=$pid\n";
 while (1) {
   my $k = waitpid(-1, 0);
@@ -202,10 +207,40 @@ while (1) {
 PERL
 }
 
+# pids (comm) holding the compositor's output pipe (inode recorded at start), for the eof FAIL detail
+pipe_holders() {
+	local f p fl out=""
+	[ -n "${PIPE_INO:-}" ] || { echo "inode unknown"; return 0; }
+	for f in /proc/[0-9]*/fd/*; do
+		[ "$(readlink "$f" 2>/dev/null)" = "$PIPE_INO" ] || continue
+		p=${f#/proc/}
+		p=${p%%/*}
+		# the pipe's reader keeps its (read) end; list write ends only (fdinfo flags access mode 1 or 2)
+		fl=$(awk '/^flags:/ {print $2}' "/proc/$p/fdinfo/${f##*/}" 2>/dev/null || true)
+		[ $((0${fl:-0} & 3)) -ne 0 ] || continue
+		out="$out $p($(cat "/proc/$p/comm" 2>/dev/null)):fd${f##*/}"
+	done
+	echo "${out:-none}"
+}
+
+# logout-leg probe: the reader end of the compositor's output pipe. Appends to the compositor log, stamps EOF when every writer is gone.
+probe_reader() { # log eofts
+	cat >>"$1"
+	date +%s.%N >"$2"
+}
+
 # start the nested compositor on the existing state dir; wrapper=1 runs it under the subreaper wrapper
 start_comp() { # wrapper
 	local i
-	if [ "$1" = 1 ]; then
+	if [ "$1" = 1 ] && [ "$LEG" = logout ]; then
+		write_subreaper
+		rm -f "$T/eof.ts"
+		: >"$T/log.$$"
+		# a FIFO, not a process substitution: bash leaves its own write-end copy (fd 63) open in the child, which every descendant would inherit
+		mkfifo "$T/probe.fifo"
+		probe_reader "$T/log.$$" "$T/eof.ts" <"$T/probe.fifo" &
+		env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit >"$T/probe.fifo" 2>&1 &
+	elif [ "$1" = 1 ]; then
 		write_subreaper
 		env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit >"$T/log.$$" 2>&1 &
 	else
@@ -220,6 +255,7 @@ start_comp() { # wrapper
 	done
 	if [ -z "$CPID" ] || ! alive "$CPID"; then echo "compositor did not come up: see $T/log.$$"; tail -5 "$T"/log.* || true; return 1; fi
 	rec "$CPID"
+	if [ "$1" = 1 ] && [ "$LEG" = logout ]; then PIPE_INO=$(readlink "/proc/$CPID/fd/1" 2>/dev/null || true); echo "PROBE launcher pipe: $PIPE_INO"; fi
 	DISP=$(nested_display)
 	[ "$T/run" != "$LIVE_RT" ] || die "nested XDG_RUNTIME_DIR is the live one"
 	[ ! -e "$LIVE_RT/cterm/$DISP.sock" ] || echo "NOTE a live cterm daemon socket exists at $LIVE_RT/cterm/$DISP.sock (untouched: nested XDG_RUNTIME_DIR differs)"
@@ -515,7 +551,7 @@ leg_logout() { leg_restart; }
 leg_segv() { leg_fault segv; }
 
 leg_restart() {
-	local i p pre_disp pre_d pre_kids pre_clients post_kids post_clients="" n=0 ok detail line c st pre_r old_cpid t0
+	local qt nalive el ev i p pre_disp pre_d pre_kids pre_clients post_kids post_clients="" n=0 ok detail line c st pre_r old_cpid t0
 	g3_start "$LEG-$RUN" || { echo "HARNESS FAILURE: start"; g3_stop; return 1; }
 	bringup || { g3_stop; return 1; }
 	pre_disp=$DISP pre_d=$DPID
@@ -528,10 +564,23 @@ leg_restart() {
 	echo "RESTART SIGKILL compositor $CPID at $(date +%T.%N | cut -c1-12)"
 	old_cpid=$CPID
 	if [ "$LEG" = logout ]; then
-		for p in $pre_clients; do sigrec HUP "$p" || true; done
+		qt=$(date +%s.%N)
 		msg exec quit >/dev/null 2>&1 || true
 		for i in 1 2 3 4 5 6 7 8 9 10; do alive "$CPID" || break; sleep 0.5; done
 		if alive "$CPID"; then sigrec TERM "$CPID" || true; fi
+		# eof: the launcher pipe must close within 5 s of the quit while the thin clients are still alive
+		while [ ! -f "$T/eof.ts" ] && [ "$(awk -v n="$(date +%s.%N)" -v q="$qt" 'BEGIN{print (n-q>=5)}')" = 0 ]; do sleep 0.1; done
+		nalive=0
+		for p in $pre_clients; do if alive "$p"; then nalive=$((nalive + 1)); fi; done
+		if [ -f "$T/eof.ts" ]; then
+			el=$(awk -v e="$(cat "$T/eof.ts")" -v q="$qt" 'BEGIN{printf "%.2f", e-q}')
+			if [ "$(awk -v e="$el" 'BEGIN{print (e<=5)}')" = 1 ] && [ "$nalive" -gt 0 ]; then ev=PASS; else ev=FAIL; fi
+			result eof "$ev" "launcher pipe reached EOF ${el}s after the quit; $nalive of $(echo $pre_clients | wc -w) recorded thin clients alive at EOF (limit 5s, clients must be alive)"
+		else
+			el=$(awk -v n="$(date +%s.%N)" -v q="$qt" 'BEGIN{printf "%.2f", n-q}')
+			result eof FAIL "launcher pipe still open ${el}s after the quit; $nalive of $(echo $pre_clients | wc -w) recorded thin clients alive; write-end holders: $(pipe_holders)"
+		fi
+		for p in $pre_clients; do sigrec HUP "$p" || true; done
 	else
 		sigrec KILL "$CPID" || { g3_stop; return 1; }
 	fi
@@ -617,7 +666,7 @@ leg_summarize() {
     while(<F>){ next unless /^RESULT leg=(\S+) run=(\d+) assert=(\S+) (PASS|FAIL|UNMEASURED) :: (.*)/; $r{$1}{$2}{$3}=[$4,$5]; } close F }
   print "G3 RESULT\n";
   for my $leg (qw(kill segv restart logout)){ my $runs=$r{$leg}; unless($runs){ print "leg $leg: not run\n"; next }
-    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = ($leg eq "restart" || $leg eq "logout") ? [qw(a b c display)] : [qw(a b)];
+    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = $leg eq "logout" ? [qw(eof a b c display)] : $leg eq "restart" ? [qw(a b c display)] : [qw(a b)];
       my $v="PASS"; for my $k (@$core){ my $s=$a->{$k} ? $a->{$k}[0] : "UNMEASURED"; $v="FAIL" if $s eq "FAIL"; $v="UNMEASURED" if $s eq "UNMEASURED" && $v eq "PASS" }
       printf "leg %-8s run %d: %s\n",$leg,$run,$v;
       for my $k (sort keys %$a){ printf "    %-10s %-10s %s\n",$k,$a->{$k}[0],substr($a->{$k}[1],0,200) } } }
