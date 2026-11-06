@@ -4,6 +4,16 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.4.2 — 2026-11-06
+
+### Fixed
+
+- Live shells survive a real logout. In 0.4.1 the daemon survived but closed every session: the thin clients are hung up when the session ends, a thin client turned SIGHUP into `close`, and the daemon closed a still-connected session the moment its client went away. SIGHUP now only hangs up the client (exit 129; SIGTERM and SIGINT still close the window). A session whose client hangs up while the daemon is still connected closes after 2 s, unless the Wayland connection is lost first, in which case it is detached and kept for reattach.
+
+### Added
+
+- `scripts/g3/g3.sh logout`: the restart leg done the way a real logout does it (thin clients hung up, clean compositor quit). See `docs/g3-measurement.md`, addendum.
+
 ## 0.4.1 — 2026-11-06
 
 ### Fixed
