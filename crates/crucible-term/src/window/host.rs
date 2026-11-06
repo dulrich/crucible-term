@@ -286,9 +286,15 @@ impl Wl {
         let identity = globals
             .bind::<CrucibleWindowIdentityManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
-        let seat_in = SeatInput::new(&globals, &qh);
+        let mut seat_in = SeatInput::new(&globals, &qh);
         let registry = RegistryState::new(&globals);
         let seat = SeatState::new(&globals, &qh);
+        // sctk calls `new_seat` only for seats announced after this point; the seats already in
+        // the registry (in practice, every seat) need their data and primary-selection devices
+        // bound here, or copy and paste silently do nothing.
+        if let Some(s) = seat.seats().next() {
+            seat_in.bind_devices(&qh, &s);
+        }
         let output = OutputState::new(&globals, &qh);
         let source = Registered::insert(handle, WaylandSource::new(conn, queue), |_, q, h| {
             q.dispatch_pending(h)
