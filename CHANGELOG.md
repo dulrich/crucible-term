@@ -4,6 +4,13 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.4.1 — 2026-11-06
+
+### Fixed
+
+- The daemon survives a real logout. It panicked ("RefCell already borrowed") instead of detaching when the compositor exited with a key-repeat timer armed (a key held at the time), so no live shell reattached after a CDE restart.
+- Copy and paste work. The clipboard and primary-selection devices were never bound for the seat present at startup, so selection, `Ctrl+Shift+C`/`Ctrl+Shift+V`, middle-click paste and OSC 52 all did nothing, in every mode.
+
 ## 0.4.0 — 2026-11-05
 
 ### Added
