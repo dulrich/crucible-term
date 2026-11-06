@@ -16,6 +16,7 @@
 //! cursor shape="block" blink=#false        // block | underline | beam
 //! mode "standalone"                        // standalone | daemon | auto (default standalone)
 //! daemon-linger 0                          // daemon idle-exit seconds; 0 = stay resident
+//! detached-timeout 30                      // seconds a detached session waits for reattach after a reconnect; 0 = never
 //! ```
 //!
 //! **Errors never stop the terminal.** A whole-file syntax error prints one
@@ -66,6 +67,9 @@ pub struct Settings {
     pub mode: RunMode,
     /// Daemon idle-exit timeout in seconds with no windows and no clients; 0 = stay resident.
     pub daemon_linger: u64,
+    /// Seconds a session still detached after a Wayland reconnect waits for a reattach before it
+    /// is closed (SIGHUP grace); 0 = never.
+    pub detached_timeout: u64,
 }
 
 impl Default for Settings {
@@ -81,6 +85,7 @@ impl Default for Settings {
             cursor_blink: false,
             mode: RunMode::Standalone,
             daemon_linger: 0,
+            detached_timeout: 30,
         }
     }
 }
@@ -103,6 +108,16 @@ fn set_mode(s: &mut Settings, v: &str) -> Result<(), String> {
         "auto" => RunMode::Auto,
         _ => return Err(format!("mode {v:?}: expected standalone|daemon|auto")),
     };
+    Ok(())
+}
+
+fn set_detached_timeout(s: &mut Settings, n: f64) -> Result<(), String> {
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > f64::from(u32::MAX) {
+        return Err(format!(
+            "detached-timeout {n}: expected a non-negative integer of seconds"
+        ));
+    }
+    s.detached_timeout = n as u64;
     Ok(())
 }
 
@@ -248,6 +263,10 @@ pub fn parse(file: &str, src: &str, s: &mut Settings, warns: &mut Vec<String>) {
             "daemon-linger" => match pos(0).and_then(num) {
                 Some(n) => set_linger(s, n).unwrap_or_else(|m| w(node, m)),
                 None => w(node, "daemon-linger: expected seconds".into()),
+            },
+            "detached-timeout" => match pos(0).and_then(num) {
+                Some(n) => set_detached_timeout(s, n).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "detached-timeout: expected seconds".into()),
             },
             "cursor" => {
                 if let Some(v) = node.get("shape") {
@@ -445,6 +464,7 @@ fn apply_key(s: &mut Settings, key: &str, val: &str) -> Result<(), String> {
         "cursor.shape" | "cursor.style" => set_shape(s, val),
         "mode" => set_mode(s, val),
         "daemon-linger" => set_linger(s, float()?),
+        "detached-timeout" => set_detached_timeout(s, float()?),
         "cursor.blink" => {
             s.cursor_blink = parse_bool(val).ok_or("cursor.blink: expected true|false|yes|no")?;
             Ok(())

@@ -201,7 +201,7 @@ fn the_grant_never_reaches_the_daemon_or_the_child() {
     // A raw `open` that smuggles the grant in its env (grant field absent): the daemon strips it.
     let dump = e.root.join("env");
     let mut s = UnixStream::connect(e.socket()).unwrap();
-    let mut hello = 1u32.to_le_bytes().to_vec();
+    let mut hello = 2u32.to_le_bytes().to_vec();
     bytes(&mut hello, b"test");
     s.write_all(&frame(1, &hello)).unwrap();
     let mut open = Vec::new();
@@ -224,7 +224,7 @@ fn the_grant_never_reaches_the_daemon_or_the_child() {
         std::env::var("PATH").unwrap_or_default().as_bytes(),
     );
     open.extend_from_slice(&0u32.to_le_bytes());
-    open.extend_from_slice(&[0, 0, 0]);
+    open.extend_from_slice(&[0, 0, 0, 0]);
     s.write_all(&frame(2, &open)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     // hello, opened, exited: read until the exited frame (tag 5) arrives.
@@ -299,7 +299,7 @@ fn a_detached_session_outlives_its_client_and_exits_are_relayed() {
     let mut late = e.sh("exit 0");
     late.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "300");
     let (_, err) = status(late);
-    assert!(err.contains("no window identity"), "{err}");
+    assert!(err.contains("no Wayland connection"), "{err}");
 }
 
 /// A child exiting while detached is relayed as `exited` to its client.
@@ -326,4 +326,228 @@ fn the_daemon_reconnects_after_a_loss() {
     }
     assert!(e.log().contains("daemon: reconnected"), "{}", e.log());
     assert_eq!(status(e.sh("exit 4")).0, 4);
+}
+
+const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+fn opt(out: &mut Vec<u8>, v: Option<&str>) {
+    match v {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            bytes(out, s.as_bytes());
+        }
+    }
+}
+
+/// A raw v2 client: `hello`, then `open` of `sh -c script` with `grant` and `key`.
+struct Raw {
+    s: UnixStream,
+    buf: Vec<u8>,
+}
+
+impl Raw {
+    fn open(e: &Env, script: &str, grant: Option<&str>, key: Option<&str>) -> Raw {
+        let mut s = UnixStream::connect(e.socket()).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut hello = 2u32.to_le_bytes().to_vec();
+        bytes(&mut hello, b"test");
+        s.write_all(&frame(1, &hello)).unwrap();
+        let mut o = Vec::new();
+        let argv = ["sh", "-c", script];
+        o.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+        for a in argv {
+            bytes(&mut o, a.as_bytes());
+        }
+        bytes(&mut o, b"/");
+        o.extend_from_slice(&1u32.to_le_bytes());
+        bytes(&mut o, b"PATH");
+        bytes(&mut o, std::env::var("PATH").unwrap_or_default().as_bytes());
+        o.extend_from_slice(&0u32.to_le_bytes());
+        opt(&mut o, None);
+        opt(&mut o, None);
+        opt(&mut o, grant);
+        opt(&mut o, key);
+        s.write_all(&frame(2, &o)).unwrap();
+        let mut r = Raw { s, buf: Vec::new() };
+        assert_eq!(r.next().0, 1, "hello first");
+        r
+    }
+
+    /// The next frame: (tag, payload).
+    fn next(&mut self) -> (u8, Vec<u8>) {
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                    as usize;
+                if self.buf.len() >= 4 + len {
+                    let f: Vec<u8> = self.buf.drain(..4 + len).collect();
+                    return (f[4], f[5..].to_vec());
+                }
+            }
+            let mut chunk = [0u8; 256];
+            let n = self.s.read(&mut chunk).expect("read");
+            assert!(n > 0, "daemon hung up");
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// `opened`: (root pid, reattached).
+    fn opened(&mut self) -> (i32, bool) {
+        let (tag, p) = self.next();
+        assert_eq!(tag, 3, "opened, got tag {tag} {p:?}");
+        (i32::from_le_bytes([p[0], p[1], p[2], p[3]]), p[4] != 0)
+    }
+}
+
+fn read_pid(p: &Path) -> i32 {
+    std::fs::read_to_string(p).unwrap().trim().parse().unwrap()
+}
+
+/// A granted, keyed `cterm` whose child records its pid in `ready` and loops; the fake Wayland
+/// connection is lost after `loss` ms and back `back` ms later (when given).
+fn keyed(e: &Env, ready: &Path, loss: Option<&str>, back: Option<&str>) -> Command {
+    let mut c = e.sh(&format!(
+        "trap 'exit 0' HUP; echo $$ > {}; while :; do sleep 0.05; done",
+        ready.display()
+    ));
+    c.env("CRUCIBLE_WINDOW_GRANT", "g")
+        .env("CRUCIBLE_TERM_SESSION", KEY)
+        .env("CTERM_DEBUG_HEADLESS_IDENTITY", "1");
+    if let Some(l) = loss {
+        c.env("CTERM_DEBUG_HEADLESS_LOSS_MS", l);
+    }
+    if let Some(b) = back {
+        c.env("CTERM_DEBUG_HEADLESS_RECONNECT_MS", b);
+    }
+    c
+}
+
+fn wait_log(e: &Env, needle: &str) {
+    let t = Instant::now();
+    while !e.log().contains(needle) && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(e.log().contains(needle), "{needle:?} not in {}", e.log());
+}
+
+/// Reattach after a loss and reconnect: the new granted open answers `reattached` with the
+/// same root pid, the old client is superseded and exits 0, and (pin E1) its EOF leaves the
+/// child alive and owned by the new connection, which can still close it.
+#[test]
+fn a_detached_session_is_reattached_by_key_and_the_old_client_superseded() {
+    let e = Env::new("reattach");
+    let ready = e.root.join("ready");
+    let old = keyed(&e, &ready, Some("300"), Some("200"))
+        .spawn()
+        .expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    let child = read_pid(&ready);
+    wait_log(&e, "daemon: reconnected");
+    let mut new = Raw::open(&e, "exit 9", Some("g"), Some(KEY));
+    assert_eq!(new.opened(), (child, true));
+    let out = old.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // E1: the superseded client's EOF did not close the session.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(alive(child), "old-client EOF closed the reattached session");
+    new.s.write_all(&frame(6, &[])).unwrap();
+    assert_eq!(new.next().0, 5, "the new owner gets the exit");
+}
+
+/// A key naming an attached session is never stolen.
+#[test]
+fn an_attached_key_is_not_stolen() {
+    let e = Env::new("nosteal");
+    let ready = e.root.join("ready");
+    let mut a = keyed(&e, &ready, None, None).spawn().expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    let child = read_pid(&ready);
+    let mut b = Raw::open(&e, "sleep 5", Some("g"), Some(KEY));
+    let (pid, re) = b.opened();
+    assert!(!re && pid != child);
+    assert!(
+        e.log().contains("already names live session"),
+        "{}",
+        e.log()
+    );
+    assert!(
+        a.try_wait().unwrap().is_none(),
+        "old client kept its window"
+    );
+    let _ = a.kill();
+    let _ = a.wait();
+}
+
+/// A key without a grant never reattaches, even a detached session.
+#[test]
+fn a_key_without_a_grant_never_reattaches() {
+    let e = Env::new("nogrant");
+    let ready = e.root.join("ready");
+    let mut a = keyed(&e, &ready, Some("200"), Some("100"))
+        .spawn()
+        .expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    let child = read_pid(&ready);
+    wait_log(&e, "daemon: reconnected");
+    let mut b = Raw::open(&e, "sleep 5", None, Some(KEY));
+    let (pid, re) = b.opened();
+    assert!(!re && pid != child);
+    assert!(e.log().contains("without a grant"), "{}", e.log());
+    assert!(a.try_wait().unwrap().is_none(), "not superseded");
+    let _ = a.kill();
+    let _ = a.wait();
+}
+
+/// `detached-timeout 1`: a session still detached 1 s after the reconnect gets SIGHUP.
+#[test]
+fn an_unclaimed_detached_session_is_closed_after_the_timeout() {
+    let e = Env::new("timeout");
+    std::fs::write(
+        e.root.join("cfg/crucible-term/config.kdl"),
+        "detached-timeout 1\n",
+    )
+    .unwrap();
+    let ready = e.root.join("ready");
+    let hup = e.root.join("hup");
+    let mut c = e.sh(&format!(
+        "trap 'echo > {}; exit 0' HUP; echo $$ > {}; while :; do sleep 0.05; done",
+        hup.display(),
+        ready.display()
+    ));
+    c.env("CTERM_DEBUG_HEADLESS_LOSS_MS", "200")
+        .env("CTERM_DEBUG_HEADLESS_RECONNECT_MS", "100");
+    let c = c.spawn().expect("client");
+    assert!(wait_for(&hup, Duration::from_secs(6)), "{}", e.log());
+    assert!(
+        e.log().contains("unclaimed after 1s; closing"),
+        "{}",
+        e.log()
+    );
+    assert_eq!(c.wait_with_output().unwrap().status.code(), Some(0));
+}
+
+/// The session key reaches neither the daemon's nor the child's environment.
+#[test]
+fn the_session_key_never_reaches_the_daemon_or_the_child() {
+    let e = Env::new("keyenv");
+    let dump = e.root.join("env");
+    let mut c = e.sh(&format!("env > {}", dump.display()));
+    c.env("CRUCIBLE_WINDOW_GRANT", "g")
+        .env("CRUCIBLE_TERM_SESSION", KEY)
+        .env("CTERM_DEBUG_HEADLESS_IDENTITY", "1");
+    assert_eq!(status(c).0, 0);
+    let env = std::fs::read_to_string(&dump).unwrap();
+    assert!(
+        env.contains("PATH=") && !env.contains("CRUCIBLE_TERM_SESSION"),
+        "{env}"
+    );
+    let pid = e.daemon_pid().expect("daemon");
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(!String::from_utf8_lossy(&environ).contains("CRUCIBLE_TERM_SESSION"));
 }

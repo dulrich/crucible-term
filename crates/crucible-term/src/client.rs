@@ -24,9 +24,33 @@ const START_BUDGET: Duration = Duration::from_secs(2);
 /// How long a signalled client waits for the `exited` that follows its `close`.
 const CLOSE_WAIT: Duration = Duration::from_millis(1500);
 
-/// `env` without `CRUCIBLE_WINDOW_GRANT`.
+/// The CDE session key variable; it never reaches a child's environment.
+pub const SESSION_VAR: &str = "CRUCIBLE_TERM_SESSION";
+
+/// `env` without `CRUCIBLE_WINDOW_GRANT` or `CRUCIBLE_TERM_SESSION`.
 pub fn strip_grant(env: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
-    env.into_iter().filter(|(k, _)| k != GRANT_VAR).collect()
+    env.into_iter()
+        .filter(|(k, _)| k != GRANT_VAR && k != SESSION_VAR)
+        .collect()
+}
+
+/// A session key is exactly 32 lowercase hex chars.
+pub fn valid_key(k: &str) -> bool {
+    k.len() == 32
+        && k.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The `open.session_key` for a raw `CRUCIBLE_TERM_SESSION` value: invalid is `None`, logged once.
+pub fn session_key(raw: Option<OsString>) -> Option<String> {
+    let raw = raw?;
+    match raw.to_str() {
+        Some(k) if valid_key(k) => Some(k.to_owned()),
+        _ => {
+            eprintln!("crucible-term: ignoring malformed {SESSION_VAR} (want 32 lowercase hex)");
+            None
+        }
+    }
 }
 
 /// Where this window runs.
@@ -104,6 +128,7 @@ fn start_daemon(log: Option<std::path::PathBuf>, deadline: Instant) -> Result<()
     let mut stage1 = std::process::Command::new(exe)
         .arg("daemon")
         .env_remove(GRANT_VAR)
+        .env_remove(SESSION_VAR)
         .env(daemon::DETACH_VAR, "1")
         .env(daemon::READY_FD_VAR, w.as_raw_fd().to_string())
         .stdin(std::process::Stdio::null())
@@ -257,6 +282,9 @@ pub fn run(open: Open) -> Outcome {
         Ok(Some(Msg::Refused { reason })) if reason == "no-identity" => {
             return Outcome::Fallback("the compositor grants no window identity".into());
         }
+        Ok(Some(Msg::Refused { reason })) if reason == "no-wayland" => {
+            return Outcome::Fallback("the daemon has no Wayland connection".into());
+        }
         Ok(Some(Msg::Refused { reason })) => return Outcome::Failed(reason),
         Ok(Some(m)) => return Outcome::Fallback(format!("daemon answered {m:?} to open")),
         Ok(None) => return Outcome::Fallback("daemon closed the connection".into()),
@@ -275,8 +303,11 @@ fn wait(mut stream: UnixStream, mut buf: Vec<u8>) -> Outcome {
         // A frame may already be buffered.
         if let Ok(Some((m, n))) = wire::decode(&buf) {
             buf.drain(..n);
-            if let Msg::Exited { code } = m {
-                return Outcome::Exit(code);
+            match m {
+                Msg::Exited { code } => return Outcome::Exit(code),
+                // Another window reattached this session: leave quietly.
+                Msg::Superseded => return Outcome::Exit(0),
+                _ => {}
             }
             continue;
         }
@@ -306,6 +337,7 @@ fn wait(mut stream: UnixStream, mut buf: Vec<u8>) -> Outcome {
             while start.elapsed() < CLOSE_WAIT {
                 match read_msg(&mut stream, &mut buf) {
                     Ok(Some(Msg::Exited { code })) => return Outcome::Exit(code),
+                    Ok(Some(Msg::Superseded)) => return Outcome::Exit(0),
                     Ok(Some(_)) => {}
                     _ => break,
                 }
@@ -343,6 +375,23 @@ mod tests {
         let out = strip_grant(env);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(k, _)| k != GRANT_VAR));
+    }
+
+    #[test]
+    fn the_session_key_is_stripped_and_validated() {
+        let env = vec![("A".into(), "1".into()), (SESSION_VAR.into(), "k".into())];
+        assert_eq!(strip_grant(env), vec![("A".into(), "1".into())]);
+        let good = "0123456789abcdef0123456789abcdef";
+        assert_eq!(session_key(Some(good.into())), Some(good.into()));
+        for bad in [
+            "",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef",
+            "g123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(session_key(Some(bad.into())), None, "{bad}");
+        }
+        assert_eq!(session_key(None), None);
     }
 
     #[test]

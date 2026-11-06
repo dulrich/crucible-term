@@ -97,7 +97,7 @@ fn main() -> ExitCode {
     let argv = cli
         .exec
         .unwrap_or_else(|| vec![shell(std::env::var_os("SHELL"))]);
-    // The grant is for this spawn only: no child environment ever carries it.
+    // The grant and session key are for this spawn only: no child environment ever carries it.
     let grant = std::env::var_os(client::GRANT_VAR).map(|g| g.to_string_lossy().into_owned());
     let env = client::strip_grant(crucible_term_core::pty::inherited_env());
     if client::route(cfg.settings.mode, grant.is_some(), cli.standalone) == client::Route::Daemon {
@@ -109,6 +109,7 @@ fn main() -> ExitCode {
             app_id: cli.app_id,
             title: cli.title,
             grant,
+            session_key: client::session_key(std::env::var_os(client::SESSION_VAR)),
         };
         match client::run(open) {
             client::Outcome::Exit(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),

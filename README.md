@@ -53,14 +53,18 @@ A broken file never stops the terminal: each problem prints one `crucible-term: 
 | `cursor.shape=block\|underline\|beam` (alias `cursor.style`), `cursor.blink=true\|false\|yes\|no` | cursor |
 | `mode=standalone\|daemon\|auto` | how the window runs (see Modes) |
 | `daemon-linger=<s>` | daemon idle-exit seconds (see Modes) |
+| `detached-timeout=<s>` | seconds a detached session waits for reattach after a reconnect; 0 = never (see Modes) |
 
 ## Modes
 
 - Config key `mode` (file `mode "auto"` or `-o mode=…`): `standalone` (default, phase-1 behaviour: the window runs in this process), `daemon` (this `cterm` is a thin client of the per-user daemon, which owns the PTY and the window), or `auto` (the daemon only when the spawn carries `CRUCIBLE_WINDOW_GRANT`, else standalone). `--standalone` forces standalone whatever the config says.
 - `auto` stays standalone in practice until CDE grants window identity: the daemon answers a granted `open` with `no-identity`, and the client falls back.
 - Socket: `$XDG_RUNTIME_DIR/cterm/<basename of $WAYLAND_DISPLAY>.sock` in a `0700` directory; only the daemon's own UID is served. Lock: the sibling `.lock`, taken by a client that starts the daemon. Log: `$XDG_STATE_HOME/crucible-term/daemon.log` (fallback `~/.local/state/crucible-term/daemon.log`), appended.
-- The daemon starts on demand (`cterm daemon`, detached) and stays resident after its last window. `daemon-linger N` (seconds, in the config the daemon reads when it starts; absent or 0 = off) makes it exit after N s with no windows and no clients. It exits when its Wayland connection is lost.
-- Fallback: no `XDG_RUNTIME_DIR` or `WAYLAND_DISPLAY`, a daemon that cannot be reached or started within 2 s, a protocol-version mismatch, or a `no-identity` refusal → the client runs the window standalone in-process with one warning.
+- The daemon starts on demand (`cterm daemon`, detached) and stays resident after its last window. `daemon-linger N` (seconds, in the config the daemon reads when it starts; absent or 0 = off) makes it exit after N s with no windows and no clients.
+- Wayland loss: the daemon *detaches* instead of exiting. Every session (PTY, child, VT state) stays live and keeps draining its PTY; a client EOF no longer closes a detached session; a child that exits while detached is still relayed. The daemon retries the display it started on every second. An `open` while detached tries the display once and is refused `no-wayland` if it is still gone (the client falls back to standalone). Standalone mode still exits on Wayland loss.
+- Reattach by session key: CDE exports `CRUCIBLE_TERM_SESSION` (32 lowercase hex) to each granted spawn; the client sends it in `open` (a malformed value is ignored with one warning) and strips it from the child's environment on every path, like the grant. A *granted* open whose key names a *detached* session rebinds a new window to that live session (same root pid) instead of spawning; the previous client, if still connected, gets `superseded` and exits 0 silently. A key that names an attached session is never stolen (the new window spawns, unregistered, and the daemon logs it), and a key without a grant never reattaches.
+- `detached-timeout N` (seconds, default 30, 0 = never; daemon config): when the display comes back, each session still detached gets N s to be reattached, else it is closed through the SIGHUP grace and logged. A reattach cancels its clock; another loss before expiry cancels every clock until the next reconnect.
+- Fallback: no `XDG_RUNTIME_DIR` or `WAYLAND_DISPLAY`, a daemon that cannot be reached or started within 2 s, a protocol-version mismatch (the wire is v2), or a `no-identity` or `no-wayland` refusal → the client runs the window standalone in-process with one warning.
 - The client exits with its window's exit code. SIGTERM/SIGINT/SIGHUP to the client, or its death, closes the window (the child gets SIGHUP with a 500 ms grace). If the daemon dies the client exits 1 (`crucible-term: daemon connection lost`); `kill -9` of the daemon closes every window.
 - The child environment never contains `CRUCIBLE_WINDOW_GRANT`, in any mode.
 

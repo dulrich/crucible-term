@@ -29,6 +29,9 @@ const GRACE: Duration = Duration::from_millis(500);
 pub const LOSS_VAR: &str = "CTERM_DEBUG_HEADLESS_LOSS_MS";
 /// TEST-ONLY: the fake display is reachable again M ms after the loss.
 pub const RECONNECT_VAR: &str = "CTERM_DEBUG_HEADLESS_RECONNECT_MS";
+/// TEST-ONLY: `1` makes the fake advertise the identity global, so granted opens (and the
+/// session-key reattach) are served.
+pub const IDENTITY_VAR: &str = "CTERM_DEBUG_HEADLESS_IDENTITY";
 
 struct Kid {
     pty: Pty,
@@ -51,6 +54,8 @@ pub struct Headless {
     lost_at: Option<Instant>,
     /// How long after a loss the fake display is reachable again (`None`: never).
     back_after: Option<Duration>,
+    /// Advertise the (fake) identity global.
+    pub identity: bool,
 }
 
 impl Headless {
@@ -64,6 +69,7 @@ impl Headless {
             fake: None,
             lost_at: None,
             back_after: None,
+            identity: false,
         }
     }
 
@@ -123,6 +129,9 @@ fn signal(pid: u32, sig: rustix::process::Signal) {
 }
 
 impl Backend for Headless {
+    fn has_identity(&self) -> bool {
+        self.identity
+    }
     fn open(
         &mut self,
         cfg: &crate::window::Config,

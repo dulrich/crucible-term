@@ -11,7 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 /// The wire protocol version; a mismatch makes the client fall back to standalone.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest accepted frame (length field value), 1 MiB.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -32,6 +32,8 @@ pub struct Open {
     pub title: Option<String>,
     /// The CDE window grant, if the spawn carried one.
     pub grant: Option<String>,
+    /// `CRUCIBLE_TERM_SESSION` (32 lowercase hex), if valid: names a session to reattach.
+    pub session_key: Option<String>,
 }
 
 /// One message.
@@ -50,8 +52,10 @@ pub enum Msg {
     Opened {
         /// The child's pid.
         root_pid: u32,
+        /// The window rebinds an existing detached session (keyed) instead of a new spawn.
+        reattached: bool,
     },
-    /// Daemon → client: the open was refused (`no-identity`, or a spawn error).
+    /// Daemon → client: the open was refused (`no-identity`, `no-wayland`, or a spawn error).
     Refused {
         /// Why.
         reason: String,
@@ -63,6 +67,8 @@ pub enum Msg {
     },
     /// Client → daemon: close the window.
     Close,
+    /// Daemon → client: another client reattached this session; exit 0 silently.
+    Superseded,
 }
 
 /// A malformed frame.
@@ -100,6 +106,7 @@ const T_OPENED: u8 = 3;
 const T_REFUSED: u8 = 4;
 const T_EXITED: u8 = 5;
 const T_CLOSE: u8 = 6;
+const T_SUPERSEDED: u8 = 7;
 
 struct W(Vec<u8>);
 
@@ -153,10 +160,15 @@ pub fn encode(m: &Msg) -> Vec<u8> {
             w.opt(&o.app_id);
             w.opt(&o.title);
             w.opt(&o.grant);
+            w.opt(&o.session_key);
         }
-        Msg::Opened { root_pid } => {
+        Msg::Opened {
+            root_pid,
+            reattached,
+        } => {
             w.0.push(T_OPENED);
             w.u32(*root_pid);
+            w.0.push(u8::from(*reattached));
         }
         Msg::Refused { reason } => {
             w.0.push(T_REFUSED);
@@ -167,6 +179,7 @@ pub fn encode(m: &Msg) -> Vec<u8> {
             w.0.extend_from_slice(&code.to_le_bytes());
         }
         Msg::Close => w.0.push(T_CLOSE),
+        Msg::Superseded => w.0.push(T_SUPERSEDED),
     }
     let len = (w.0.len() - 4) as u32;
     w.0[..4].copy_from_slice(&len.to_le_bytes());
@@ -242,9 +255,13 @@ pub fn decode_body(body: &[u8]) -> Result<Msg, WireError> {
             o.app_id = r.opt()?;
             o.title = r.opt()?;
             o.grant = r.opt()?;
+            o.session_key = r.opt()?;
             Msg::Open(o)
         }
-        T_OPENED => Msg::Opened { root_pid: r.u32()? },
+        T_OPENED => Msg::Opened {
+            root_pid: r.u32()?,
+            reattached: r.u8()? != 0,
+        },
         T_REFUSED => Msg::Refused {
             reason: r.string()?,
         },
@@ -252,6 +269,7 @@ pub fn decode_body(body: &[u8]) -> Result<Msg, WireError> {
             code: r.u32()? as i32,
         },
         T_CLOSE => Msg::Close,
+        T_SUPERSEDED => Msg::Superseded,
         t => return Err(WireError::UnknownTag(t)),
     };
     if !r.0.is_empty() {
@@ -323,15 +341,24 @@ mod tests {
                 app_id: Some("a.b".into()),
                 title: None,
                 grant: Some("g".into()),
+                session_key: Some("0123456789abcdef0123456789abcdef".into()),
             }),
             Msg::Open(Open::default()),
-            Msg::Opened { root_pid: 4242 },
+            Msg::Opened {
+                root_pid: 4242,
+                reattached: true,
+            },
+            Msg::Opened {
+                root_pid: 1,
+                reattached: false,
+            },
             Msg::Refused {
                 reason: "no-identity".into(),
             },
             Msg::Exited { code: -1 },
             Msg::Exited { code: 143 },
             Msg::Close,
+            Msg::Superseded,
         ]
     }
 
@@ -397,5 +424,7 @@ mod tests {
             HelloVerdict::Fallback
         );
         assert_eq!(judge_hello(&Msg::Close, "x"), HelloVerdict::Fallback);
+        // A v1 peer (pre-session-key) falls back rather than misparsing `open`.
+        assert_eq!(judge_hello(&h(1, "x"), "x"), HelloVerdict::Fallback);
     }
 }

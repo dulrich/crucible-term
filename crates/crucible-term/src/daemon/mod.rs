@@ -15,7 +15,7 @@
 pub mod headless;
 pub mod paths;
 
-use crate::client::{GRANT_VAR, strip_grant};
+use crate::client::{GRANT_VAR, SESSION_VAR, strip_grant};
 use crate::config;
 use crate::window::identity;
 use crate::window::{self, Host, TermId};
@@ -26,7 +26,7 @@ use smithay_client_toolkit::reexports::calloop::{
     EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -91,8 +91,6 @@ pub trait Backend: 'static {
     }
     /// Bind a new surface to the existing, surface-less session `id` (binding the window
     /// identity with `grant`); returns its root pid.
-    // WP-2 calls this from the keyed `open`; until then only tests do.
-    #[allow(dead_code)]
     fn attach(&mut self, id: u64, grant: Option<String>) -> Result<u32, String>;
 }
 
@@ -167,6 +165,14 @@ struct State {
     delay: Option<Duration>,
     /// A deferred open to schedule: set by `on_msg`, armed by the readable callback.
     armed: Option<(u64, Duration, Open)>,
+    /// Session key → session id, for sessions spawned under a key that can be reattached.
+    keys: BTreeMap<String, u64>,
+    /// Every live session id (removed when its exit is drained).
+    live: BTreeSet<u64>,
+    /// `detached-timeout` (`None`: never).
+    detached_timeout: Option<Duration>,
+    /// Session id → when it is closed unless reattached; set at reconnect, cleared on loss.
+    deadlines: BTreeMap<u64, Instant>,
 }
 
 /// TEST-ONLY: parse `CTERM_DEBUG_OPEN_DELAY_MS`: unset, `0` or unparsable mean no delay.
@@ -219,19 +225,83 @@ fn open_config(o: &Open) -> window::Config {
 fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: bool) {
     let cfg = open_config(&o);
     let grant = if granted { o.grant } else { None };
+    let key = o.session_key;
     match b.open(&cfg, o.argv, strip_grant(o.env), grant) {
         Ok((id, root_pid)) => {
             if let Some(c) = st.conns.get_mut(&conn) {
                 c.term = Some(id);
             }
             st.by_term.insert(id, conn);
-            st.send(conn, &Msg::Opened { root_pid });
+            st.live.insert(id);
+            if let Some(k) = key {
+                if !granted {
+                    eprintln!(
+                        "crucible-term: daemon: client {conn}: session key without a grant; session {id} is not reattachable"
+                    );
+                } else if let Some(&old) = st.keys.get(&k).filter(|o| st.live.contains(o)) {
+                    // Never steal: the key's session is still live (attached), so this one
+                    // spawns unregistered.
+                    eprintln!(
+                        "crucible-term: daemon: client {conn}: session key already names live session {old}; session {id} is not reattachable"
+                    );
+                } else {
+                    st.keys.insert(k, id);
+                }
+            }
+            st.send(
+                conn,
+                &Msg::Opened {
+                    root_pid,
+                    reattached: false,
+                },
+            );
         }
         Err(reason) => {
             eprintln!("crucible-term: daemon: open: {reason}");
             st.send(conn, &Msg::Refused { reason });
         }
     }
+}
+
+/// The reattach rule for a *granted* open: if its session key names a detached session of this
+/// daemon, bind a new surface to it, move the session to `conn` (pin E1: the old connection
+/// gives up ownership, so its EOF can never close the session) and supersede the old client.
+/// Returns false when the open should spawn instead (no key, unknown key, attached session).
+fn try_reattach<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: &Open) -> bool {
+    let Some(&id) = o.session_key.as_ref().and_then(|k| st.keys.get(k)) else {
+        return false;
+    };
+    if !b.is_detached(id) {
+        // Attached (or gone): never stolen; `do_open` logs and spawns unregistered.
+        return false;
+    }
+    let root_pid = match b.attach(id, o.grant.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("crucible-term: daemon: client {conn}: reattach session {id}: {e}; spawning");
+            return false;
+        }
+    };
+    st.deadlines.remove(&id);
+    if let Some(old) = st.by_term.remove(&id) {
+        if let Some(c) = st.conns.get_mut(&old) {
+            c.term = None;
+        }
+        st.send(old, &Msg::Superseded);
+    }
+    if let Some(c) = st.conns.get_mut(&conn) {
+        c.term = Some(id);
+    }
+    st.by_term.insert(id, conn);
+    eprintln!("crucible-term: daemon: client {conn}: reattached session {id}");
+    st.send(
+        conn,
+        &Msg::Opened {
+            root_pid,
+            reattached: true,
+        },
+    );
+    true
 }
 
 /// Handle one decoded message from `conn`. Returns false to drop the connection.
@@ -263,14 +333,13 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 );
                 return true;
             }
-            // Detached: try the display once, synchronously; still lost refuses so the client
-            // falls back to standalone. The client falls back only on `no-identity` until WP-2
-            // adds `no-wayland`, so that is the reason sent.
+            // Detached: try the display once, synchronously; still lost refuses `no-wayland`
+            // so the client falls back to standalone.
             if b.is_lost() && !b.reconnect() {
                 st.send(
                     conn,
                     &Msg::Refused {
-                        reason: "no-identity".into(),
+                        reason: "no-wayland".into(),
                     },
                 );
                 return true;
@@ -287,6 +356,9 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
                 return true;
             }
             let granted = decision == identity::OpenDecision::OpenBound;
+            if granted && try_reattach(st, b, conn, &o) {
+                return true;
+            }
             if let Some(d) = take_delay(&mut st.delay, granted) {
                 eprintln!(
                     "crucible-term: daemon: client {conn}: open deferred {} ms (CTERM_DEBUG_OPEN_DELAY_MS)",
@@ -319,6 +391,8 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
 fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) {
     if let Some(c) = st.conns.remove(&conn)
         && let Some(id) = c.term
+        // Pin E1: only the owning connection may close; a superseded one has `term: None`.
+        && st.by_term.get(&id) == Some(&conn)
         && st.by_term.remove(&id).is_some()
         && !b.is_detached(id)
     {
@@ -531,7 +605,8 @@ fn detach() -> ExitCode {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .env_remove(DETACH_VAR)
-        .env_remove(GRANT_VAR);
+        .env_remove(GRANT_VAR)
+        .env_remove(SESSION_VAR);
     #[allow(unsafe_code)]
     // SAFETY: the closure runs between fork and exec and only calls setsid(2), which is
     // async-signal-safe and touches no Rust state.
@@ -577,6 +652,8 @@ pub fn run() -> ExitCode {
         }
     };
     let linger = (settings.daemon_linger > 0).then(|| Duration::from_secs(settings.daemon_linger));
+    let detached_timeout =
+        (settings.detached_timeout > 0).then(|| Duration::from_secs(settings.detached_timeout));
     let open_delay = parse_open_delay(
         env(OPEN_DELAY_VAR)
             .and_then(|v| v.into_string().ok())
@@ -602,6 +679,7 @@ pub fn run() -> ExitCode {
             }
         };
         let mut b = headless::Headless::new(event_loop.handle());
+        b.identity = env(headless::IDENTITY_VAR).is_some_and(|v| v == "1");
         let ms = |k: &str| {
             headless::Headless::parse_ms(env(k).and_then(|v| v.into_string().ok()).as_deref())
         };
@@ -611,10 +689,26 @@ pub fn run() -> ExitCode {
             eprintln!("crucible-term: daemon: fake Wayland: {e}");
             return ExitCode::from(1);
         }
-        serve(event_loop, b, listener, ready, linger, open_delay)
+        serve(
+            event_loop,
+            b,
+            listener,
+            ready,
+            linger,
+            open_delay,
+            detached_timeout,
+        )
     } else {
         match Host::new(true) {
-            Ok((event_loop, host)) => serve(event_loop, host, listener, ready, linger, open_delay),
+            Ok((event_loop, host)) => serve(
+                event_loop,
+                host,
+                listener,
+                ready,
+                linger,
+                open_delay,
+                detached_timeout,
+            ),
             Err(e) => Err(e.to_string()),
         }
     };
@@ -643,6 +737,40 @@ fn arm_reconnect<B: Backend>(handle: &LoopHandle<'static, B>) {
     }
 }
 
+/// The `detached-timeout` state machine, run after every dispatch:
+/// - lost (connected → lost): every pending deadline is cancelled;
+/// - reconnected (lost → connected): every live session still detached gets `now + timeout`;
+/// - a deadline that passes on a still-detached session closes it (SIGHUP grace) and drops its
+///   key, so it can never be reattached or mapped. A reattach removes the deadline itself.
+fn detached_clock<B: Backend>(st: &mut State, b: &mut B, was_lost: bool, lost: bool, now: Instant) {
+    if lost {
+        st.deadlines.clear();
+        return;
+    }
+    if was_lost && let Some(t) = st.detached_timeout {
+        for &id in &st.live {
+            if b.is_detached(id) {
+                st.deadlines.entry(id).or_insert(now + t);
+            }
+        }
+    }
+    let expired: Vec<u64> = st
+        .deadlines
+        .iter()
+        .filter(|(_, d)| **d <= now)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in expired {
+        st.deadlines.remove(&id);
+        if b.is_detached(id) {
+            let n = st.detached_timeout.map_or(0, |t| t.as_secs());
+            eprintln!("crucible-term: daemon: detached session {id} unclaimed after {n}s; closing");
+            st.keys.retain(|_, v| *v != id);
+            b.close(id);
+        }
+    }
+}
+
 fn serve<B: Backend>(
     mut event_loop: EventLoop<'static, B>,
     mut b: B,
@@ -650,9 +778,11 @@ fn serve<B: Backend>(
     ready: Option<OwnedFd>,
     linger: Option<Duration>,
     open_delay: Option<Duration>,
+    detached_timeout: Option<Duration>,
 ) -> Result<(), String> {
     let state = Rc::new(RefCell::new(State {
         delay: open_delay,
+        detached_timeout,
         ..State::default()
     }));
     let own_uid = rustix::process::getuid().as_raw();
@@ -676,6 +806,7 @@ fn serve<B: Backend>(
         let _ = rustix::io::write(&fd, b"r");
     }
     let mut idle_since = Instant::now();
+    let mut was_lost = b.is_lost();
     loop {
         let idle = b.is_idle() && state.borrow().conns.is_empty();
         let linger_left = match (linger, idle) {
@@ -692,10 +823,16 @@ fn serve<B: Backend>(
                 None
             }
         };
-        let timeout = match (b.poll_hint(), linger_left) {
-            (Some(a), Some(c)) => Some(a.min(c)),
-            (a, c) => a.or(c),
-        };
+        let deadline_left = state
+            .borrow()
+            .deadlines
+            .values()
+            .min()
+            .map(|d| d.saturating_duration_since(Instant::now()));
+        let timeout = [b.poll_hint(), linger_left, deadline_left]
+            .into_iter()
+            .flatten()
+            .min();
         if let Err(e) = event_loop.dispatch(timeout, &mut b) {
             if !b.on_lost() {
                 return Err(format!("event loop (Wayland connection lost?): {e}"));
@@ -708,6 +845,9 @@ fn serve<B: Backend>(
         if !exits.is_empty() {
             let mut st = state.borrow_mut();
             for (id, code) in exits {
+                st.live.remove(&id);
+                st.deadlines.remove(&id);
+                st.keys.retain(|_, v| *v != id);
                 let Some(conn) = st.by_term.remove(&id) else {
                     continue;
                 };
@@ -719,6 +859,15 @@ fn serve<B: Backend>(
                 }
             }
         }
+        let lost = b.is_lost();
+        detached_clock(
+            &mut state.borrow_mut(),
+            &mut b,
+            was_lost,
+            lost,
+            Instant::now(),
+        );
+        was_lost = lost;
     }
 }
 
@@ -754,5 +903,90 @@ mod tests {
         assert!(peer_allowed(1000, 1000));
         assert!(!peer_allowed(0, 1000));
         assert!(!peer_allowed(1001, 1000));
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// Sessions 1 and 2; `detached` holds the surface-less ones; `closed` records `close`.
+    #[derive(Default)]
+    struct Fake {
+        detached: BTreeSet<u64>,
+        closed: Vec<u64>,
+    }
+
+    impl Backend for Fake {
+        fn open(
+            &mut self,
+            _: &window::Config,
+            _: Vec<OsString>,
+            _: Vec<(OsString, OsString)>,
+            _: Option<String>,
+        ) -> Result<(u64, u32), String> {
+            Err("fake".into())
+        }
+        fn close(&mut self, id: u64) {
+            self.closed.push(id);
+        }
+        fn reap(&mut self) {}
+        fn drain_exits(&mut self) -> Vec<(u64, i32)> {
+            Vec::new()
+        }
+        fn is_idle(&self) -> bool {
+            false
+        }
+        fn is_detached(&self, id: u64) -> bool {
+            self.detached.contains(&id)
+        }
+        fn attach(&mut self, id: u64, _: Option<String>) -> Result<u32, String> {
+            self.detached.remove(&id);
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn the_detached_timeout_runs_from_reconnect_and_a_loss_cancels_it() {
+        let t = Duration::from_secs(30);
+        let mut st = State {
+            detached_timeout: Some(t),
+            live: [1, 2].into(),
+            ..State::default()
+        };
+        st.keys.insert("k".into(), 1);
+        let mut b = Fake {
+            detached: [1, 2].into(),
+            ..Fake::default()
+        };
+        let t0 = Instant::now();
+        // While lost, no clock runs.
+        detached_clock(&mut st, &mut b, false, true, t0);
+        assert!(st.deadlines.is_empty());
+        // Reconnect arms both; a loss before expiry cancels them; the next reconnect re-arms.
+        detached_clock(&mut st, &mut b, true, false, t0);
+        assert_eq!(st.deadlines.len(), 2);
+        detached_clock(&mut st, &mut b, false, true, t0 + t / 2);
+        assert!(st.deadlines.is_empty());
+        let t1 = t0 + t;
+        detached_clock(&mut st, &mut b, true, false, t1);
+        assert_eq!(st.deadlines.get(&1), Some(&(t1 + t)));
+        // Session 2 is reattached (its deadline removed as `try_reattach` does).
+        b.detached.remove(&2);
+        st.deadlines.remove(&2);
+        detached_clock(
+            &mut st,
+            &mut b,
+            false,
+            false,
+            t1 + t - Duration::from_millis(1),
+        );
+        assert!(b.closed.is_empty());
+        detached_clock(&mut st, &mut b, false, false, t1 + t);
+        assert_eq!(b.closed, [1]);
+        assert!(
+            st.keys.is_empty(),
+            "an expired session can never be reattached"
+        );
     }
 }
