@@ -4,6 +4,16 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.4.4 — 2026-11-06
+
+### Fixed
+
+- A CDE quit no longer hangs, and the shells survive it. Once a window is open, the cterm thin client stops holding the stdout and stderr it inherited from the compositor. It now sends stdout to `/dev/null` and stderr to the daemon log. A thin client outlives its compositor by design, and a launcher that waits on the compositor's output pipe (`cde.sh`'s `| tee` before crucible-dev-env `5e2fad3`) waited for every client too. That hung the logout until Ctrl+C, and Ctrl+C closed every session.
+
+### Added
+
+- `scripts/g3/g3.sh logout` models the launcher pipe. The compositor's output goes into a FIFO, and the new `eof` assertion requires EOF within 5 s of the quit while the thin clients are still alive. See `docs/g3-measurement.md`, addendum 2026-11-06.
+
 ## 0.4.3 — 2026-11-06
 
 ### Added
