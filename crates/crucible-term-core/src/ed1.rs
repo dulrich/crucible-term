@@ -28,7 +28,11 @@ use rio_vt::performer::parser::Params;
 use std::path::PathBuf;
 
 /// Delegating wrapper; see the module docs.
-pub(crate) struct Ed1Fix<'a, U: EventListener>(pub(crate) &'a mut Crosswords<U>);
+/// The second field records the application pointer icon set by OSC 22 (cleared by RIS).
+pub(crate) struct Ed1Fix<'a, U: EventListener>(
+    pub(crate) &'a mut Crosswords<U>,
+    pub(crate) &'a mut Option<CursorIcon>,
+);
 
 macro_rules! delegate {
     ($( fn $name:ident(&mut self $(, $arg:ident : $ty:ty)*) $(-> $ret:ty)?; )*) => {
@@ -48,6 +52,15 @@ impl<U: EventListener> Handler for Ed1Fix<'_, U> {
         if above && self.0.grid.cursor.pos.row == Line(1) {
             self.0.grid.reset_region(..Line(1));
         }
+    }
+
+    fn set_mouse_cursor_icon(&mut self, icon: CursorIcon) {
+        *self.1 = Some(icon);
+    }
+
+    fn reset_state(&mut self) {
+        *self.1 = None;
+        <Crosswords<U> as Handler>::reset_state(self.0);
     }
 
     fn is_sixel_graphic_active(&self) -> bool {
@@ -105,7 +118,6 @@ impl<U: EventListener> Handler for Ed1Fix<'_, U> {
         fn clear_line(&mut self, m: LineClearMode);
         fn set_tabs(&mut self, n: u16);
         fn clear_tabs(&mut self, m: TabulationClearMode);
-        fn reset_state(&mut self);
         fn reverse_index(&mut self);
         fn terminal_attribute(&mut self, a: Attr);
         fn set_mode(&mut self, m: Mode);
@@ -142,7 +154,6 @@ impl<U: EventListener> Handler for Ed1Fix<'_, U> {
         fn place_graphic(&mut self, p: kitty_graphics_protocol::PlacementRequest) -> bool;
         fn delete_graphics(&mut self, d: kitty_graphics_protocol::DeleteRequest);
         fn set_hyperlink(&mut self, h: Option<Hyperlink>);
-        fn set_mouse_cursor_icon(&mut self, i: CursorIcon);
         fn set_progress_report(&mut self, r: ProgressReport);
         fn report_keyboard_mode(&mut self);
         fn push_keyboard_mode(&mut self, m: KeyboardModes);

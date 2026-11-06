@@ -27,6 +27,7 @@ use smithay_client_toolkit::reexports::calloop::{
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::csd_frame::WindowState;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::pointer::ThemeSpec;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
@@ -522,7 +523,9 @@ impl Host {
                             return Ok(PostAction::Remove);
                         };
                         t.on_pty_readable(&mut host.seat_in, focus);
-                        Ok(if t.exit.is_some() {
+                        let gone = t.exit.is_some();
+                        host.refresh_cursor(id);
+                        Ok(if gone {
                             PostAction::Remove
                         } else {
                             PostAction::Continue
@@ -939,8 +942,15 @@ impl SeatHandler for Host {
                 let Some(w) = self.wl.as_mut() else {
                     return;
                 };
-                match w.seat.get_pointer(qh, &seat) {
-                    Ok(p) => self.seat_in.pointer = Some(p),
+                let surface = w.compositor.create_surface(qh);
+                match w.seat.get_pointer_with_theme(
+                    qh,
+                    &seat,
+                    w.shm.wl_shm(),
+                    surface,
+                    ThemeSpec::System,
+                ) {
+                    Ok(p) => self.seat_in.bind_pointer(p),
                     Err(e) => eprintln!("crucible-term: pointer: {e}"),
                 }
             }
@@ -963,11 +973,9 @@ impl SeatHandler for Host {
                 }
             }
             Capability::Pointer => {
-                if let Some(p) = self.seat_in.pointer.take()
-                    && p.version() >= 3
-                {
-                    p.release();
-                }
+                // Dropping the themed pointer destroys the shape device, releases the pointer
+                // and destroys the cursor surface (no `release()` here: that would double it).
+                self.seat_in.unbind_pointer();
             }
             _ => {}
         }

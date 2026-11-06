@@ -7,6 +7,7 @@ use crate::model::{
     Attrs, Cell, Color, CursorKind, CursorStyle, Damage, Event, Grid, PromptMark, Row, Underline,
     Width,
 };
+use cursor_icon::CursorIcon;
 use rio_vt::ansi::CursorShape;
 use rio_vt::clipboard::ClipboardType;
 use rio_vt::config::colors::AnsiColor;
@@ -88,6 +89,7 @@ pub struct Session {
     term: Crosswords<Listener>,
     parser: Processor,
     sink: Listener,
+    mouse_icon: Option<CursorIcon>,
 }
 
 impl std::fmt::Debug for Session {
@@ -118,6 +120,7 @@ impl Session {
             term,
             parser: Processor::default(),
             sink,
+            mouse_icon: None,
         }
     }
 
@@ -125,7 +128,7 @@ impl Session {
     /// XTVERSION, ...) accumulate for [`Session::take_replies`]; events for
     /// [`Session::take_events`].
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut fix = Ed1Fix(&mut self.term);
+        let mut fix = Ed1Fix(&mut self.term, &mut self.mouse_icon);
         self.parser.advance(&mut fix, bytes);
         if let Some(dir) = self.term.current_directory.clone() {
             self.sink.with(|s| {
@@ -138,6 +141,11 @@ impl Session {
                 }
             });
         }
+    }
+
+    /// The pointer icon the application requested with OSC 22, if any (cleared by a full reset).
+    pub fn mouse_icon(&self) -> Option<CursorIcon> {
+        self.mouse_icon
     }
 
     /// Resize the screen, reflowing soft-wrapped lines. Zero dimensions are raised to 1.
@@ -422,5 +430,20 @@ fn color(c: AnsiColor) -> Color {
             Ok(i) if i < 16 => Color::Indexed(i),
             _ => Color::Default,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc_22_sets_and_ris_clears_the_mouse_icon() {
+        let mut s = Session::new(10, 3, 0);
+        assert_eq!(s.mouse_icon(), None);
+        s.feed(b"\x1b]22;pointer\x07");
+        assert_eq!(s.mouse_icon(), Some(CursorIcon::Pointer));
+        s.feed(b"\x1bc");
+        assert_eq!(s.mouse_icon(), None);
     }
 }

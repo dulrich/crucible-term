@@ -14,6 +14,7 @@
 //!   notch); else scroll the scrollback viewport (3 lines per notch).
 
 use super::host::Host;
+use super::routing::TermId;
 use super::term::Term;
 use crate::clipboard::{self, MIME_TYPES, Osc52};
 use crate::render;
@@ -40,7 +41,8 @@ use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
 };
 use smithay_client_toolkit::seat::pointer::{
-    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, CursorIcon, PointerEvent, PointerEventKind, PointerHandler,
+    ThemedPointer,
 };
 use smithay_client_toolkit::{
     delegate_data_device, delegate_keyboard, delegate_pointer, delegate_primary_selection,
@@ -67,7 +69,9 @@ const MAX_PASTE: usize = 64 << 20;
 /// clipboard and primary-selection sources (one clipboard per seat, whichever window set it).
 pub struct SeatInput {
     pub(super) keyboard: Option<wl_keyboard::WlKeyboard>,
-    pub(super) pointer: Option<wl_pointer::WlPointer>,
+    pub(super) pointer: Option<ThemedPointer>,
+    /// Which window the pointer is in and the icon last set for it.
+    pub(super) cursor: CursorState,
     pub(super) mods: Mods,
     /// The latest input serial, used for `set_selection`.
     serial: u32,
@@ -81,6 +85,37 @@ pub struct SeatInput {
     primary_text: Arc<str>,
     /// The connection the devices belong to (`None`: detached, every device gone).
     qh: Option<QueueHandle<Host>>,
+}
+
+/// The pointer-cursor bookkeeping: the window under the pointer (set on Enter, cleared on
+/// Leave), the icon last set for it, and whether a `set_cursor` failure was already logged for
+/// the current pointer binding.
+#[derive(Default)]
+pub(super) struct CursorState {
+    pub(super) term: Option<TermId>,
+    last: Option<CursorIcon>,
+    err_logged: bool,
+}
+
+impl CursorState {
+    /// The pointer left its window: forget the window and the cached icon.
+    fn leave(&mut self) {
+        self.term = None;
+        self.last = None;
+    }
+}
+
+/// The pointer icon for a window: the application's OSC 22 icon if set, else the arrow while
+/// the child has mouse reporting on and Shift is not held (clicks go to the application), else
+/// the I-beam.
+pub(super) fn desired_icon(app: Option<CursorIcon>, reporting: bool, shift: bool) -> CursorIcon {
+    if let Some(icon) = app {
+        icon
+    } else if reporting && !shift {
+        CursorIcon::Default
+    } else {
+        CursorIcon::Text
+    }
 }
 
 /// Per-window pointer gesture and selection state, owned by its [`Term`].
@@ -106,6 +141,7 @@ impl SeatInput {
         SeatInput {
             keyboard: None,
             pointer: None,
+            cursor: CursorState::default(),
             mods: Mods::default(),
             serial: 0,
             data_mgr: DataDeviceManagerState::bind(globals, qh).ok(),
@@ -120,11 +156,48 @@ impl SeatInput {
         }
     }
 
+    /// Set the pointer cursor now. `force` sets even when `icon` equals the last one set (every
+    /// Enter: the compositor may have shown another client's cursor meanwhile); otherwise a
+    /// repeat is skipped. Errors are logged once per pointer binding and never fatal.
+    pub(super) fn set_cursor(&mut self, icon: CursorIcon, force: bool) {
+        if !force && self.cursor.last == Some(icon) {
+            return;
+        }
+        let Some(p) = self.pointer.as_ref() else {
+            return;
+        };
+        let Some(backend) = p.pointer().backend().upgrade() else {
+            return;
+        };
+        let conn = Connection::from_backend(backend);
+        self.cursor.last = Some(icon);
+        if let Err(e) = p.set_cursor(&conn, icon)
+            && !self.cursor.err_logged
+        {
+            self.cursor.err_logged = true;
+            eprintln!("crucible-term: cursor: {e}");
+        }
+    }
+
+    /// A new pointer binding: forget the window, the cached icon and the logged error.
+    pub(super) fn bind_pointer(&mut self, p: ThemedPointer) {
+        self.pointer = Some(p);
+        self.cursor = CursorState::default();
+    }
+
+    /// The pointer device is gone: dropping the themed pointer destroys the shape device,
+    /// releases the pointer and destroys the cursor surface.
+    pub(super) fn unbind_pointer(&mut self) {
+        self.pointer = None;
+        self.cursor = CursorState::default();
+    }
+
     /// No connection: no devices, no selection sources (the detached host's seat).
     pub(super) fn detached() -> SeatInput {
         SeatInput {
             keyboard: None,
             pointer: None,
+            cursor: CursorState::default(),
             mods: Mods::default(),
             serial: 0,
             data_mgr: None,
@@ -375,6 +448,15 @@ impl Term {
         }
     }
 
+    /// The pointer icon this window wants now.
+    pub(super) fn desired_icon(&self, shift: bool) -> CursorIcon {
+        desired_icon(
+            self.session.mouse_icon(),
+            self.session.modes().mouse != MouseMode::Off,
+            shift,
+        )
+    }
+
     fn on_pointer(&mut self, seat: &mut SeatInput, ev: &PointerEvent) {
         self.inp.pos = ev.position;
         let mods = seat.mods;
@@ -444,7 +526,10 @@ impl Term {
                     self.on_wheel(mods, notches as i32);
                 }
             }
-            PointerEventKind::Enter { serial } => seat.serial = serial,
+            PointerEventKind::Enter { serial } => {
+                seat.serial = serial;
+                seat.set_cursor(self.desired_icon(mods.shift), true);
+            }
             PointerEventKind::Leave { .. } => {}
         }
     }
@@ -777,6 +862,23 @@ impl KeyboardHandler for Host {
             ctrl: m.ctrl,
             logo: m.logo,
         };
+        if let Some(id) = self.seat_in.cursor.term {
+            self.refresh_cursor(id);
+        }
+    }
+}
+
+impl Host {
+    /// Recompute the pointer icon for window `id` (after a PTY feed or a Shift change) and set
+    /// it when the pointer is in that window and the icon differs from the last one set.
+    pub(super) fn refresh_cursor(&mut self, id: TermId) {
+        if self.seat_in.cursor.term != Some(id) {
+            return;
+        }
+        if let Some(t) = self.terms.get(&id) {
+            let icon = t.desired_icon(self.seat_in.mods.shift);
+            self.seat_in.set_cursor(icon, false);
+        }
     }
 }
 
@@ -792,6 +894,13 @@ impl PointerHandler for Host {
             let Some(id) = self.routes.term(&ev.surface.id()) else {
                 continue;
             };
+            match ev.kind {
+                PointerEventKind::Enter { .. } => self.seat_in.cursor.term = Some(id),
+                PointerEventKind::Leave { .. } if self.seat_in.cursor.term == Some(id) => {
+                    self.seat_in.cursor.leave();
+                }
+                _ => {}
+            }
             if let Some(t) = self.terms.get_mut(&id) {
                 t.on_pointer(&mut self.seat_in, ev);
             }
@@ -935,6 +1044,24 @@ delegate_primary_selection!(Host);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desired_icon_rules() {
+        // 1. The application's OSC 22 icon wins over everything.
+        assert_eq!(
+            desired_icon(Some(CursorIcon::Pointer), true, false),
+            CursorIcon::Pointer
+        );
+        assert_eq!(
+            desired_icon(Some(CursorIcon::Pointer), false, true),
+            CursorIcon::Pointer
+        );
+        // 2. Mouse reporting on, no Shift: the arrow.
+        assert_eq!(desired_icon(None, true, false), CursorIcon::Default);
+        // 3. Otherwise the I-beam, and Shift overrides reporting.
+        assert_eq!(desired_icon(None, false, false), CursorIcon::Text);
+        assert_eq!(desired_icon(None, true, true), CursorIcon::Text);
+    }
 
     #[test]
     fn keysyms_translate_to_core_keys() {
