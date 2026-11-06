@@ -37,6 +37,10 @@ use std::time::{Duration, Instant};
 
 /// Env var naming the readiness pipe's write fd (set by the starting client).
 pub const READY_FD_VAR: &str = "CTERM_DAEMON_READY_FD";
+/// How long a session whose client hung up waits before it closes, so a compositor quit that
+/// takes the thin clients down with it detaches the session instead (see [`drop_conn`]).
+const ORPHAN_GRACE: Duration = Duration::from_secs(2);
+
 /// Env var asking `cterm daemon` to detach (the first stage of the double fork).
 pub const DETACH_VAR: &str = "CTERM_DAEMON_DETACH";
 /// TEST-ONLY: `1` runs the daemon without Wayland ([`headless`]).
@@ -173,6 +177,9 @@ struct State {
     detached_timeout: Option<Duration>,
     /// Session id → when it is closed unless reattached; set at reconnect, cleared on loss.
     deadlines: BTreeMap<u64, Instant>,
+    /// Session id → when it is closed: its client hung up while the daemon was connected. A
+    /// loss inside [`ORPHAN_GRACE`] clears it (the session is detached, kept for reattach).
+    orphans: BTreeMap<u64, Instant>,
 }
 
 /// TEST-ONLY: parse `CTERM_DEBUG_OPEN_DELAY_MS`: unset, `0` or unparsable mean no delay.
@@ -282,6 +289,7 @@ fn try_reattach<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: &Open) -> b
             return false;
         }
     };
+    st.orphans.remove(&id);
     st.deadlines.remove(&id);
     if let Some(old) = st.by_term.remove(&id) {
         if let Some(c) = st.conns.get_mut(&old) {
@@ -386,8 +394,10 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, conn: u64, m: Msg) -> bool {
     }
 }
 
-/// Drop `conn`: its window (if still open) closes through the SIGHUP grace, unless it is
-/// detached: a detached session outlives its client (a later rebind reattaches it).
+/// Drop `conn`: its window (if still open) closes after [`ORPHAN_GRACE`] (then through the SIGHUP
+/// grace) unless the connection is lost first; a detached session outlives its client (a later
+/// rebind reattaches it). The grace exists because on a compositor quit the thin clients die
+/// with it, and their EOFs can arrive before the daemon sees its own Wayland connection go.
 fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) {
     if let Some(c) = st.conns.remove(&conn)
         && let Some(id) = c.term
@@ -396,7 +406,7 @@ fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) {
         && st.by_term.remove(&id).is_some()
         && !b.is_detached(id)
     {
-        b.close(id);
+        st.orphans.insert(id, Instant::now() + ORPHAN_GRACE);
     }
 }
 
@@ -745,6 +755,7 @@ fn arm_reconnect<B: Backend>(handle: &LoopHandle<'static, B>) {
 fn detached_clock<B: Backend>(st: &mut State, b: &mut B, was_lost: bool, lost: bool, now: Instant) {
     if lost {
         st.deadlines.clear();
+        st.orphans.clear();
         return;
     }
     if was_lost && let Some(t) = st.detached_timeout {
@@ -766,6 +777,18 @@ fn detached_clock<B: Backend>(st: &mut State, b: &mut B, was_lost: bool, lost: b
             let n = st.detached_timeout.map_or(0, |t| t.as_secs());
             eprintln!("crucible-term: daemon: detached session {id} unclaimed after {n}s; closing");
             st.keys.retain(|_, v| *v != id);
+            b.close(id);
+        }
+    }
+    let orphaned: Vec<u64> = st
+        .orphans
+        .iter()
+        .filter(|(_, d)| **d <= now)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in orphaned {
+        st.orphans.remove(&id);
+        if !b.is_detached(id) && !st.by_term.contains_key(&id) {
             b.close(id);
         }
     }
@@ -823,12 +846,14 @@ fn serve<B: Backend>(
                 None
             }
         };
-        let deadline_left = state
-            .borrow()
-            .deadlines
-            .values()
-            .min()
-            .map(|d| d.saturating_duration_since(Instant::now()));
+        let deadline_left = {
+            let st = state.borrow();
+            st.deadlines
+                .values()
+                .chain(st.orphans.values())
+                .min()
+                .map(|d| d.saturating_duration_since(Instant::now()))
+        };
         let timeout = [b.poll_hint(), linger_left, deadline_left]
             .into_iter()
             .flatten()
@@ -846,6 +871,7 @@ fn serve<B: Backend>(
             let mut st = state.borrow_mut();
             for (id, code) in exits {
                 st.live.remove(&id);
+                st.orphans.remove(&id);
                 st.deadlines.remove(&id);
                 st.keys.retain(|_, v| *v != id);
                 let Some(conn) = st.by_term.remove(&id) else {
@@ -988,5 +1014,30 @@ mod clock_tests {
             st.keys.is_empty(),
             "an expired session can never be reattached"
         );
+    }
+
+    /// A client hang-up while connected closes its session only after `ORPHAN_GRACE`; a loss inside
+    /// the grace (a compositor quit taking the thin clients with it) keeps the session.
+    #[test]
+    fn an_orphan_closes_after_the_grace_unless_the_connection_is_lost_first() {
+        let mut st = State {
+            live: [1, 2].into(),
+            ..State::default()
+        };
+        let mut b = Fake::default();
+        let t0 = Instant::now();
+        st.orphans.insert(1, t0 + ORPHAN_GRACE);
+        detached_clock(&mut st, &mut b, false, false, t0 + ORPHAN_GRACE / 2);
+        assert!(b.closed.is_empty(), "not before the grace");
+        detached_clock(&mut st, &mut b, false, false, t0 + ORPHAN_GRACE);
+        assert_eq!(b.closed, [1]);
+        assert!(st.orphans.is_empty());
+        // Session 2: the connection is lost inside the grace, so it is detached, not closed.
+        st.orphans.insert(2, t0 + ORPHAN_GRACE);
+        b.detached.insert(2);
+        detached_clock(&mut st, &mut b, false, true, t0 + ORPHAN_GRACE / 2);
+        assert!(st.orphans.is_empty());
+        detached_clock(&mut st, &mut b, true, false, t0 + ORPHAN_GRACE * 2);
+        assert_eq!(b.closed, [1], "the detached session waits for reattach");
     }
 }

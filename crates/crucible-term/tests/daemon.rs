@@ -142,7 +142,10 @@ fn client_sigkill_hangs_up_the_child() {
     assert!(wait_for(&ready, Duration::from_secs(5)), "child started");
     c.kill().expect("SIGKILL client");
     let _ = c.wait();
-    assert!(wait_for(&hup, Duration::from_secs(3)), "child got SIGHUP");
+    assert!(
+        wait_for(&hup, Duration::from_secs(6)),
+        "child got SIGHUP (after the orphan grace)"
+    );
     let child: i32 = std::fs::read_to_string(&ready)
         .unwrap()
         .trim()
@@ -153,6 +156,38 @@ fn client_sigkill_hangs_up_the_child() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(!alive(child), "child reaped");
+}
+
+#[test]
+fn client_sighup_hangs_up_without_close_and_the_session_closes_after_the_grace() {
+    let e = Env::new("hup");
+    let ready = e.root.join("ready");
+    let hup = e.root.join("hup");
+    let script = format!(
+        "trap 'echo hup > {}; exit 0' HUP; echo $$ > {}; while :; do sleep 0.05; done",
+        hup.display(),
+        ready.display()
+    );
+    let c = e.sh(&script).spawn().expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    let pid = rustix::process::Pid::from_raw(c.id() as i32).unwrap();
+    let t = Instant::now();
+    rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+    let out = c.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exits at once with 128 + SIGHUP"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "no close round trip");
+    assert!(
+        wait_for(&hup, Duration::from_secs(6)),
+        "child hung up after the orphan grace"
+    );
+    assert!(
+        t.elapsed() >= Duration::from_millis(1900),
+        "not before the grace"
+    );
 }
 
 #[test]

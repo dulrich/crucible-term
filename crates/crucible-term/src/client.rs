@@ -2,8 +2,10 @@
 //!
 //! [`run`] reaches the per-display daemon (starting it on demand under `flock` on the sibling
 //! `.lock`, with a readiness pipe and a 2 s budget), sends `hello` and `open`, then waits for
-//! `exited` and returns its code. SIGTERM/SIGINT/SIGHUP send `close` (the daemon SIGHUPs the
-//! child with its grace) and the client exits with the relayed code or 128 + signo. Any failure
+//! `exited` and returns its code. SIGTERM/SIGINT send `close` (the daemon SIGHUPs the child
+//! with its grace) and the client exits with the relayed code or 128 + signo; SIGHUP only hangs up
+//! (exit 129): the daemon closes the session after its orphan grace unless its own Wayland
+//! connection is lost first, which keeps the session for reattach across a logout. Any failure
 //! before `opened` is a [`Outcome::Fallback`]: the caller runs standalone with one warning.
 
 use crate::config::RunMode;
@@ -331,6 +333,12 @@ fn wait(mut stream: UnixStream, mut buf: Vec<u8>) -> Outcome {
         };
         if sig_ready && let Some(s) = &sig {
             let signo = read_signal(s);
+            if signo == libc::SIGHUP {
+                // The session or tty is going away (a logout, a compositor quit), not a request to
+                // close the window: hang up without `close`, so the daemon's orphan grace can
+                // detach the session when its Wayland connection goes too.
+                return Outcome::Exit(128 + signo);
+            }
             let _ = stream.write_all(&wire::encode(&Msg::Close));
             let _ = stream.set_read_timeout(Some(CLOSE_WAIT));
             let start = Instant::now();
