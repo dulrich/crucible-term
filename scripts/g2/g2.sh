@@ -776,7 +776,7 @@ leg_e2e_run() { # attempt; sets E2E_REVERSED=0/1; returns 1 on a harness failure
 	out=$("$BIN" mem --pid "$CPID" 2>&1 || true)
 	echo "E2E (b) crucible mem:"
 	printf '%s\n' "$out" | sed 's/^/  | /'
-	if printf '%s\n' "$out" | grep -q 'cterm daemon (2 windows)'; then echo "E2E (b) PASS: cterm daemon (2 windows) row present"; else echo "E2E (b) FAIL: no 'cterm daemon (2 windows)' row"; fi
+	if printf '%s\n' "$out" | grep -qF 'cterm daemon (+2 windows)'; then echo "E2E (b) PASS: cterm daemon (+2 windows) row present"; else echo "E2E (b) FAIL: no 'cterm daemon (+2 windows)' row"; fi
 	# (c) close-pid C1 closes only window 1
 	resp=$(msg close-pid "$C1" 2>&1 || true)
 	echo "E2E (c) close-pid $C1 response: ${resp:-<empty>}"
