@@ -14,7 +14,7 @@ usage() {
 	cat <<'USAGE'
 Usage: g3.sh [--help|-h] [--build|--version] [LEG...]
 
-Legs (default: kill segv restart logout): kill, segv, restart, logout, summarize.
+Legs (default: kill segv restart logout): kill, segv, restart, logout, reboot (not in the default list), summarize.
 Every leg runs in its own fresh nested `crucible --winit` launched through `crucible msg run-on` into a scratch workspace (scratch-cterm-<driver>-<pid>; override with CTERM_SCRATCH_WS, which must start with scratch-; the live CDE_SOCKET is required; parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
 XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/tmp/cde-g3w), so the nested daemon socket and
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE in daemon mode (`-o mode=auto`, CDE `restore-session #true`) onto a
@@ -38,6 +38,16 @@ Only pids this script recorded (with their start time) are ever signalled, with 
              hold the inherited stdout/stderr); then SIGHUP the clients (the tty hangup), so their hang-ups reach the daemon before its
              Wayland connection goes. (a), (b) and the display check as for restart; (c) the old thin clients exited 129 (128 + SIGHUP,
              no `close` sent).
+  reboot     durable scrollback (WP-1) through a simulated scope stop. Config `scrollback-persist #true`; the nested daemon gets the TEST-ONLY
+             CTERM_DEBUG_PERSIST_MS=300,2000,3000 (fast saves, logs `saved record`/`deleted record`). The three terminals are
+             `sh -c 'echo G3MARK-<n>-<run>; exec sleep 100<n>'`. After one `saved record` per session: SIGTERM then SIGHUP to the recorded
+             daemon and the three recorded wrappers in one burst, then SIGKILL the compositor. (a) the daemon exited (a-exit: exit 0 from the
+             subreaper's wait status, UNMEASURED if unreadable) and every <key>.vt under sessions/ survived with its marker; restart the
+             compositor on the same scratch dirs; (b) `restored session <id> from record` x3 and each record, rewritten after the restore,
+             still has its marker; (c) control: close one restored window (`msg close-pid` on its thin client): `deleted record <key>` and its
+             .vt is gone, the other two stay.
+             The kill leg also enables persistence and adds (e3): after the SIGKILL each `--lost` placeholder's new session logs
+             `restored session ... from record` (history survives under the placeholder).
   summarize  read target/g3/g3-*.raw and print the G3 table (target/g3/g3-summary.txt).
 
 Output: raw lines in target/g3/g3-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g3/logs/.
@@ -60,7 +70,7 @@ build_flags "${BASH_SOURCE[0]}" "$@"
 LEGS=("$@")
 [ "$#" -gt 0 ] || LEGS=(kill segv restart logout)
 for s in "${LEGS[@]}"; do
-	case $s in kill | segv | restart | logout | summarize) ;; *) echo "g3.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
+	case $s in kill | segv | restart | logout | reboot | summarize) ;; *) echo "g3.sh: unknown leg: $s" >&2; usage >&2; exit 2 ;; esac
 done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
@@ -150,7 +160,8 @@ kids_of() { perl -e 'my $r=shift; opendir(D,"/proc"); for my $p (grep /^\d+$/, r
 alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ] && ! grep -q '^State:.*Z' "/proc/$1/status" 2>/dev/null; }
 
 # ---------------------------------------------------------------- nested compositor sessions
-T="" CPID="" DPID="" DISP="" PROGEXE="" TAG=""
+T="" CPID="" DPID="" DISP="" PROGEXE="" TAG="" PERSIST=0 MARKS=0
+PERSIST_ENV=()
 CLIENTS=()
 
 cleanup() {
@@ -177,6 +188,8 @@ scrollback lines=10000
 pad 2 2
 center
 KDL
+	# KDL v2 booleans are `#true`: a bare `true` is a syntax error that drops the whole config
+	if [ "$PERSIST" = 1 ]; then echo "scrollback-persist #true" >>"$T/config/crucible-term/config.kdl"; fi
 }
 
 # conditions: one COND line (date, load, PSI avg10/avg60, live outputs enabled/dpms and preferred mode) per call
@@ -283,12 +296,12 @@ start_comp() { # wrapper
 		# a FIFO, not a process substitution: bash leaves its own write-end copy (fd 63) open in the child, which every descendant would inherit
 		mkfifo "$T/probe.fifo"
 		probe_reader "$T/log.$$" "$T/eof.ts" <"$T/probe.fifo" &
-		run_on_launch g3 "$T" "$T/probe.fifo" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
+		run_on_launch g3 "$T" "$T/probe.fifo" XDG_CONFIG_HOME="$T/config" "${PERSIST_ENV[@]}" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
 	elif [ "$1" = 1 ]; then
 		write_subreaper
-		run_on_launch g3 "$T" "$T/log.$$" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
+		run_on_launch g3 "$T" "$T/log.$$" XDG_CONFIG_HOME="$T/config" "${PERSIST_ENV[@]}" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
 	else
-		run_on_launch g3 "$T" "$T/log.$$.2" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
+		run_on_launch g3 "$T" "$T/log.$$.2" XDG_CONFIG_HOME="$T/config" "${PERSIST_ENV[@]}" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
 	fi
 	rec "$RUN_ON_PID"
 	CPID=""
@@ -368,6 +381,9 @@ shape() {
 	awk '/^ *pane/ {printf "P|"} /^ *terminal / {c="";w=""; if (match($0,/cwd="[^"]*"/)) w=substr($0,RSTART+5,RLENGTH-6); if (match($0,/command="[^"]*"/)) c=substr($0,RSTART+9,RLENGTH-10); printf "T %s %s|", w, c} /^ *app / {printf "APP|"}' "$1"
 }
 EXPECT_SHAPE='P|T /tmp sleep 1001|T /tmp sleep 1002|P|T /tmp sleep 1003|'
+# the command of slot N: plain, or (MARKS=1) one that prints a unique marker before sleeping
+slot_cmd() { if [ "$MARKS" = 1 ]; then echo "sh -c 'echo G3MARK-$1-$RUN; exec sleep 100$1'"; else echo "sleep 100$1"; fi; }
+
 WSFILE=""
 
 result() { # assert PASS|FAIL|UNMEASURED detail
@@ -377,17 +393,18 @@ result() { # assert PASS|FAIL|UNMEASURED detail
 craft() {
 	mkdir -p "$T/state/cde/workspaces"
 	WSFILE=$T/state/cde/workspaces/g3.kdl
-	cat >"$WSFILE" <<'KDL'
+	EXPECT_SHAPE="P|T /tmp $(slot_cmd 1)|T /tmp $(slot_cmd 2)|P|T /tmp $(slot_cmd 3)|"
+	cat >"$WSFILE" <<KDL
 version 1
 workspace "g3" root="/tmp" {
     focused-pane 0
     split axis="horizontal" ratio=0.5 {
         pane focused=0 {
-            terminal cwd="/tmp" command="sleep 1001"
-            terminal cwd="/tmp" command="sleep 1002"
+            terminal cwd="/tmp" command="$(slot_cmd 1)"
+            terminal cwd="/tmp" command="$(slot_cmd 2)"
         }
         pane focused=0 {
-            terminal cwd="/tmp" command="sleep 1003"
+            terminal cwd="/tmp" command="$(slot_cmd 3)"
         }
     }
 }
@@ -402,6 +419,9 @@ g3_start() { # tag
 	wait_calm "$TAG"
 	cond_record "$TAG start"
 	T=$W/$TAG
+	PERSIST=0 MARKS=0 PERSIST_ENV=()
+	case $LEG in reboot) PERSIST=1 MARKS=1 ;; kill) PERSIST=1 ;; esac
+	if [ "$PERSIST" = 1 ]; then PERSIST_ENV=("CTERM_DEBUG_PERSIST_MS=300,2000,3000"); fi
 	sweep_daemons "$T/"
 	rm -rf "$T"
 	mkdir -p "$T/config/cde" "$T/config/crucible-term" "$T/state/crucible-term" "$T/data" "$T/run"
@@ -538,6 +558,12 @@ leg_fault() { # kill|segv
 	if [ "$1" = kill ]; then sig=KILL; else sig=SEGV; fi
 	g3_start "$LEG-$RUN" || { echo "HARNESS FAILURE: start"; g3_stop; return 1; }
 	bringup || { g3_stop; return 1; }
+	local e3_saved=""
+	if [ "$PERSIST" = 1 ]; then
+		# E3: the records must exist before the fault (one `saved record` per session)
+		e3_saved=$(wait_dlog 'daemon: saved record ' 30 3)
+		echo "FAULT saved record lines before the fault: $e3_saved"
+	fi
 	old=$DPID
 	oldr="$R1 $R2 $R3"
 	WATCH_LAST="" WATCH_BAD=0
@@ -602,6 +628,13 @@ leg_fault() { # kill|segv
 	echo "daemon.log:"
 	dlog | sed 's/^/  daemon.log: /'
 	n=$(comp_log | grep -c 'window lost; placeholder spawned' || true)
+	if [ "$PERSIST" = 1 ]; then
+		# E3: each placeholder's new session replays its record (the key is kept), so history survives under the placeholder
+		E3N=$(wait_dlog 'daemon: restored session [0-9]+ from record' 10 3)
+		detail="saved record lines before the fault=$e3_saved; restored session lines in the new daemon's log=$E3N:"
+		detail="$detail $(dlog | grep 'restored session' | sed 's/^crucible-term: daemon: //' | tr '\n' ';')"
+		if [ "${e3_saved:-0}" -ge 3 ] && [ "$E3N" -ge 3 ]; then result e3 PASS "$detail"; else result e3 FAIL "$detail"; fi
+	fi
 	if [ "$n" = 3 ]; then result cde-log PASS "3 'window lost; placeholder spawned' lines"; else result cde-log FAIL "$n 'window lost; placeholder spawned' lines (expected 3)"; fi
 	g3_stop
 }
@@ -718,14 +751,172 @@ leg_restart() {
 	g3_stop
 }
 
+# like sigrec, but silent (and successful) when the recorded process is already gone: for the burst, where a shell may exit between two signals
+sigsoft() { # SIG pid
+	local p st cur
+	while read -r p st; do
+		[ "$p" = "$2" ] || continue
+		cur=$(starttime "$p" 2>/dev/null) || return 0
+		[ "$cur" = "$st" ] || return 0
+		kill "-$1" "$p" 2>/dev/null || true
+		return 0
+	done <"$W/pids"
+	echo "HARNESS FAILURE: refusing to signal unrecorded pid $2"
+	return 1
+}
+# wait up to $2 s for the daemon.log to hold at least $3 lines matching the ERE $1; echoes the final count
+wait_dlog() { # ere seconds count
+	local i n=0
+	for i in $(seq 1 $(($2 * 5))); do
+		n=$(dlog | grep -cE "$1" || true)
+		[ "$n" -lt "$3" ] || break
+		sleep 0.2
+	done
+	echo "$n"
+}
+# the session records dir of this run
+sdir() { echo "$T/state/crucible-term/sessions"; }
+# key (file stem) of the single record holding marker G3MARK-$1-$RUN; empty when none or several
+key_of_marker() {
+	local f
+	f=$(grep -laF "G3MARK-$1-$RUN" "$(sdir)"/*.vt 2>/dev/null || true)
+	[ "$(echo "$f" | grep -c .)" = 1 ] || return 0
+	basename "$f" .vt
+}
+
+leg_reboot() {
+	local n i p k ex nsave nrest exitline detail ok keys=() dead clients="" victim vkey before_del
+	g3_start "$LEG-$RUN" || { echo "HARNESS FAILURE: start"; g3_stop; return 1; }
+	bringup || { g3_stop; return 1; }
+	nsave=$(wait_dlog 'daemon: saved record ' 30 3)
+	echo "REBOOT saved record lines before the stop: $nsave"
+	if [ "$nsave" -lt 3 ]; then
+		echo "HARNESS FAILURE: fewer than 3 'saved record' lines (persistence not active?)"
+		dlog | tail -20
+		ls -la "$(sdir)" 2>&1 | head
+		g3_stop
+		return 1
+	fi
+	for n in 1 2 3; do
+		k=$(key_of_marker "$n")
+		if [ -z "$k" ]; then echo "HARNESS FAILURE: no single record holds marker G3MARK-$n-$RUN before the stop"; ls -la "$(sdir)"; g3_stop; return 1; fi
+		keys+=("$k")
+	done
+	echo "REBOOT keys by slot: ${keys[*]}"
+	local pre_d=$DPID pre_r="$R1 $R2 $R3" old_cpid=$CPID
+	echo "REBOOT scope stop: daemon=$pre_d wrappers=$pre_r compositor=$CPID at $(date +%T.%N | cut -c1-12)"
+	# one burst: TERM to the daemon and every shell/wrapper, then HUP to all of them, no waits; then the compositor dies
+	for p in $pre_d $pre_r; do sigsoft TERM "$p" || true; done
+	for p in $pre_d $pre_r; do sigsoft HUP "$p" || true; done
+	sigrec KILL "$CPID" || { g3_stop; return 1; }
+	dead=0
+	for i in $(seq 1 50); do
+		if ! alive "$pre_d"; then dead=1; break; fi
+		sleep 0.2
+	done
+	# the daemon's wait status: it reparents to the subreaper wrapper once its parent is gone
+	exitline=""
+	for i in $(seq 1 25); do
+		exitline=$(grep "REAPED pid=$pre_d " "$T/reaped.log" 2>/dev/null | head -1 || true)
+		[ -z "$exitline" ] || break
+		sleep 0.2
+	done
+	echo "REBOOT daemon alive=$(alive "$pre_d" && echo yes || echo no); wait status: ${exitline:-none}"
+	echo "REBOOT daemon.log after the stop:"
+	dlog | sed 's/^/  daemon.log: /'
+	ls -la "$(sdir)" | sed 's/^/  sessions: /'
+	# (a)
+	ok=1 detail="daemon $pre_d exited=$([ "$dead" = 1 ] && echo yes || echo no);"
+	[ "$dead" = 1 ] || ok=0
+	for n in 1 2 3; do
+		k=${keys[$((n - 1))]}
+		if [ -f "$(sdir)/$k.vt" ] && grep -qaF "G3MARK-$n-$RUN" "$(sdir)/$k.vt"; then
+			detail="$detail slot$n $k.vt survived with its marker ($(stat -c %s "$(sdir)/$k.vt") bytes);"
+		else
+			ok=0
+			detail="$detail slot$n $k.vt missing or without marker;"
+		fi
+	done
+	if [ "$ok" = 1 ]; then result a PASS "$detail"; else result a FAIL "$detail"; fi
+	if [ "$dead" != 1 ]; then
+		result a-exit FAIL "daemon did not exit within 10 s of SIGTERM+SIGHUP"
+	elif [ -z "$exitline" ]; then
+		result a-exit UNMEASURED "daemon exited but no wait status was read (it was not reparented to the subreaper wrapper)"
+	else
+		ex=$(dlog | grep -c "daemon: records saved for 3 live session(s)" || true)
+		case $exitline in
+		*"exit=0 signal=0"*) if [ "$ex" -ge 1 ]; then result a-exit PASS "${exitline#REAPED }; daemon.log has \`records saved for 3 live session(s)\`"; else result a-exit FAIL "${exitline#REAPED }; but no \`records saved for 3 live session(s)\` line"; fi ;;
+		*) result a-exit FAIL "${exitline#REAPED }" ;;
+		esac
+	fi
+	# restart on the same dirs
+	touch "$T/stamp"
+	sleep 1
+	nsave=$(dlog | grep -c 'daemon: saved record ' || true)
+	start_comp 0 || { g3_stop; return 1; }
+	[ "$CPID" != "$old_cpid" ] || { echo "HARNESS FAILURE: compositor pid unchanged"; g3_stop; return 1; }
+	nrest=$(wait_dlog 'daemon: restored session [0-9]+ from record' "$RESTORE_WAIT_S" 3)
+	echo "REBOOT restored lines: $nrest"
+	# rewritten after the restore: each record newer than the stamp, with its marker (up to 15 s)
+	for i in $(seq 1 75); do
+		ok=1
+		for n in 1 2 3; do
+			k=${keys[$((n - 1))]}
+			if [ ! "$(sdir)/$k.vt" -nt "$T/stamp" ] || ! grep -qaF "G3MARK-$n-$RUN" "$(sdir)/$k.vt" 2>/dev/null; then ok=0; fi
+		done
+		[ "$ok" = 1 ] && break
+		sleep 0.2
+	done
+	detail="restored session lines=$nrest;"
+	[ "$nrest" -ge 3 ] || ok=0
+	for n in 1 2 3; do
+		k=${keys[$((n - 1))]}
+		detail="$detail slot$n $k.vt $([ "$(sdir)/$k.vt" -nt "$T/stamp" ] && echo rewritten || echo NOT-rewritten) marker=$(grep -caF "G3MARK-$n-$RUN" "$(sdir)/$k.vt" 2>/dev/null || true) occurrence(s);"
+	done
+	echo "REBOOT restored lines:"
+	dlog | grep 'restored session' | sed 's/^/  daemon.log: /'
+	if [ "$ok" = 1 ]; then result b PASS "$detail"; else result b FAIL "$detail"; fi
+	# (c) control: close one restored window on purpose
+	for i in $(seq 1 50); do
+		clients=$(comp_clients | tr '\n' ' ')
+		[ "$(echo "$clients" | wc -w)" -ge 3 ] && break
+		sleep 0.2
+	done
+	for p in $clients; do rec "$p"; CLIENTS+=("$p"); done
+	victim=$(echo "$clients" | awk '{print $1}')
+	before_del=$(dlog | grep -c 'daemon: deleted record ' || true)
+	if [ -z "$victim" ]; then
+		result c FAIL "no restored thin client found to close (clients: '$clients')"
+	else
+		echo "REBOOT closing restored window: thin client $victim: $(msg close-pid "$victim" 2>&1 || true)"
+		wait_dlog 'daemon: deleted record ' 20 $((before_del + 1)) >/dev/null
+		vkey=$(dlog | sed -n 's/^crucible-term: daemon: deleted record \([A-Za-z0-9_-]*\)$/\1/p' | tail -1)
+		sleep 1
+		ok=1
+		case " ${keys[*]} " in *" $vkey "*) ;; *) ok=0 ;; esac
+		[ -n "$vkey" ] || ok=0
+		[ ! -e "$(sdir)/$vkey.vt" ] || ok=0
+		detail="closed client $victim; deleted-record lines $before_del -> $(dlog | grep -c 'daemon: deleted record ' || true); deleted key '$vkey' is one of the three: $(case " ${keys[*]} " in *" $vkey "*) echo yes ;; *) echo no ;; esac); its .vt $([ -e "$(sdir)/$vkey.vt" ] && echo STILL-PRESENT || echo gone);"
+		for k in "${keys[@]}"; do
+			[ "$k" != "$vkey" ] || continue
+			if [ -f "$(sdir)/$k.vt" ]; then detail="$detail other $k.vt kept;"; else ok=0; detail="$detail other $k.vt MISSING;"; fi
+		done
+		if [ "$ok" = 1 ]; then result c PASS "$detail"; else result c FAIL "$detail"; fi
+	fi
+	echo "daemon.log (final):"
+	dlog | sed 's/^/  daemon.log: /'
+	ls -la "$(sdir)" | sed 's/^/  sessions: /'
+	g3_stop
+}
+
 leg_summarize() {
 	perl -e '
   my $dir=shift; my (%r);
-  for my $leg (qw(kill segv restart logout)){ open(F,"<","$dir/g3-$leg.raw") or next;
+  for my $leg (qw(kill segv restart logout reboot)){ open(F,"<","$dir/g3-$leg.raw") or next;
     while(<F>){ next unless /^RESULT leg=(\S+) run=(\d+) assert=(\S+) (PASS|FAIL|UNMEASURED) :: (.*)/; $r{$1}{$2}{$3}=[$4,$5]; } close F }
   print "G3 RESULT\n";
-  for my $leg (qw(kill segv restart logout)){ my $runs=$r{$leg}; unless($runs){ print "leg $leg: not run\n"; next }
-    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = $leg eq "logout" ? [qw(eof a b c display)] : $leg eq "restart" ? [qw(a b c display)] : [qw(a b)];
+  for my $leg (qw(kill segv restart logout reboot)){ my $runs=$r{$leg}; unless($runs){ print "leg $leg: not run\n"; next }
+    for my $run (sort {$a<=>$b} keys %$runs){ my $a=$runs->{$run}; my $core = $leg eq "logout" ? [qw(eof a b c display)] : $leg eq "restart" ? [qw(a b c display)] : $leg eq "reboot" ? [qw(a a-exit b c)] : $a->{e3} ? [qw(a b e3)] : [qw(a b)];
       my $v="PASS"; for my $k (@$core){ my $s=$a->{$k} ? $a->{$k}[0] : "UNMEASURED"; $v="FAIL" if $s eq "FAIL"; $v="UNMEASURED" if $s eq "UNMEASURED" && $v eq "PASS" }
       printf "leg %-8s run %d: %s\n",$leg,$run,$v;
       for my $k (sort keys %$a){ printf "    %-10s %-10s %s\n",$k,$a->{$k}[0],substr($a->{$k}[1],0,200) } } }
