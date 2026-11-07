@@ -9,6 +9,7 @@
 //! With no PTY output and no blink the loop blocks in `dispatch(None)`: no timers, idle CPU ~0.
 
 mod damage;
+pub(crate) mod diag;
 mod host;
 #[path = "../identity.rs"]
 pub(crate) mod identity;

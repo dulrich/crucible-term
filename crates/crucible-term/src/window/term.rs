@@ -6,8 +6,9 @@
 //! dirty and no frame callback is outstanding ([`Term::draw`]); the `wl_surface.frame` callback
 //! draws again only if new damage arrived meanwhile.
 
+use super::diag::Diag;
 use super::host::Host;
-use super::lifecycle::{self, BufState, Lifecycle};
+use super::lifecycle::{BufState, Lifecycle};
 use super::routing::TermId;
 use super::{Config, damage, input};
 use crate::font::{FontPool, Metrics, PooledFonts};
@@ -178,15 +179,8 @@ pub struct Term {
     pub(super) exit: Option<i32>,
     /// The compositor asked to close; the host removes the window and reaps the child.
     pub(super) close_requested: bool,
-    /// `CTERM_DEBUG_MEM=1`: print memory attribution to stderr (first frame, then 4 s idle).
-    pub(super) mem_debug: bool,
-    pub(super) mem_first: bool,
-    /// `CTERM_DEBUG_FRAME_SUM=1`: log a checksum of every committed full-size buffer.
-    pub(super) sum_debug: bool,
-    /// Log a forced-full-repaint checksum after the next commit (set on resume).
-    pub(super) sum_full_pending: bool,
-    /// Full-size commits so far (the frame-sum sequence number; never reset).
-    pub(super) commits: u64,
+    /// Debug-only memory and frame-checksum diagnostics (see [`Diag`]).
+    pub(super) diag: Diag,
     /// The next draw presents even inside a mode 2026 hold (the resume repaint).
     pub(super) force_present: bool,
 }
@@ -359,30 +353,47 @@ impl Term {
             return;
         }
         self.blink_armed = true;
-        let id = self.id;
-        let r = self
-            .handle
-            .insert_source(Timer::from_duration(BLINK), move |_, _, host| {
-                let Some(t) = host.terms.get_mut(&id) else {
-                    return TimeoutAction::Drop;
-                };
-                if !t.session.cursor_style().blinking || !t.focused {
-                    t.blink_on = true;
-                    t.blink_armed = false;
-                    t.mark_cursor();
-                    return TimeoutAction::Drop;
-                }
-                t.blink_on = !t.blink_on;
-                t.mark_cursor();
-                TimeoutAction::ToDuration(BLINK)
-            });
-        if r.is_err() {
-            self.blink_armed = false;
-        }
+        let armed = self.add_timer(BLINK, |t, _| {
+            if !t.session.cursor_style().blinking || !t.focused {
+                t.blink_on = true;
+                t.blink_armed = false;
+                t.request_redraw();
+                return TimeoutAction::Drop;
+            }
+            t.blink_on = !t.blink_on;
+            t.request_redraw();
+            TimeoutAction::ToDuration(BLINK)
+        });
+        self.blink_armed = armed;
     }
 
-    pub(super) fn mark_cursor(&mut self) {
-        self.request_redraw();
+    /// Register a calloop timer that fires after `after` with this window and, while connected,
+    /// the host's `wl_shm`. The window is looked up in the host on every firing (gone: the timer
+    /// drops itself). Returns whether the timer was registered.
+    pub(super) fn add_timer(
+        &self,
+        after: Duration,
+        mut f: impl FnMut(&mut Term, Option<&Shm>) -> TimeoutAction + 'static,
+    ) -> bool {
+        let id = self.id;
+        self.handle
+            .insert_source(Timer::from_duration(after), move |_, _, host| {
+                let shm = host.wl.as_ref().map(|w| &w.shm);
+                match host.terms.get_mut(&id) {
+                    Some(t) => f(t, shm),
+                    None => TimeoutAction::Drop,
+                }
+            })
+            .is_ok()
+    }
+
+    /// Run `f` with the surface half taken out of `self` (so both can be borrowed), then put it
+    /// back. `None` while detached.
+    fn with_surf<R>(&mut self, f: impl FnOnce(&mut Self, &mut Surf) -> R) -> Option<R> {
+        let mut s = self.surf.take()?;
+        let r = f(self, &mut s);
+        self.surf = Some(s);
+        Some(r)
     }
 
     pub(super) fn request_redraw(&mut self) {
@@ -440,10 +451,7 @@ impl Term {
     /// and not inside a mode 2026 hold younger than [`SYNC_TIMEOUT`].
     pub(super) fn draw(&mut self) {
         // Detached (no surface): the session keeps parsing PTY output; nothing is drawn.
-        if let Some(mut s) = self.surf.take() {
-            self.draw_on(&mut s);
-            self.surf = Some(s);
-        }
+        self.with_surf(|t, s| t.draw_on(s));
     }
 
     fn draw_on(&mut self, s: &mut Surf) {
@@ -457,17 +465,11 @@ impl Term {
             let left = SYNC_TIMEOUT.saturating_sub(since.elapsed());
             if !left.is_zero() {
                 if !self.sync_timer {
-                    self.sync_timer = true;
-                    let id = self.id;
-                    let _ =
-                        self.handle
-                            .insert_source(Timer::from_duration(left), move |_, _, host| {
-                                if let Some(t) = host.terms.get_mut(&id) {
-                                    t.sync_timer = false;
-                                    t.draw();
-                                }
-                                TimeoutAction::Drop
-                            });
+                    self.sync_timer = self.add_timer(left, |t, _| {
+                        t.sync_timer = false;
+                        t.draw();
+                        TimeoutAction::Drop
+                    });
                 }
                 return;
             }
@@ -573,17 +575,8 @@ impl Term {
             return;
         }
         // Debug-only checksums, taken before the attach (the canvas is writable until then).
-        if self.sum_debug {
-            self.commits += 1;
-            if let Some(bytes) = buffer.canvas(&mut s.pool) {
-                eprintln!(
-                    "crucible-term: frame-sum: {} {} {:016x}",
-                    self.id.0,
-                    self.commits,
-                    lifecycle::fnv1a64(bytes)
-                );
-            }
-            if std::mem::take(&mut self.sum_full_pending) {
+        self.diag
+            .frame_sum(self.id, buffer.canvas(&mut s.pool).map(|b| &*b), || {
                 let mut scratch = vec![0u32; w * h];
                 render::paint(
                     &mut Canvas {
@@ -599,13 +592,8 @@ impl Term {
                     None,
                     sel.is_some().then_some(&selected as render::Selected<'_>),
                 );
-                eprintln!(
-                    "crucible-term: frame-sum-full: {} {:016x}",
-                    self.id.0,
-                    lifecycle::fnv1a64_px(&scratch)
-                );
-            }
-        }
+                scratch
+            });
         let surface = s.window.wl_surface().clone();
         for &(y, bh) in &bands {
             surface.damage_buffer(0, y as i32, w as i32, bh as i32);
@@ -621,8 +609,7 @@ impl Term {
         if s.buffers.len() > 2 {
             s.buffers.remove(0);
         }
-        if self.mem_debug && self.mem_first {
-            self.mem_first = false;
+        if self.diag.first_frame_mem() {
             self.print_mem(Some(&*s), "first-frame");
         }
     }
@@ -631,10 +618,7 @@ impl Term {
     /// the host pool `tiny`, give up every full-size buffer, and return the pool's memory once
     /// no full-size buffer is held. Rendering stops until [`Term::resume`].
     pub(super) fn suspend(&mut self, tiny: &mut SlotPool, shm: &Shm) {
-        if let Some(mut s) = self.surf.take() {
-            self.suspend_on(&mut s, tiny, shm);
-            self.surf = Some(s);
-        }
+        self.with_surf(|t, s| t.suspend_on(s, tiny, shm));
     }
 
     fn suspend_on(&mut self, s: &mut Surf, tiny: &mut SlotPool, shm: &Shm) {
@@ -685,7 +669,7 @@ impl Term {
         if plan.recreate_pool {
             Term::recreate_pool(s, shm);
         }
-        if self.mem_debug && s.life.suspended() {
+        if self.diag.mem() && s.life.suspended() {
             self.print_mem(Some(&*s), "suspended");
         }
         self.arm_drain(s);
@@ -695,19 +679,15 @@ impl Term {
     /// before the hide may never fire), restore the integer scale, and force a full repaint into
     /// fresh buffers. The caller's relayout then draws and commits it in the same handler.
     pub(super) fn resume(&mut self) {
-        if let Some(mut s) = self.surf.take() {
-            self.resume_on(&mut s);
-            self.surf = Some(s);
-        }
+        self.with_surf(Term::resume_on);
     }
 
     fn resume_on(&mut self, s: &mut Surf) {
-        let Some(plan) = s.life.resume() else {
+        if !s.life.resume() {
             return;
-        };
-        if plan.clear_frame_pending {
-            s.frame_pending = false;
         }
+        // A frame callback requested before the hide may never fire.
+        s.frame_pending = false;
         if s.viewport.is_none() {
             s.window
                 .wl_surface()
@@ -716,13 +696,12 @@ impl Term {
         // The compositor releases the placeholder when the full-size buffer replaces it; sctk
         // defers its destroy until then and its slot returns to the host pool.
         s.tiny = None;
-        if plan.full_repaint {
-            s.frames.reset();
-            self.full = true;
-            self.dirty = true;
-            self.force_present = true;
-            self.sum_full_pending = self.sum_debug;
-        }
+        // Repaint the whole grid into fresh buffers.
+        s.frames.reset();
+        self.full = true;
+        self.dirty = true;
+        self.force_present = true;
+        self.diag.on_resume();
     }
 
     /// Replace the pool by an empty one, returning its mapping to the OS. Only called when no
@@ -738,12 +717,8 @@ impl Term {
     /// Destroy the draining buffers the compositor has released; on the last release while
     /// still suspended, recreate the pool. Returns whether any are left to wait for.
     pub(super) fn poll_drain(&mut self, shm: &Shm) -> bool {
-        let Some(mut s) = self.surf.take() else {
-            return false;
-        };
-        let left = self.poll_drain_on(&mut s, shm);
-        self.surf = Some(s);
-        left
+        self.with_surf(|t, s| t.poll_drain_on(s, shm))
+            .unwrap_or(false)
     }
 
     fn poll_drain_on(&mut self, s: &mut Surf, shm: &Shm) -> bool {
@@ -760,7 +735,7 @@ impl Term {
         }
         if recreate && s.buffers.is_empty() {
             Term::recreate_pool(s, shm);
-            if self.mem_debug {
+            if self.diag.mem() {
                 self.print_mem(Some(&*s), "suspended-drained");
             }
         }
@@ -775,28 +750,19 @@ impl Term {
             return;
         }
         s.drain_timer = true;
-        let id = self.id;
-        let r = self
-            .handle
-            .insert_source(Timer::from_duration(DRAIN_POLL), move |_, _, host| {
-                let Some(shm) = host.wl.as_ref().map(|w| &w.shm) else {
-                    return TimeoutAction::Drop;
-                };
-                let Some(t) = host.terms.get_mut(&id) else {
-                    return TimeoutAction::Drop;
-                };
-                if t.poll_drain(shm) {
-                    TimeoutAction::ToDuration(DRAIN_POLL)
-                } else {
-                    if let Some(s) = t.surf.as_mut() {
-                        s.drain_timer = false;
-                    }
-                    TimeoutAction::Drop
+        s.drain_timer = self.add_timer(DRAIN_POLL, |t, shm| {
+            let Some(shm) = shm else {
+                return TimeoutAction::Drop;
+            };
+            if t.poll_drain(shm) {
+                TimeoutAction::ToDuration(DRAIN_POLL)
+            } else {
+                if let Some(s) = t.surf.as_mut() {
+                    s.drain_timer = false;
                 }
-            });
-        if r.is_err() {
-            s.drain_timer = false;
-        }
+                TimeoutAction::Drop
+            }
+        });
     }
 
     /// Debug-only (`CTERM_DEBUG_MEM=1`): byte sizes of the big per-window and shareable pieces.

@@ -788,7 +788,7 @@ impl KeyboardHandler for Host {
             t.send(b"\x1b[I");
         }
         t.arm_blink();
-        t.mark_cursor();
+        t.request_redraw();
     }
 
     fn leave(
@@ -810,7 +810,7 @@ impl KeyboardHandler for Host {
         if t.session.modes().focus_events {
             t.send(b"\x1b[O");
         }
-        t.mark_cursor();
+        t.request_redraw();
     }
 
     fn press_key(

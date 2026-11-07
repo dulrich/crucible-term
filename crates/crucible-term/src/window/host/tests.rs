@@ -1,4 +1,5 @@
 use super::*;
+use smithay_client_toolkit::reexports::calloop::timer::Timer;
 use std::time::Instant;
 
 fn host(detachable: bool, display: Option<PathBuf>) -> (EventLoop<'static, Host>, Host) {

@@ -4,6 +4,7 @@
 //! the owning `Term` by `wl_surface` through [`Routes`]. Standalone [`run`] is a host with one
 //! window.
 
+use super::diag::Diag;
 use super::identity::generated::crucible_window_identity_manager_v1::CrucibleWindowIdentityManagerV1;
 use super::identity::generated::crucible_window_identity_v1::{
     CrucibleWindowIdentityV1, Event as IdentityEvent,
@@ -21,7 +22,7 @@ use crucible_term_core::pty::{Pty, SpawnSpec};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
-use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay_client_toolkit::reexports::calloop::timer::TimeoutAction;
 use smithay_client_toolkit::reexports::calloop::{
     Dispatcher, EventLoop, EventSource, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
@@ -524,24 +525,15 @@ impl Host {
             last_cursor: None,
             exit: None,
             close_requested: false,
-            mem_debug: std::env::var_os("CTERM_DEBUG_MEM").is_some_and(|v| v == "1"),
-            mem_first: true,
-            sum_debug: std::env::var_os("CTERM_DEBUG_FRAME_SUM").is_some_and(|v| v == "1"),
-            sum_full_pending: false,
-            commits: 0,
+            diag: Diag::from_env(),
             force_present: false,
         };
         term.apply_cursor_defaults();
-        if term.mem_debug {
-            let _ = self.handle.insert_source(
-                Timer::from_duration(Duration::from_secs(4)),
-                move |_, _, host| {
-                    if let Some(t) = host.terms.get(&id) {
-                        t.print_mem(t.surf.as_ref(), "idle-4s");
-                    }
-                    TimeoutAction::Drop
-                },
-            );
+        if term.diag.mem() {
+            term.add_timer(Duration::from_secs(4), |t, _| {
+                t.print_mem(t.surf.as_ref(), "idle-4s");
+                TimeoutAction::Drop
+            });
         }
         Ok(term)
     }

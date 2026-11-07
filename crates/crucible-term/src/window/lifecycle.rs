@@ -30,21 +30,10 @@ pub(super) enum Transition {
 /// The decision on suspend for the live full-size buffers (indices into the caller's list).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct SuspendPlan {
-    /// Released buffers: destroy now.
-    pub destroy: Vec<usize>,
     /// Held buffers: keep until their release is observed, then destroy.
     pub drain: Vec<usize>,
     /// Nothing is held: recreate (empty) the pool now.
     pub recreate_pool: bool,
-}
-
-/// The decision on resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResumePlan {
-    /// Forget a frame callback requested before the hide (it may never fire).
-    pub clear_frame_pending: bool,
-    /// Repaint the whole grid into fresh buffers and commit now.
-    pub full_repaint: bool,
 }
 
 /// Per-window suspended state plus the number of held buffers still draining.
@@ -88,9 +77,9 @@ impl Lifecycle {
         self.suspended = true;
         let mut plan = SuspendPlan::default();
         for (i, s) in bufs.iter().enumerate() {
-            match s {
-                BufState::Released => plan.destroy.push(i),
-                BufState::Held => plan.drain.push(i),
+            // Released buffers need no entry: the caller destroys whatever is not drained.
+            if *s == BufState::Held {
+                plan.drain.push(i);
             }
         }
         self.draining += plan.drain.len();
@@ -110,39 +99,17 @@ impl Lifecycle {
         false
     }
 
-    /// Leave the suspended state. Buffers still draining keep draining (the pool is in use again,
-    /// so it is no longer recreated).
-    pub(super) fn resume(&mut self) -> Option<ResumePlan> {
+    /// Leave the suspended state; `false` if the window was not suspended. Buffers still
+    /// draining keep draining (the pool is in use again, so it is no longer recreated). The
+    /// caller then forgets its stale frame callback and repaints in full.
+    pub(super) fn resume(&mut self) -> bool {
         if !self.suspended {
-            return None;
+            return false;
         }
         self.suspended = false;
         self.pool_stale = false;
-        Some(ResumePlan {
-            clear_frame_pending: true,
-            full_repaint: true,
-        })
+        true
     }
-}
-
-/// FNV-1a 64 over bytes (the `CTERM_DEBUG_FRAME_SUM` checksum).
-pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
-        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// [`fnv1a64`] over `Argb8888` pixels in wire (little-endian) byte order.
-pub(crate) fn fnv1a64_px(px: &[u32]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for p in px {
-        for b in p.to_le_bytes() {
-            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-        }
-    }
-    h
 }
 
 #[cfg(test)]
@@ -154,7 +121,6 @@ mod tests {
     fn suspend_destroys_only_released_and_drains_held() {
         let mut l = Lifecycle::default();
         let p = l.suspend(&[Released, Held]);
-        assert_eq!(p.destroy, vec![0]);
         assert_eq!(p.drain, vec![1]);
         assert!(!p.recreate_pool, "a held buffer still maps the pool");
         assert!(!l.may_draw());
@@ -169,7 +135,6 @@ mod tests {
     fn suspend_with_nothing_held_recreates_the_pool_at_once() {
         let mut l = Lifecycle::default();
         let p = l.suspend(&[Released, Released]);
-        assert_eq!(p.destroy, vec![0, 1]);
         assert!(p.drain.is_empty());
         assert!(p.recreate_pool);
         let p = Lifecycle::default().suspend(&[]);
@@ -181,7 +146,6 @@ mod tests {
         let mut l = Lifecycle::default();
         let p = l.suspend(&[Held, Held]);
         assert_eq!(p.drain, vec![0, 1]);
-        assert!(p.destroy.is_empty());
         assert!(!l.release());
         assert!(l.release());
     }
@@ -190,7 +154,7 @@ mod tests {
     fn release_after_resume_never_recreates_the_pool() {
         let mut l = Lifecycle::default();
         l.suspend(&[Held]);
-        assert!(l.resume().is_some());
+        assert!(l.resume());
         assert!(!l.release(), "the pool is in use again");
         assert_eq!(l.draining(), 0);
     }
@@ -203,14 +167,9 @@ mod tests {
         assert_eq!(l.transition(true), Transition::None, "repeat suspend");
         assert_eq!(l.suspend(&[Held]), SuspendPlan::default());
         assert_eq!(l.transition(false), Transition::Resume);
-        let r = l.resume().expect("resume");
-        assert!(
-            r.clear_frame_pending,
-            "a stale frame callback must not gate the repaint"
-        );
-        assert!(r.full_repaint);
+        assert!(l.resume());
         assert!(l.may_draw());
-        assert!(l.resume().is_none());
+        assert!(!l.resume(), "already visible");
     }
 
     #[test]
@@ -222,15 +181,5 @@ mod tests {
         assert!(l.may_draw());
         assert!(!l.suspended());
         assert_eq!(l.draining(), 0);
-    }
-
-    #[test]
-    fn fnv_is_deterministic_and_matches_the_pixel_form() {
-        let px = [0xff00_00ffu32, 0x1234_5678, 0];
-        let bytes: Vec<u8> = px.iter().flat_map(|p| p.to_le_bytes()).collect();
-        assert_eq!(fnv1a64(&bytes), fnv1a64_px(&px));
-        assert_eq!(fnv1a64_px(&px), fnv1a64_px(&px));
-        assert_eq!(fnv1a64(&[]), 0xcbf2_9ce4_8422_2325);
-        assert_ne!(fnv1a64_px(&px), fnv1a64_px(&[0, 0, 0]));
     }
 }

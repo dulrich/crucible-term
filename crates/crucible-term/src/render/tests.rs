@@ -509,7 +509,7 @@ fn centered_splits_the_spare_pixels() {
 /// forced-full-repaint checksum of the same grid (what WP-8 compares after un-hiding).
 #[test]
 fn frame_sum_of_incremental_paint_equals_full_repaint() {
-    use crate::window::lifecycle::fnv1a64_px;
+    use crate::window::diag::fnv1a64_px;
     let mut f = fonts(false);
     let mut s = Session::new(8, 2, 0);
     s.feed(b"abc\r\ndef");
