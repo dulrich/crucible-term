@@ -380,7 +380,7 @@ g3_start() { # tag
 	cat >"$T/config/cde/config.kdl" <<KDL
 restore-session #true
 tiling {
-    terminal gap=$GAP ring=2 ring-inset=4 frame="#3a3a3a"
+    terminal gap=(px)$GAP ring=(px)2 ring-inset=(px)4 frame="#3a3a3a"
     terminal-args "-o" "pad={gap}x{gap} center" "-o" "mode=auto"
 }
 terminal "$CT" exec-flag="-e"

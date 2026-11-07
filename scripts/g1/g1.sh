@@ -153,7 +153,7 @@ cursor shape="block" blink=#true
 KDL
 	cat >"$T/config/cde/config.kdl" <<KDL
 tiling {
-    terminal gap=$GAP ring=2 ring-inset=4 frame="#3a3a3a"
+    terminal gap=(px)$GAP ring=(px)2 ring-inset=(px)4 frame="#3a3a3a"
     terminal-args "-o" "pad={gap}x{gap} center"
 }
 terminal "$HERE/term.sh" exec-flag="-e"

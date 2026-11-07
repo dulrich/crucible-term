@@ -307,7 +307,7 @@ cde_start() {
 	[ -z "$mode" ] || targs=' "-o" "mode='$mode'"'
 	cat >"$T/config/cde/config.kdl" <<KDL
 tiling {
-    terminal gap=$GAP ring=2 ring-inset=4 frame="#3a3a3a"
+    terminal gap=(px)$GAP ring=(px)2 ring-inset=(px)4 frame="#3a3a3a"
     terminal-args "-o" "pad={gap}x{gap} center"$targs
 }
 terminal "$term" exec-flag="-e"
@@ -680,7 +680,7 @@ e2e_start_with_state() { # attempt
 	write_ct_config
 	cat >"$T/config/cde/config.kdl" <<KDL
 tiling {
-    terminal gap=$GAP ring=2 ring-inset=4 frame="#3a3a3a"
+    terminal gap=(px)$GAP ring=(px)2 ring-inset=(px)4 frame="#3a3a3a"
     terminal-args "-o" "pad={gap}x{gap} center" "-o" "mode=auto"
 }
 terminal "$CT" exec-flag="-e"
