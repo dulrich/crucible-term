@@ -4,6 +4,18 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.5.0 — 2026-11-07
+
+### Added
+
+- Durable scrollback, off by default. With `scrollback-persist #true` the daemon keeps each session's history (the last `persist-lines` rows plus the screen, default 2000) in a 0600 file under `$XDG_STATE_HOME/crucible-term/sessions/`, written atomically. When CDE restores a keyed window after a reboot, the saved history is shown above the new child, such as the `crucible resume` banner. A window closed for real deletes its record, and records older than `persist-days` (default 14) are swept at startup. While the alternate screen is active, the last primary-screen record stands.
+- The daemon saves every live session on SIGTERM and SIGHUP, then exits 0.
+- `scripts/g3/g3.sh reboot` models a reboot: the daemon is stopped, the shells die, and the restored windows must show the saved history. The kill leg now checks record replay too.
+
+### Fixed
+
+- The PTY child resets its signal mask and dispositions before exec, so the shell no longer inherits the SIGTERM and SIGHUP block the daemon holds for its signalfd.
+
 ## 0.4.4 — 2026-11-06
 
 ### Fixed
