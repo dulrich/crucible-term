@@ -548,6 +548,12 @@ impl Term {
         let top = self.session.viewport_top();
         let sel = self.inp.selection.as_ref();
         let selected = |r: usize, c: usize| sel.is_some_and(|s| s.contains(top + r, c));
+        let frame = render::Frame {
+            theme: &self.theme,
+            pad,
+            cursor,
+            selected: sel.is_some().then_some(&selected as render::Selected<'_>),
+        };
         let Some(px) = buffer.canvas(&mut s.pool).and_then(as_pixels) else {
             eprintln!("crucible-term: shm buffer not drawable");
             s.buffers.push((buffer, None));
@@ -562,12 +568,9 @@ impl Term {
                 height: h,
             },
             &grid,
-            &self.theme,
             &mut self.fonts.fonts.borrow_mut(),
-            pad,
-            cursor,
+            &frame,
             rows.as_deref(),
-            sel.is_some().then_some(&selected as render::Selected<'_>),
         );
         if bands.is_empty() {
             // Nothing painted, but the repair above brought the buffer up to the current frame.
@@ -585,12 +588,9 @@ impl Term {
                         height: h,
                     },
                     &grid,
-                    &self.theme,
                     &mut self.fonts.fonts.borrow_mut(),
-                    pad,
-                    cursor,
+                    &frame,
                     None,
-                    sel.is_some().then_some(&selected as render::Selected<'_>),
                 );
                 scratch
             });

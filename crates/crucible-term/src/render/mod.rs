@@ -235,23 +235,32 @@ pub fn cell_at(
     )
 }
 
+/// The per-frame inputs to [`paint`] other than the canvas, grid and fonts.
+#[derive(Clone, Copy)]
+pub struct Frame<'a> {
+    /// Colours.
+    pub theme: &'a Theme,
+    /// Padding around the grid.
+    pub pad: Pad,
+    /// How to draw the cursor.
+    pub cursor: CursorDraw,
+    /// Which cells are selected, if any.
+    pub selected: Option<Selected<'a>>,
+}
+
 /// Paint `grid` into `canvas`: every row when `rows` is `None` (padding too), otherwise only the
 /// listed rows (each repainted across the full canvas width, side padding included). Returns
 /// the repainted pixel bands as `(y, height)` for the window's buffer damage.
-#[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut Canvas<'_>,
     grid: &Grid,
-    theme: &Theme,
     fonts: &mut Fonts,
-    pad: impl Into<Pad>,
-    cursor: CursorDraw,
+    frame: &Frame<'_>,
     rows: Option<&[usize]>,
-    selected: Option<Selected<'_>>,
 ) -> Vec<(usize, usize)> {
-    let pad: Pad = pad.into();
+    let pad = frame.pad;
     let m = fonts.metrics();
-    let bg = premul(theme.bg, theme.alpha);
+    let bg = premul(frame.theme.bg, frame.theme.alpha);
     let all: Vec<usize>;
     let rows = match rows {
         Some(r) => r,
@@ -273,18 +282,7 @@ pub fn paint(
         }
         let cur = (grid.cursor.1 == r).then_some(grid.cursor.0);
         let mut band = Band { c: canvas, y0, y1 };
-        let sel_row = |c: usize| selected.is_some_and(|f| f(r, c));
-        paint_row(
-            &mut band,
-            &grid.screen[r].cells,
-            theme,
-            fonts,
-            &m,
-            pad,
-            cur,
-            cursor,
-            &sel_row,
-        );
+        paint_row(&mut band, &grid.screen[r].cells, frame, fonts, &m, r, cur);
         bands.push((y0, y1 - y0));
     }
     if rows.len() == grid.rows {
@@ -324,50 +322,57 @@ fn colors(cell: &Cell, t: &Theme) -> CellColors {
     CellColors { fg, bg }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A cell's final colours: reverse, selection and block-cursor adjustment applied. `bg` is the
+/// fill (`None` = the row's default background), `fg` the glyph and decoration colour.
+fn final_colors(cell: &Cell, t: &Theme, selected: bool, under_block: bool) -> CellColors {
+    let mut col = colors(cell, t);
+    if selected {
+        invert(&mut col, t);
+    }
+    if under_block {
+        col.fg = col.bg.unwrap_or(t.bg);
+        col.bg = Some(t.cursor);
+    }
+    col
+}
+
 fn paint_row(
     b: &mut Band<'_, '_>,
     cells: &[Cell],
-    t: &Theme,
+    frame: &Frame<'_>,
     fonts: &mut Fonts,
     m: &Metrics,
-    pad: Pad,
+    row: usize,
     cur: Option<usize>,
-    cursor: CursorDraw,
-    sel: &dyn Fn(usize) -> bool,
 ) {
+    let (t, pad, cursor) = (frame.theme, frame.pad, frame.cursor);
     let (cw, ch) = (i64::from(m.cell_w), i64::from(m.cell_h));
     let y = b.y0 as i64;
     b.fill(0, y, b.c.width as i64, ch, premul(t.bg, t.alpha));
     let show = cursor.blink_on && cursor.style.shape != CursorKind::Hidden;
     let block = show && cursor.focused && cursor.style.shape == CursorKind::Block;
+    // Each cell's colours are resolved once and used by both passes.
+    let cols: Vec<CellColors> = cells
+        .iter()
+        .enumerate()
+        .map(|(x, cell)| {
+            let sel = frame.selected.is_some_and(|f| f(row, x));
+            final_colors(cell, t, sel, block && cur == Some(x))
+        })
+        .collect();
     // Backgrounds first, so glyph overhang from one cell is not erased by the next.
-    for (x, cell) in cells.iter().enumerate() {
+    for (x, col) in cols.iter().enumerate() {
         let cx = i64::from(pad.x) + x as i64 * cw;
-        let mut col = colors(cell, t);
-        if sel(x) {
-            invert(&mut col, t);
-        }
-        if block && cur == Some(x) {
-            col.bg = Some(t.cursor);
-        }
         if let Some(bgc) = col.bg {
             b.fill(cx, y, cw, ch, premul(bgc, 255));
         }
     }
-    for (x, cell) in cells.iter().enumerate() {
+    for (x, (cell, col)) in cells.iter().zip(&cols).enumerate() {
         if cell.width == Width::Spacer {
             continue;
         }
         let cx = i64::from(pad.x) + x as i64 * cw;
         let span = if cell.width == Width::Wide { 2 } else { 1 };
-        let mut col = colors(cell, t);
-        if sel(x) {
-            invert(&mut col, t);
-        }
-        if block && cur == Some(x) {
-            col.fg = col.bg.unwrap_or(t.bg);
-        }
         let fg = premul(col.fg, 255);
         if !cell.text.is_empty() {
             let style = Style::of(cell.attrs.bold, cell.attrs.italic);

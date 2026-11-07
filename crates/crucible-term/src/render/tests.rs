@@ -65,6 +65,16 @@ const NO_CURSOR: CursorDraw = CursorDraw {
     ..FOCUSED
 };
 
+/// A frame with no padding and no selection.
+fn fr(theme: &Theme, cursor: CursorDraw) -> Frame<'_> {
+    Frame {
+        theme,
+        pad: Pad::from(0),
+        cursor,
+        selected: None,
+    }
+}
+
 struct Out {
     px: Vec<u32>,
     w: usize,
@@ -91,7 +101,14 @@ fn render(cols: usize, rows: usize, input: &[u8], f: &mut Fonts, cur: CursorDraw
         width: w,
         height: h,
     };
-    paint(&mut c, &grid, &Theme::default(), f, pad, cur, None, None);
+    let theme = Theme::default();
+    let frame = Frame {
+        theme: &theme,
+        pad: pad.into(),
+        cursor: cur,
+        selected: None,
+    };
+    paint(&mut c, &grid, f, &frame, None);
     Out { px, w, h }
 }
 
@@ -147,7 +164,13 @@ fn padding_and_background_alpha_are_premultiplied() {
         width: w,
         height: h,
     };
-    paint(&mut c, &grid, &theme, &mut f, pad, NO_CURSOR, None, None);
+    let frame = Frame {
+        theme: &theme,
+        pad: pad.into(),
+        cursor: NO_CURSOR,
+        selected: None,
+    };
+    paint(&mut c, &grid, &mut f, &frame, None);
     // Default bg #111111 at alpha 0x80, premultiplied: 0x11 * 0x80 / 255 = 0x09.
     assert_eq!(px[0], 0x8009_0909, "padding corner");
     assert_eq!(px[(h - 1) * w + w - 1], 0x8009_0909, "padding far corner");
@@ -292,11 +315,8 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
             height: h,
         },
         &first,
-        &theme,
         &mut f,
-        0,
-        FOCUSED,
-        None,
+        &fr(&theme, FOCUSED),
         None,
     );
     let before = inc.clone();
@@ -311,12 +331,9 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
             height: h,
         },
         &next,
-        &theme,
         &mut f,
-        0,
-        FOCUSED,
+        &fr(&theme, FOCUSED),
         Some(&rows),
-        None,
     );
     assert_eq!(
         bands,
@@ -338,11 +355,8 @@ fn damage_limited_repaint_matches_full_and_touches_only_its_rows() {
             height: h,
         },
         &next,
-        &theme,
         &mut f,
-        0,
-        FOCUSED,
-        None,
+        &fr(&theme, FOCUSED),
         None,
     );
     assert_eq!(inc, full, "incremental == full repaint");
@@ -367,6 +381,11 @@ fn selected_cells_swap_colours_and_pointer_maps_to_cells() {
     let (w, h) = (3 * m.cell_w as usize, m.cell_h as usize);
     let mut px = vec![0u32; w * h];
     let sel = |_r: usize, c: usize| c == 1;
+    let theme = Theme::default();
+    let frame = Frame {
+        selected: Some(&sel),
+        ..fr(&theme, NO_CURSOR)
+    };
     paint(
         &mut Canvas {
             px: &mut px,
@@ -374,12 +393,9 @@ fn selected_cells_swap_colours_and_pointer_maps_to_cells() {
             height: h,
         },
         &grid,
-        &Theme::default(),
         &mut f,
-        0,
-        NO_CURSOR,
+        &frame,
         None,
-        Some(&sel),
     );
     let o = Out { px, w, h };
     let mid = |c: usize| at(&o, c * m.cell_w as usize + 1, m.cell_h as usize / 2);
@@ -451,11 +467,8 @@ fn bench_swash_frame() {
                 height: h,
             },
             &grid,
-            &theme,
             f,
-            0,
-            FOCUSED,
-            None,
+            &fr(&theme, FOCUSED),
             None,
         );
         t.elapsed().as_secs_f64() * 1e3
@@ -524,12 +537,9 @@ fn frame_sum_of_incremental_paint_equals_full_repaint() {
                 height: h,
             },
             g,
-            &theme,
             &mut f,
-            0,
-            FOCUSED,
+            &fr(&theme, FOCUSED),
             rows,
-            None,
         );
     };
     let mut inc = vec![0u32; w * h];
