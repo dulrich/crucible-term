@@ -15,12 +15,12 @@ usage() {
 Usage: g1.sh [--help|-h] [--build|--version] <subject>...
 
 Measure each subject (`crucible-term`, `foot`), back-to-back in the order given, each in its own fresh nested
-`crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1). Per subject:
+`crucible --winit` launched through `crucible msg run-on` into a scratch workspace (scratch-cterm-<driver>-<pid>; override with CTERM_SCRATCH_WS, which must start with scratch-; the live CDE_SOCKET is required; parent WAYLAND_DISPLAY=/run/user/1001/wayland-1). Per subject:
   spawn -> first drawn frame (WAYLAND_DEBUG), median of 5; PSS/RSS of the terminal subtree after a 4 s settle,
   median of 3; idle CPU over 60 s (utime+stime of the subtree); `time cat` of the 50 MB file, the escape-heavy
   and the unicode corpus, median of 3 each. Prints MEM/LAT/IDLE/THR lines and writes them to target/g1/<subject>.out.
 Scratch lives in /tmp/cde-g1-<subject> (removed at exit); artifacts under target/g1/. Only pids recorded by this
-script are ever signalled; nothing is started against the live session directly.
+script are ever signalled; nothing is started on the live focused workspace.
 
 Environment (defaults): G1_CRUCIBLE (crucible-dev-env/target/release/crucible), G1_CT (target/release/cterm),
 G1_FOOT (~/.local/bin/foot), G1_FOOT_INI (~/.config/foot/foot.ini), G1_CORPUS (crucible-dev-env/target/spike-core/corpus),
@@ -31,6 +31,8 @@ USAGE
 
 # shellcheck source-path=SCRIPTDIR source=../lib/build-id.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/build-id.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/run-on.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/run-on.sh"
 case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
 
@@ -97,6 +99,7 @@ cleanup() {
 	if [ -n "$T" ] && [ -f "$T/pids" ]; then
 		while read -r p; do kill "$p" 2>/dev/null || true; done <"$T/pids"
 	fi
+	[ -z "$CPID" ] || run_on_close "$CPID"
 	[ -n "$CPID" ] && kill "$CPID" 2>/dev/null || true
 	[ -n "$T" ] && rm -rf "$T"
 	return 0
@@ -165,8 +168,8 @@ KDL
 	done
 	msg() { CDE_SOCKET=$T/run/cde/wayland-1.sock "$BIN" msg "$@"; }
 
-	G1_DIR=$T XDG_CONFIG_HOME=$T/config XDG_STATE_HOME=$T/state XDG_DATA_HOME=$T/data XDG_RUNTIME_DIR=$T/run WAYLAND_DISPLAY=$PARENT_WL setsid "$BIN" --winit >"$T/log" 2>&1 &
-	CPID=$!
+	run_on_launch g1 "$T" "$T/log" G1_DIR="$T" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
+	CPID=$RUN_ON_PID
 	local i
 	for i in $(seq 1 50); do
 		[ -S "$T/run/cde/wayland-1.sock" ] && ls "$T"/run/wayland-* >/dev/null 2>&1 && break
@@ -245,7 +248,7 @@ KDL
 
 	msg exec quit >/dev/null || true
 	sleep 2
-	if kill -0 "$CPID" 2>/dev/null; then kill "$CPID" 2>/dev/null || true; fi
+	if kill -0 "$CPID" 2>/dev/null; then run_on_close "$CPID"; kill "$CPID" 2>/dev/null || true; fi
 	echo "== $NAME done"
 }
 

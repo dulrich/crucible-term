@@ -15,7 +15,7 @@ usage() {
 Usage: g2.sh [--help|-h] [--build|--version] [LEG...]
 
 Legs (default: ff mem reshow info e2e): ff, mem, reshow, info, e2e, smoke, summarize, rsummarize.
-Every leg runs in its own fresh nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
+Every leg runs in its own fresh nested `crucible --winit` launched through `crucible msg run-on` into a scratch workspace (scratch-cterm-<driver>-<pid>; override with CTERM_SCRATCH_WS, which must start with scratch-; the live CDE_SOCKET is required; parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
 XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/tmp/cde-g2w), so the nested daemon socket and
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE (never through scripts/g1/term.sh, which defeats the
 basename-gated grant minting); every mode=auto subject is asserted to be in daemon mode (resident `cterm daemon`, shells in its subtree,
@@ -51,6 +51,8 @@ USAGE
 
 # shellcheck source-path=SCRIPTDIR source=../lib/build-id.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/build-id.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/run-on.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/run-on.sh"
 case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
 
@@ -155,6 +157,7 @@ KNOWN=()
 XENV=() # extra env words for the compositor (inherited by every spawn)
 
 cleanup() {
+	if alive "$CPID"; then run_on_close "$CPID"; fi
 	killrec
 	[ -z "$T" ] || rm -rf "$T"
 	return 0
@@ -309,9 +312,9 @@ tiling {
 }
 terminal "$term" exec-flag="-e"
 KDL
-	env "${XENV[@]}" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid "$BIN" --winit >"$T/log" 2>&1 &
-	CPID=$(real_cpid "$!")
-	rec "$!"
+	run_on_launch g2 "$T" "$T/log" "${XENV[@]}" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
+	CPID=$(real_cpid "$RUN_ON_PID")
+	rec "$RUN_ON_PID"
 	rec "$CPID"
 	local i
 	for i in $(seq 1 60); do
@@ -340,7 +343,7 @@ cde_stop() {
 	sleep 1
 	msg exec quit >/dev/null 2>&1 || true
 	sleep 2
-	alive "$CPID" && kill "$CPID" 2>/dev/null || true
+	if alive "$CPID"; then run_on_close "$CPID"; kill "$CPID" 2>/dev/null || true; fi
 	alive "$DPID" && kill "$DPID" 2>/dev/null || true
 	sleep 0.5
 	cp "$T/log" "$OUT/logs/$TAG.compositor.log" 2>/dev/null || true
@@ -684,9 +687,9 @@ terminal "$CT" exec-flag="-e"
 KDL
 	PROGEXE=$(readlink -f "$CT")
 	CLIENTS=() DPID=""
-	env "${XENV[@]}" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid "$BIN" --winit >"$T/log" 2>&1 &
-	CPID=$(real_cpid "$!")
-	rec "$!"
+	run_on_launch g2 "$T" "$T/log" "${XENV[@]}" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
+	CPID=$(real_cpid "$RUN_ON_PID")
+	rec "$RUN_ON_PID"
 	rec "$CPID"
 	local i
 	for i in $(seq 1 60); do

@@ -20,7 +20,7 @@ as in scripts/g1/g1.sh; it has no debug hook (no MEMHOOK lines). G2_WLDEBUG=1 ad
 window and prints a WLBUF summary (wl_shm pool/buffer creates and destroys; foot also logs its cell grid) - this perturbs memory
 slightly, so use it in a separate batch from the PSS split.
 
-Start a nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with the
+Start a nested `crucible --winit` launched through `crucible msg run-on` into a scratch workspace (scratch-cterm-<driver>-<pid>; override with CTERM_SCRATCH_WS, which must start with scratch-; the live CDE_SOCKET is required; parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with the
 g1 tiling probe config, open one standalone `cterm` window (`CTERM_DEBUG_MEM=1`) three times (fresh window each),
 wait the 4 s settle (and for the hook's idle line), then split the window's PSS from /proc/<pid>/smaps by mapping
 class: anon (heap/stack/anon), shm (memfd and /dev/shm: Wayland buffers; PSS is halved where the nested compositor
@@ -37,6 +37,8 @@ USAGE
 
 # shellcheck source-path=SCRIPTDIR source=../lib/build-id.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/build-id.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/run-on.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/run-on.sh"
 case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
 SUBJECTS=("$@")
@@ -95,6 +97,7 @@ cleanup() {
 	if [ -f "$T/pids" ]; then
 		while read -r p; do kill "$p" 2>/dev/null || true; done <"$T/pids"
 	fi
+	[ -z "$CPID" ] || run_on_close "$CPID"
 	[ -n "$CPID" ] && kill "$CPID" 2>/dev/null || true
 	rm -rf "$T"
 	return 0
@@ -156,8 +159,8 @@ tiling {
 terminal "$R/scripts/g1/term.sh" exec-flag="-e"
 KDL
 	msg() { CDE_SOCKET=$T/run/cde/wayland-1.sock "$BIN" msg "$@"; }
-	G1_DIR=$T XDG_CONFIG_HOME=$T/config XDG_STATE_HOME=$T/state XDG_DATA_HOME=$T/data XDG_RUNTIME_DIR=$T/run WAYLAND_DISPLAY=$PARENT_WL setsid "$BIN" --winit >"$T/log" 2>&1 &
-	CPID=$!
+	run_on_launch spike-mem "$T" "$T/log" G1_DIR="$T" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
+	CPID=$RUN_ON_PID
 	for _ in $(seq 1 50); do
 		[ -S "$T/run/cde/wayland-1.sock" ] && ls "$T"/run/wayland-* >/dev/null 2>&1 && break
 		sleep 0.2
@@ -208,7 +211,7 @@ KDL
 
 	msg exec quit >/dev/null || true
 	sleep 2
-	kill -0 "$CPID" 2>/dev/null && kill "$CPID" 2>/dev/null || true
+	if kill -0 "$CPID" 2>/dev/null; then run_on_close "$CPID"; kill "$CPID" 2>/dev/null || true; fi
 	echo "== done"
 }
 

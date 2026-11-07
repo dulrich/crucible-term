@@ -15,7 +15,7 @@ usage() {
 Usage: g3.sh [--help|-h] [--build|--version] [LEG...]
 
 Legs (default: kill segv restart logout): kill, segv, restart, logout, summarize.
-Every leg runs in its own fresh nested `crucible --winit` on the live session (parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
+Every leg runs in its own fresh nested `crucible --winit` launched through `crucible msg run-on` into a scratch workspace (scratch-cterm-<driver>-<pid>; override with CTERM_SCRATCH_WS, which must start with scratch-; the live CDE_SOCKET is required; parent WAYLAND_DISPLAY=/run/user/1001/wayland-1) with
 XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/tmp/cde-g3w), so the nested daemon socket and
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE in daemon mode (`-o mode=auto`, CDE `restore-session #true`) onto a
 crafted workspace of three terminals across two panes (sleep 1001 and sleep 1002 stacked in pane 1, sleep 1003 in pane 2) running
@@ -51,6 +51,8 @@ USAGE
 
 # shellcheck source-path=SCRIPTDIR source=../lib/build-id.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/build-id.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/run-on.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/run-on.sh"
 case " $* " in *" --help "* | *" -h "*) usage; exit 0 ;; esac
 build_flags "${BASH_SOURCE[0]}" "$@"
 
@@ -81,6 +83,18 @@ die() { echo "g3.sh: $*" >&2; exit 1; }
 
 starttime() { perl -e 'open(F,"<","/proc/$ARGV[0]/stat") or exit 1; my $s=<F>; $s=~/\) (.*)$/ or exit 1; my @f=split / /,$1; print $f[19]' "$1"; }
 rec() { local st; st=$(starttime "$1") || return 0; echo "$1 $st" >>"$W/pids"; }
+# compositor pids (with start time) in a file: the legs run in a pipeline subshell, so the EXIT trap in the parent cannot see $CPID
+recc() { local st; st=$(starttime "$1") || return 0; echo "$1 $st" >>"$W/comps"; }
+# ask the live CDE to close the windows of every recorded compositor that is still the same process (start time matches)
+closecomps() {
+	local p st cur
+	[ -f "$W/comps" ] || return 0
+	while read -r p st; do
+		cur=$(starttime "$p" 2>/dev/null) || continue
+		if [ "$cur" = "$st" ]; then run_on_close "$p"; fi
+	done <"$W/comps"
+	return 0
+}
 # signal only recorded pids whose start time still matches (pid reuse safe)
 killrec() {
 	local p st cur
@@ -112,6 +126,7 @@ T="" CPID="" DPID="" DISP="" PROGEXE="" TAG=""
 CLIENTS=()
 
 cleanup() {
+	closecomps
 	killrec
 	[ -z "$T" ] || rm -rf "$T"
 	return 0
@@ -239,14 +254,14 @@ start_comp() { # wrapper
 		# a FIFO, not a process substitution: bash leaves its own write-end copy (fd 63) open in the child, which every descendant would inherit
 		mkfifo "$T/probe.fifo"
 		probe_reader "$T/log.$$" "$T/eof.ts" <"$T/probe.fifo" &
-		env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit >"$T/probe.fifo" 2>&1 &
+		run_on_launch g3 "$T" "$T/probe.fifo" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
 	elif [ "$1" = 1 ]; then
 		write_subreaper
-		env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit >"$T/log.$$" 2>&1 &
+		run_on_launch g3 "$T" "$T/log.$$" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- perl "$T/subreap.pl" "$T/reaped.log" "$BIN" --winit || return 1
 	else
-		env XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" setsid "$BIN" --winit >"$T/log.$$.2" 2>&1 &
+		run_on_launch g3 "$T" "$T/log.$$.2" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$PARENT_WL" -- "$BIN" --winit || return 1
 	fi
-	rec "$!"
+	rec "$RUN_ON_PID"
 	CPID=""
 	for i in $(seq 1 100); do
 		CPID=$(find_comp || true)
@@ -255,6 +270,7 @@ start_comp() { # wrapper
 	done
 	if [ -z "$CPID" ] || ! alive "$CPID"; then echo "compositor did not come up: see $T/log.$$"; tail -5 "$T"/log.* || true; return 1; fi
 	rec "$CPID"
+	recc "$CPID"
 	if [ "$1" = 1 ] && [ "$LEG" = logout ]; then PIPE_INO=$(readlink "/proc/$CPID/fd/1" 2>/dev/null || true); echo "PROBE launcher pipe: $PIPE_INO"; fi
 	DISP=$(nested_display)
 	[ "$T/run" != "$LIVE_RT" ] || die "nested XDG_RUNTIME_DIR is the live one"
@@ -419,7 +435,7 @@ g3_stop() {
 	sleep 1
 	msg exec quit >/dev/null 2>&1 || true
 	sleep 2
-	if alive "$CPID"; then sigrec TERM "$CPID" || true; fi
+	if alive "$CPID"; then run_on_close "$CPID"; sigrec TERM "$CPID" || true; fi
 	sleep 0.5
 	cp "$T"/log.* "$OUT/logs/" 2>/dev/null || true
 	cp "$T/state/crucible-term/daemon.log" "$OUT/logs/$TAG.daemon.log" 2>/dev/null || true
@@ -449,6 +465,12 @@ bringup() {
 	for i in $(seq 1 40); do
 		DPID=$(daemon_pid || true)
 		wait_wrappers 0 1 && break
+	done
+	# the wrappers can appear before the daemon's "pid N listening" log line is readable (fast scratch-workspace start): re-read it
+	for i in $(seq 1 25); do
+		DPID=$(daemon_pid || true)
+		[ -z "$DPID" ] || break
+		sleep 0.2
 	done
 	echo "BRINGUP daemon=$DPID wrappers R1=$R1 R2=$R2 R3=$R3"
 	if [ -z "$R1" ] || [ -z "$R2" ] || [ -z "$R3" ]; then
@@ -695,6 +717,8 @@ if [ "$needs_display" = 1 ] && [ "${G3_SKIP_DISPLAY_CHECK:-0}" != 1 ]; then
 fi
 mkdir -p "$W"
 : >"$W/pids"
+: >"$W/comps"
+HARNESS_FAILED=0
 echo "g3.sh: crucible $("$BIN" --build) | cterm $("$CT" --version | head -1)"
 for leg in "${LEGS[@]}"; do
 	LEG=$leg
@@ -704,5 +728,11 @@ for leg in "${LEGS[@]}"; do
 	{
 		echo "=== RUN $RUN leg=$leg $(date -Is)"
 		"leg_$leg" || echo "LEG $leg run $RUN: harness failure"
-	} 2>&1 | tee -a "$OUT/g3-$leg.raw"
+	} 2>&1 | tee -a "$OUT/g3-$leg.raw" | awk '{ print; fflush() } /^HARNESS FAILURE/ || /^LEG .* harness failure$/ { bad = 1 } END { exit bad ? 7 : 0 }' || HARNESS_FAILED=1
 done
+# a HARNESS FAILURE / `LEG ... harness failure` line in any leg fails the run. The legs run in a pipeline subshell, so a variable set there is lost:
+# the pipeline status (awk exits 7, pipefail carries it) is the channel. An assertion FAIL stays a RESULT line and does not change the exit status.
+if [ "$HARNESS_FAILED" != 0 ]; then
+	echo "g3.sh: HARNESS FAILURE in at least one leg: exiting non-zero"
+	exit 1
+fi
