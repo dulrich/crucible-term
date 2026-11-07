@@ -99,6 +99,45 @@ impl Surf {
     }
 }
 
+/// The surface's scale: the compositor's fractional scale when the protocol is bound, else the
+/// integer `wl_output` scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Scale {
+    /// Fractional scale (1.0 until the first preferred-scale event).
+    Fractional(f64),
+    /// Integer `wl_output` scale, used only without fractional scale.
+    Integer(i32),
+}
+
+impl Scale {
+    /// The mode for a surface with (`true`) or without the fractional-scale protocol, keeping
+    /// the value when the mode is unchanged.
+    pub(super) fn for_surface(self, has_fractional: bool) -> Self {
+        match (self, has_fractional) {
+            (s @ Scale::Fractional(_), true) | (s @ Scale::Integer(_), false) => s,
+            (_, true) => Scale::Fractional(1.0),
+            (_, false) => Scale::Integer(1),
+        }
+    }
+
+    /// The scale the layout uses.
+    pub(super) fn effective(self) -> f64 {
+        match self {
+            Scale::Fractional(s) => s,
+            Scale::Integer(n) => f64::from(n),
+        }
+    }
+
+    /// The `wl_surface` buffer scale: the integer scale, 1 under fractional scale (the viewport
+    /// does the scaling).
+    pub(super) fn buffer_scale(self) -> i32 {
+        match self {
+            Scale::Fractional(_) => 1,
+            Scale::Integer(n) => n,
+        }
+    }
+}
+
 /// Per-window state: the session half (`Session`, PTY, pidfd and PTY sources, outbox, exit)
 /// plus an optional surface half ([`Surf`], `None` while detached).
 pub struct Term {
@@ -122,11 +161,8 @@ pub struct Term {
     pub(super) theme: Theme,
     /// Logical window size.
     pub(super) logical: (u32, u32),
-    /// Fractional scale (1.0 without the protocol).
-    pub(super) scale: f64,
-    /// Integer `wl_output` scale, used only without fractional scale.
-    pub(super) int_scale: i32,
-    pub(super) has_fractional: bool,
+    /// The surface's scale mode and value.
+    pub(super) scale: Scale,
     /// Buffer size in pixels.
     pub(super) buf: (u32, u32),
     pub(super) dirty: bool,
@@ -196,11 +232,7 @@ fn as_pixels(bytes: &mut [u8]) -> Option<&mut [u32]> {
 
 impl Term {
     pub(super) fn effective_scale(&self) -> f64 {
-        if self.has_fractional {
-            self.scale
-        } else {
-            f64::from(self.int_scale)
-        }
+        self.scale.effective()
     }
 
     pub(super) fn metrics(&self) -> Metrics {
@@ -395,7 +427,9 @@ impl Term {
             if let Some(vp) = &s.viewport {
                 vp.set_destination(self.logical.0 as i32, self.logical.1 as i32);
             } else {
-                s.window.wl_surface().set_buffer_scale(self.int_scale);
+                s.window
+                    .wl_surface()
+                    .set_buffer_scale(self.scale.buffer_scale());
             }
         }
         self.full = true;
@@ -675,7 +709,9 @@ impl Term {
             s.frame_pending = false;
         }
         if s.viewport.is_none() {
-            s.window.wl_surface().set_buffer_scale(self.int_scale);
+            s.window
+                .wl_surface()
+                .set_buffer_scale(self.scale.buffer_scale());
         }
         // The compositor releases the placeholder when the full-size buffer replaces it; sctk
         // defers its destroy until then and its slot returns to the host pool.
@@ -822,5 +858,21 @@ impl Term {
             s.teardown();
         }
         self.pty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scale;
+
+    #[test]
+    fn scale_values_and_mode_switch() {
+        assert_eq!(Scale::Fractional(1.5).effective(), 1.5);
+        assert_eq!(Scale::Fractional(1.5).buffer_scale(), 1);
+        assert_eq!(Scale::Integer(2).effective(), 2.0);
+        assert_eq!(Scale::Integer(2).buffer_scale(), 2);
+        assert_eq!(Scale::Integer(2).for_surface(false), Scale::Integer(2));
+        assert_eq!(Scale::Integer(2).for_surface(true), Scale::Fractional(1.0));
+        assert_eq!(Scale::Fractional(1.5).for_surface(false), Scale::Integer(1));
     }
 }

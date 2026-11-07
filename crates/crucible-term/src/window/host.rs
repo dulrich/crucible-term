@@ -11,7 +11,7 @@ use super::identity::generated::crucible_window_identity_v1::{
 use super::identity::{OpenSteps, open_in_order};
 use super::input::{self, SeatInput};
 use super::routing::{Routes, TermId};
-use super::term::{Surf, Term};
+use super::term::{Scale, Surf, Term};
 use super::{Config, WindowError, lifecycle, wl};
 use crate::font::FontPool;
 use crate::outbox::Outbox;
@@ -32,9 +32,7 @@ use smithay_client_toolkit::seat::pointer::ThemeSpec;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
-use smithay_client_toolkit::shell::xdg::window::{
-    Window, WindowConfigure, WindowDecorations, WindowHandler,
-};
+use smithay_client_toolkit::shell::xdg::window::{Window, WindowConfigure, WindowHandler};
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
@@ -56,6 +54,9 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
+
+mod steps;
+use steps::RealSteps;
 
 /// The connection-bound half of the host: registry, globals, seat, `Shm` and the identity
 /// manager, plus the connection's calloop source. Dropped whole when the connection is lost
@@ -164,54 +165,6 @@ pub fn run(
         host.reap();
     }
     Ok(host.exits.get(&id).copied().unwrap_or(0))
-}
-
-/// The real proxy layer behind [`open_in_order`].
-struct RealSteps<'a> {
-    wl: &'a Wl,
-    id: TermId,
-    spec: Option<SpawnSpec>,
-    viewport: Option<WpViewport>,
-    fractional: Option<WpFractionalScaleV1>,
-    surface_id: Option<ObjectId>,
-}
-
-impl OpenSteps for RealSteps<'_> {
-    type Pty = Pty;
-    type Surface = wl_surface::WlSurface;
-    type Role = smithay_client_toolkit::shell::xdg::window::Window;
-    type Err = crucible_term_core::pty::PtyError;
-
-    fn spawn(&mut self) -> Result<(Pty, u32), Self::Err> {
-        let spec = self.spec.take().expect("spawn once");
-        let pty = Pty::spawn(&spec)?;
-        let pid = pty.pid();
-        Ok((pty, pid))
-    }
-
-    fn create_surface(&mut self) -> Self::Surface {
-        let w = self.wl;
-        let qh = &w.qh;
-        let surface = w.compositor.create_surface(qh);
-        if let (Some(vp), Some(fm)) = (&w.viewporter, &w.fractional_mgr) {
-            self.viewport = Some(vp.get_viewport(&surface, qh, ()));
-            self.fractional = Some(fm.get_fractional_scale(&surface, qh, self.id));
-        }
-        surface
-    }
-
-    fn bind_surface(&mut self, surface: &Self::Surface, grant: &str, root_pid: u32) {
-        if let Some(m) = &self.wl.identity {
-            m.bind_surface(surface, grant.to_owned(), root_pid, &self.wl.qh, ());
-        }
-    }
-
-    fn create_role(&mut self, surface: Self::Surface) -> Self::Role {
-        self.surface_id = Some(surface.id());
-        self.wl
-            .xdg
-            .create_window(surface, WindowDecorations::RequestServer, &self.wl.qh)
-    }
 }
 
 impl Dispatch<CrucibleWindowIdentityManagerV1, ()> for Host {
@@ -444,30 +397,47 @@ impl Host {
             surface_id,
             ..
         } = steps;
-        let surface_id = surface_id.expect("role step ran");
-        window.set_title(cfg.title.clone());
-        window.set_app_id(cfg.app_id.clone());
-        window.commit();
         let pty = match early_pty {
             Some(pty) => pty,
             None => Pty::spawn(&spec.expect("spawn spec unused")).map_err(WindowError::Pty)?,
         };
         let mut term = self.new_session(id, cfg, pty)?;
-        let shm = &self.wl.as_ref().expect("connected above").shm;
-        let pool =
-            SlotPool::new((term.logical.0 * term.logical.1 * 4) as usize, shm).map_err(wl)?;
-        term.has_fractional = fractional.is_some();
-        term.surf = Some(Surf::new(
-            pool,
+        Self::bind_surface(
+            self.wl.as_ref().expect("connected above"),
+            &mut self.routes,
+            &mut term,
             window,
             viewport,
             fractional,
-            self.wl.as_ref().expect("connected above").qh.clone(),
-        ));
+            surface_id.expect("role step ran"),
+        )?;
         let root_pid = term.pty.pid();
-        self.routes.insert(surface_id, id);
         self.terms.insert(id, term);
         Ok((id, root_pid))
+    }
+
+    /// Bind the freshly created toplevel `window` (and its viewport / fractional-scale objects)
+    /// to the surface-less `term`: title, app id, first commit, the shm pool sized from
+    /// `term.logical`, the scale mode and the route from `surface_id`. Shared by
+    /// [`Host::open_window`] and [`Host::attach`].
+    fn bind_surface(
+        w: &Wl,
+        routes: &mut Routes<ObjectId>,
+        term: &mut Term,
+        window: Window,
+        viewport: Option<WpViewport>,
+        fractional: Option<WpFractionalScaleV1>,
+        surface_id: ObjectId,
+    ) -> Result<(), WindowError> {
+        window.set_title(term.cfg.title.clone());
+        window.set_app_id(term.cfg.app_id.clone());
+        window.commit();
+        let pool =
+            SlotPool::new((term.logical.0 * term.logical.1 * 4) as usize, &w.shm).map_err(wl)?;
+        term.scale = term.scale.for_surface(fractional.is_some());
+        term.surf = Some(Surf::new(pool, window, viewport, fractional, w.qh.clone()));
+        routes.insert(surface_id, term.id);
+        Ok(())
     }
 
     /// The session half of window `id` on `pty`: the PTY and pidfd sources and the `Session`,
@@ -542,9 +512,7 @@ impl Host {
             fonts,
             theme: cfg.settings.theme.clone(),
             logical,
-            scale: 1.0,
-            int_scale: 1,
-            has_fractional: false,
+            scale: Scale::Integer(1),
             buf: (0, 0),
             dirty: false,
             full: true,
@@ -582,8 +550,6 @@ impl Host {
     /// loss), binding the window identity with `grant` when the global is advertised. Returns
     /// the session's root pid. The session's grid and scrollback carry over; the new surface
     /// repaints in full on its first configure.
-    // WP-2 wires this to the keyed `open`; nothing calls it yet outside tests.
-    #[allow(dead_code)]
     pub(crate) fn attach(&mut self, id: TermId, grant: Option<String>) -> Result<u32, WindowError> {
         let w = self
             .wl
@@ -617,17 +583,19 @@ impl Host {
             surface_id,
             ..
         } = steps;
-        window.set_title(t.cfg.title.clone());
-        window.set_app_id(t.cfg.app_id.clone());
-        window.commit();
-        let pool = SlotPool::new((t.logical.0 * t.logical.1 * 4) as usize, &w.shm).map_err(wl)?;
-        t.has_fractional = fractional.is_some();
-        t.surf = Some(Surf::new(pool, window, viewport, fractional, w.qh.clone()));
+        Self::bind_surface(
+            w,
+            &mut self.routes,
+            t,
+            window,
+            viewport,
+            fractional,
+            surface_id.expect("role step ran"),
+        )?;
         t.buf = (0, 0);
         t.full = true;
         t.dirty = true;
         t.focused = true;
-        self.routes.insert(surface_id.expect("role step ran"), id);
         Ok(root_pid)
     }
 
@@ -723,8 +691,10 @@ impl CompositorHandler for Host {
         let Some(t) = self.terms.get_mut(&id) else {
             return;
         };
-        if !t.has_fractional && factor != t.int_scale {
-            t.int_scale = factor.max(1);
+        if let Scale::Integer(cur) = t.scale
+            && factor != cur
+        {
+            t.scale = Scale::Integer(factor.max(1));
             t.relayout(&mut self.fonts);
         }
     }
@@ -983,8 +953,11 @@ impl Dispatch<WpFractionalScaleV1, TermId> for Host {
                 return;
             };
             let s = f64::from(scale) / 120.0;
-            if (s - t.scale).abs() > f64::EPSILON {
-                t.scale = s;
+            // A fractional-scale object exists only on a fractional surface.
+            if let Scale::Fractional(cur) = t.scale
+                && (s - cur).abs() > f64::EPSILON
+            {
+                t.scale = Scale::Fractional(s);
                 t.relayout(&mut host.fonts);
             }
         }
@@ -1002,195 +975,4 @@ delegate_registry!(Host);
 /// The detach path without a compositor: a [`Host`] whose Wayland half is absent owns sessions
 /// exactly as a detached daemon does.
 #[cfg(test)]
-mod detached_tests {
-    use super::*;
-    use std::time::Instant;
-
-    fn host(detachable: bool, display: Option<PathBuf>) -> (EventLoop<'static, Host>, Host) {
-        let ev: EventLoop<Host> = EventLoop::try_new().expect("event loop");
-        let h = Host::detached(ev.handle(), detachable, display);
-        (ev, h)
-    }
-
-    /// Stands in for sctk's keyboard `RepeatData`: its `Drop` removes another loop source.
-    struct RemovesOnDrop(LoopHandle<'static, Host>, Option<RegistrationToken>);
-    impl Drop for RemovesOnDrop {
-        fn drop(&mut self) {
-            if let Some(t) = self.1.take() {
-                self.0.remove(t);
-            }
-        }
-    }
-
-    /// A source whose callback owns a [`RemovesOnDrop`] guarding a second timer.
-    fn guarded(
-        h: &Host,
-    ) -> (
-        Timer,
-        impl FnMut(Instant, &mut (), &mut Host) -> TimeoutAction + use<>,
-    ) {
-        let repeat = h
-            .handle
-            .insert_source(Timer::from_duration(Duration::from_secs(60)), |_, _, _| {
-                TimeoutAction::Drop
-            })
-            .expect("repeat timer");
-        let guard = RemovesOnDrop(h.handle.clone(), Some(repeat));
-        let source = Timer::from_duration(Duration::from_secs(60));
-        (source, move |_, _, _| {
-            let _ = &guard;
-            TimeoutAction::Drop
-        })
-    }
-
-    /// The live-session logout panic: removing a source by token alone drops it inside
-    /// `LoopHandle::remove`, and a `Drop` that removes another source panics.
-    #[test]
-    #[should_panic(expected = "already borrowed")]
-    fn removing_by_token_drops_the_source_inside_remove() {
-        let (_ev, h) = host(true, None);
-        let (source, cb) = guarded(&h);
-        let token = h.handle.insert_source(source, cb).expect("insert");
-        h.handle.remove(token);
-    }
-
-    /// [`Registered::remove`] drops the source after `remove` returns, so the nested remove
-    /// (sctk's armed key-repeat timer) runs without a panic.
-    #[test]
-    fn registered_remove_drops_the_source_after_unregistering() {
-        let (mut ev, mut h) = host(true, None);
-        let (source, cb) = guarded(&h);
-        let reg = Registered::insert(&h.handle, source, cb).expect("insert");
-        reg.remove(&h.handle);
-        ev.dispatch(Some(Duration::ZERO), &mut h)
-            .expect("loop still usable");
-    }
-
-    /// A surface-less session on `sh -c script`, as a detached daemon holds it.
-    fn spawn(h: &mut Host, script: &str) -> TermId {
-        let cfg = Config::default();
-        let pty = Pty::spawn(&SpawnSpec {
-            argv: vec!["sh".into(), "-c".into(), script.into()],
-            cwd: cfg.cwd.clone(),
-            env: vec![("PATH".into(), std::env::var_os("PATH").unwrap_or_default())],
-            size: (cfg.cols, cfg.rows),
-        })
-        .expect("spawn");
-        let id = TermId(h.next_id);
-        h.next_id += 1;
-        let t = h.new_session(id, &cfg, pty).expect("session");
-        h.terms.insert(id, t);
-        id
-    }
-
-    /// Dispatch until `id`'s exit is recorded (or `within` passes); returns it.
-    fn run_until_exit(
-        ev: &mut EventLoop<'static, Host>,
-        h: &mut Host,
-        id: TermId,
-        within: Duration,
-    ) -> Option<i32> {
-        let t0 = Instant::now();
-        while t0.elapsed() < within {
-            ev.dispatch(Some(Duration::from_millis(50)), h)
-                .expect("dispatch");
-            h.reap();
-            if let Some(c) = h.exits.get(&id) {
-                return Some(*c);
-            }
-        }
-        None
-    }
-
-    /// A loss keeps every session: the PTY sources stay registered, the `Session` stays, and
-    /// the session reports detached; the host is lost until a reconnect.
-    #[test]
-    fn a_session_survives_a_loss() {
-        let (mut ev, mut h) = host(true, None);
-        let id = spawn(&mut h, "printf ready; exec cat");
-        assert!(h.detach(), "daemon mode detaches");
-        assert!(h.is_lost() && h.is_detached(id));
-        for _ in 0..5 {
-            ev.dispatch(Some(Duration::from_millis(20)), &mut h)
-                .unwrap();
-            h.reap();
-        }
-        let t = h.terms.get(&id).expect("session kept");
-        assert!(t.exit.is_none() && t.surf.is_none());
-        assert_eq!(t.sources.len(), 2, "PTY and pidfd sources kept");
-        // Cleanup: the session closes through the grace (our own child).
-        h.close(id);
-        h.reap();
-        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
-    }
-
-    /// Detached, the session keeps draining and parsing its PTY: a 4 MiB writer completes (it
-    /// would block forever on a full PTY) and its exit code is recorded for the relay.
-    #[test]
-    fn a_detached_session_drains_a_flooding_child_and_records_its_exit() {
-        let (mut ev, mut h) = host(true, None);
-        let id = spawn(&mut h, "head -c 4194304 /dev/zero | tr '\\0' x; exit 7");
-        assert!(h.detach());
-        assert_eq!(
-            run_until_exit(&mut ev, &mut h, id, Duration::from_secs(30)),
-            Some(7)
-        );
-        assert!(h.terms.is_empty(), "the exited session is removed");
-    }
-
-    /// Standalone never detaches: the loss ends the loop and nothing is dropped.
-    #[test]
-    fn standalone_does_not_detach() {
-        let (mut ev, mut h) = host(false, None);
-        let id = spawn(&mut h, "exec cat");
-        assert!(!h.detach(), "standalone: the loss is the loop error");
-        assert!(h.terms.contains_key(&id));
-        h.close(id);
-        h.reap();
-        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
-    }
-
-    /// Reconnect targets the captured display only; an unreachable one leaves the host lost,
-    /// and an attach while lost is refused without touching the session.
-    #[test]
-    fn reconnect_to_a_missing_display_stays_detached() {
-        let gone = std::env::temp_dir().join(format!("cterm-no-display-{}", std::process::id()));
-        let (mut ev, mut h) = host(true, Some(gone));
-        let id = spawn(&mut h, "exec cat");
-        assert!(!h.reconnect());
-        assert!(h.is_lost());
-        assert!(h.attach(id, None).is_err());
-        assert!(h.is_detached(id));
-        h.close(id);
-        h.reap();
-        assert!(run_until_exit(&mut ev, &mut h, id, Duration::from_secs(5)).is_some());
-    }
-
-    #[test]
-    fn display_path_follows_libwayland() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| {
-                pairs
-                    .iter()
-                    .find(|(n, _)| *n == k)
-                    .map(|(_, v)| OsString::from(v))
-            }
-        };
-        assert_eq!(
-            display_path(&env(&[
-                ("XDG_RUNTIME_DIR", "/run/u"),
-                ("WAYLAND_DISPLAY", "w-1")
-            ])),
-            Some(PathBuf::from("/run/u/w-1"))
-        );
-        assert_eq!(
-            display_path(&env(&[("XDG_RUNTIME_DIR", "/run/u")])),
-            Some(PathBuf::from("/run/u/wayland-0"))
-        );
-        assert_eq!(
-            display_path(&env(&[("WAYLAND_DISPLAY", "/abs/w")])),
-            Some(PathBuf::from("/abs/w"))
-        );
-        assert_eq!(display_path(&env(&[("WAYLAND_DISPLAY", "w")])), None);
-    }
-}
+mod tests;
