@@ -29,6 +29,7 @@ font (font files, fontconfig caches), file_other; plus the shell child's PSS and
 `sleep` as the thin-client anon baseline. Prints RUN/SPLIT/MEMHOOK lines and writes them to target/g2/spike-mem.out (target/g2/spike-mem-<subjects>.out when not just `cterm`).
 Scratch lives in /tmp/cde-g2 (removed at exit). Only pids recorded by this script are ever signalled.
 
+Environment: CDE (the crucible-dev-env checkout; default: crucible-dev-env beside this repo; the harness exits before launching anything if it is absent).
 Environment (defaults): G2_CRUCIBLE (crucible-dev-env/target/release/crucible), G2_CT (target/release/cterm),
 G2_GAP (10), G2_PARENT_WL (/run/user/1001/wayland-1), G2_RUNS (3), G2_SETTLE_S (4), G2_FOOT, G2_FOOT_INI, G2_WLDEBUG (0), G2_CT_ENV (extra env words for cterm, e.g. CTERM_DEBUG_MEM=1 CTERM_DEBUG_FRAME_SUM=1), G2_TOP (1: print the 6 largest anon mappings per window as ANONTOP lines).
 Bash reasons: process substitution, trap cleanup, BASH_SOURCE.
@@ -47,7 +48,8 @@ for s in "${SUBJECTS[@]}"; do case $s in cterm | foot) ;; *) usage >&2; exit 2 ;
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
-CDE=crucible-dev-env
+CDE=${CDE:-$R/../crucible-dev-env}
+[ -d "$CDE" ] || { echo "HARNESS FAILURE: CDE checkout not found: $CDE (set CDE to a crucible-dev-env checkout)" >&2; exit 1; }
 BIN=${G2_CRUCIBLE:-$CDE/target/release/crucible}
 CT=${G2_CT:-$R/target/release/cterm}
 GAP=${G2_GAP:-10}

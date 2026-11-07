@@ -7,7 +7,7 @@ version = "0.4.4"
 edition = "2024"
 license = "MIT"
 authors = ["David Ulrich <david@ulrichdev.com>"]
-repository = ""
+repository = "https://github.com/dulrich/crucible-term"
 rust-version = "1.85"
 
 # Shared dependency versions. Crates opt in via `dep.workspace = true`.

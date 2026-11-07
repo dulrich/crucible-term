@@ -22,6 +22,7 @@ Measure each subject (`crucible-term`, `foot`), back-to-back in the order given,
 Scratch lives in /tmp/cde-g1-<subject> (removed at exit); artifacts under target/g1/. Only pids recorded by this
 script are ever signalled; nothing is started on the live focused workspace.
 
+Environment: CDE (the crucible-dev-env checkout; default: crucible-dev-env beside this repo; the harness exits before launching anything if it is absent).
 Environment (defaults): G1_CRUCIBLE (crucible-dev-env/target/release/crucible), G1_CT (target/release/cterm),
 G1_FOOT (~/.local/bin/foot), G1_FOOT_INI (~/.config/foot/foot.ini), G1_CORPUS (crucible-dev-env/target/spike-core/corpus),
 G1_GAP (10), G1_PARENT_WL (/run/user/1001/wayland-1), G1_RUNS (5), G1_IDLE_S (60), G1_WAIT_S (120, per throughput run).
@@ -43,7 +44,8 @@ done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
-CDE=crucible-dev-env
+CDE=${CDE:-$R/../crucible-dev-env}
+[ -d "$CDE" ] || { echo "HARNESS FAILURE: CDE checkout not found: $CDE (set CDE to a crucible-dev-env checkout)" >&2; exit 1; }
 BIN=${G1_CRUCIBLE:-$CDE/target/release/crucible}
 CT=${G1_CT:-$R/target/release/cterm}
 FOOT=${G1_FOOT:-$HOME/.local/bin/foot}

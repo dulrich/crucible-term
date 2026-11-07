@@ -42,6 +42,7 @@ Only pids this script recorded (with their start time) are ever signalled, with 
 
 Output: raw lines in target/g3/g3-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g3/logs/.
 Each assertion prints `RESULT leg=L run=N assert=A PASS|FAIL|UNMEASURED :: detail`; COND lines record load and PSI at start and end.
+Environment: CDE (the crucible-dev-env checkout; default: crucible-dev-env beside this repo; the harness exits before launching anything if it is absent).
 Environment (defaults): G3_CRUCIBLE (crucible-dev-env/target/release/crucible), G3_CT (target/release/cterm), G3_PARENT_WL (/run/user/1001/wayland-1),
 G3_GAP (10), G3_WAIT_S (10), G3_RESTORE_WAIT_S (40), G3_OUT (target/g3), G3_CPU_PSI_MAX (5), G3_CPU_PSI_WAIT_S (60), G3_WAIT_DISPLAY_S (0),
 G3_SKIP_DISPLAY_CHECK (0), G3_RUN (run number; default the count of earlier runs in the leg raw file + 1).
@@ -64,7 +65,8 @@ done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
-CDE=crucible-dev-env
+CDE=${CDE:-$R/../crucible-dev-env}
+[ -d "$CDE" ] || { echo "HARNESS FAILURE: CDE checkout not found: $CDE (set CDE to a crucible-dev-env checkout)" >&2; exit 1; }
 BIN=${G3_CRUCIBLE:-$CDE/target/release/crucible}
 CT=${G3_CT:-$R/target/release/cterm}
 PARENT_WL=${G3_PARENT_WL:-/run/user/1001/wayland-1}

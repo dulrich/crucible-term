@@ -12,7 +12,7 @@ crucible-term uses pre-1.0 semantic versioning: a breaking change to the config 
 
 ### Added
 
-- `scripts/g3/g3.sh logout` models the launcher pipe. The compositor's output goes into a FIFO, and the new `eof` assertion requires EOF within 5 s of the quit while the thin clients are still alive. See `docs/g3-measurement.md`, addendum 2026-11-06.
+- `scripts/g3/g3.sh logout` models the launcher pipe. The compositor's output goes into a FIFO, and the new `eof` assertion requires EOF within 5 s of the quit while the thin clients are still alive.
 
 ## 0.4.3 — 2026-11-06
 
@@ -28,7 +28,7 @@ crucible-term uses pre-1.0 semantic versioning: a breaking change to the config 
 
 ### Added
 
-- `scripts/g3/g3.sh logout`: the restart leg done the way a real logout does it (thin clients hung up, clean compositor quit). See `docs/g3-measurement.md`, addendum.
+- `scripts/g3/g3.sh logout`: the restart leg done the way a real logout does it (thin clients hung up, clean compositor quit).
 
 ## 0.4.1 — 2026-11-06
 
@@ -52,7 +52,7 @@ crucible-term uses pre-1.0 semantic versioning: a breaking change to the config 
 
 ### G3
 
-- Measured in `docs/g3-measurement.md`: pass, 2 of 2 runs per leg. After a daemon SIGKILL or SIGSEGV, no workspace entries are lost and lost placeholders show in their original slots. After a compositor restart, the live shells reattach. Harness note: Rust's runtime swallows the first SIGSEGV, so the harness sends a second one.
+- Measured: pass, 2 of 2 runs per leg. After a daemon SIGKILL or SIGSEGV, no workspace entries are lost and lost placeholders show in their original slots. After a compositor restart, the live shells reattach. Harness note: Rust's runtime swallows the first SIGSEGV, so the harness sends a second one.
 
 ## 0.3.0 — 2026-11-05
 
@@ -70,17 +70,17 @@ crucible-term uses pre-1.0 semantic versioning: a breaking change to the config 
 
 ### G2
 
-- Measured in `docs/g2-measurement.md` § G2 result. Passes: reversed-arrival (unit and end to end), standalone window ≤ foot + 10% (+8.6%), hidden-window marginal ≤ 10 MiB (6.97 MiB), re-show content checksums. **Fails**: a visible daemon window is foot + 11.9% (limit + 5%), and warm-daemon first frame is 81.3 ms against G1's 64.2 ms (though below same-batch standalone's 149.9 ms). Per the plan, `mode` stays `standalone` and the user decides whether phase 3 proceeds.
+- Measured (G2 result). Passes: reversed-arrival (unit and end to end), standalone window ≤ foot + 10% (+8.6%), hidden-window marginal ≤ 10 MiB (6.97 MiB), re-show content checksums. **Fails**: a visible daemon window is foot + 11.9% (limit + 5%), and warm-daemon first frame is 81.3 ms against G1's 64.2 ms (though below same-batch standalone's 149.9 ms). Per the plan, `mode` stays `standalone` and the user decides whether phase 3 proceeds.
 
 ## 0.2.0 — 2026-11-05
 
 ### Changed
 
-- The executable is now `cterm` (the crate and project stay `crucible-term`; the config path, app id and stderr prefix are unchanged). `--help` and `--version` name `cterm`. `scripts/deploy.sh` installs `~/.local/bin/cterm` and removes a binary left under the old name. A CDE config pointing at `crucible-term` must point at `cterm` instead.
+- The executable is now `cterm` (the crate and project stay `crucible-term`; the config path, app id and stderr prefix are unchanged). `--help` and `--version` name `cterm`. The install step puts the binary at `~/.local/bin/cterm` and removes a binary left under the old name. A CDE config pointing at `crucible-term` must point at `cterm` instead.
 
 ### Added
 
-- Launcher entry `share/cterm.desktop` (`Categories=System;TerminalEmulator;`), installed by `scripts/deploy.sh` into `~/.local/share/applications`, so CDE's program launcher (`Super+Return`) lists `cterm` as a TERM row.
+- Launcher entry `share/cterm.desktop` (`Categories=System;TerminalEmulator;`), installed into `~/.local/share/applications`, so CDE's program launcher (`Super+Return`) lists `cterm` as a TERM row.
 
 ### G1
 
@@ -96,7 +96,7 @@ crucible-term uses pre-1.0 semantic versioning: a breaking change to the config 
 - Selection (word, line, block) into the primary selection with middle-click paste; clipboard copy/paste on `Ctrl+Shift+C`/`Ctrl+Shift+V`; OSC 52 write while focused; scrollback viewport on `Shift+PageUp/PageDown`, `Shift+Home/End` and the wheel.
 - KDL config at `$XDG_CONFIG_HOME/crucible-term/config.kdl` (font, colours and palette, alpha, scrollback, padding, cursor); a broken file falls back to defaults.
 - CLI contract for CDE: `-e`, `--working-directory`, `-o key=value` with foot-compatible aliases (`pad=<x>x<y> center`, `font=<family>:size=<n>`, `colors-dark.*`), `--app-id`, `--title`; the shell's exit status is the process exit status; child exit detected through a pidfd.
-- `scripts/deploy.sh <host-a|host-b|all>` and the G1 measurement harness `scripts/g1/` with its results in `docs/g1-measurement.md`.
+- A deploy script and the G1 measurement harness `scripts/g1/`.
 
 ### Known gaps
 

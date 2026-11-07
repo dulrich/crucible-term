@@ -41,6 +41,7 @@ Re-measurement (2026-11-05): G2_OUT=target/g2/remeasure G2_FF_SUBJECTS="foot-wl 
   Conditions: every nested session records COND lines (date, /proc/loadavg, PSI cpu/memory/io some avg10,avg60, live outputs enabled/dpms/preferred mode) at start and end into the leg raw file, and waits up to G2_CPU_PSI_WAIT_S (60) for CPU PSI avg10 <= G2_CPU_PSI_MAX (5) first (COND_WAIT line).
 
 Output: raw lines in target/g2/g2-<leg>.raw (appended per run; delete to start over) and per-session logs in target/g2/logs/.
+Environment: CDE (the crucible-dev-env checkout; default: crucible-dev-env beside this repo; the harness exits before launching anything if it is absent).
 Environment (defaults): G2_CRUCIBLE (crucible-dev-env/target/release/crucible), G2_CT (target/release/cterm), G2_FOOT (~/.local/bin/foot),
 G2_FOOT_INI (~/.config/foot/foot.ini), G2_PARENT_WL (/run/user/1001/wayland-1), G2_GAP (10), G2_BATCHES (3), G2_SETTLE_S (4), G2_FF_RUNS (5),
 G2_N_LO (5), G2_N_HI (20), G2_IDLE_S (60), G2_DELAY_MS (800), G2_BLINK (true; false disables cursor blink in the reshow leg), G2_WAIT_S (120).
@@ -64,7 +65,8 @@ done
 
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
 R=$(cd "$HERE/../.." && pwd -P)
-CDE=crucible-dev-env
+CDE=${CDE:-$R/../crucible-dev-env}
+[ -d "$CDE" ] || { echo "HARNESS FAILURE: CDE checkout not found: $CDE (set CDE to a crucible-dev-env checkout)" >&2; exit 1; }
 BIN=${G2_CRUCIBLE:-$CDE/target/release/crucible}
 CT=${G2_CT:-$R/target/release/cterm}
 FOOT=$(readlink -f "${G2_FOOT:-$HOME/.local/bin/foot}")

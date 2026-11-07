@@ -70,14 +70,14 @@ A broken file never stops the terminal: each problem prints one `crucible-term: 
 
 ## Using it from CDE
 
-CDE spawns the terminal directly (no shell) as `[terminal, <terminal-args…>, <exec-flag>, <cmd…>]` and sets the working directory itself. In `the private config repo/cde/config-<host>.kdl`:
+CDE spawns the terminal directly (no shell) as `[terminal, <terminal-args…>, <exec-flag>, <cmd…>]` and sets the working directory itself. In your CDE config:
 
 ```kdl
-terminal "~/.local/bin/cterm" exec-flag="-e"
+terminal "/path/to/cterm" exec-flag="-e"
 ```
 
 with the existing `terminal-args "-o" "pad={gap}x{gap} center"` unchanged. Switching CDE to cterm is the user's decision.
 
-## Deploy
+## Install
 
-`scripts/deploy.sh <host-a|host-b|all>` builds the release binary, installs `~/.local/bin/cterm` (keeping `cterm.prev`, and removing a binary left under the old name `crucible-term`), installs the launcher entry `share/cterm.desktop` into `~/.local/share/applications` (CDE's `Super+Return` launcher lists it as a TERM row), syncs the other host by git bundle (a first deploy clones the repo there), and prints `RESULT: <host> cterm <version> (<build-id>)`. It never pushes and never restarts CDE.
+Build with `cargo build --release`, then install the binary as `cterm` (for example `~/.local/bin/cterm`) and the launcher entry `share/cterm.desktop` into `~/.local/share/applications` (CDE's `Super+Return` launcher lists it as a TERM row). A binary left under the old name `crucible-term` can be removed.
