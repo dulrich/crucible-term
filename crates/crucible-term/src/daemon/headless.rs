@@ -10,7 +10,7 @@
 //! a real loss), and `CTERM_DEBUG_HEADLESS_RECONNECT_MS=M` makes the display reachable again M
 //! ms after the loss (unset: never).
 
-use super::Backend;
+use super::{Backend, TermId};
 use crate::session_life;
 use crucible_term_core::pty::{Pty, SpawnSpec, exit_code};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
@@ -45,8 +45,8 @@ struct Kid {
 pub struct Headless {
     handle: LoopHandle<'static, Headless>,
     next: u64,
-    kids: BTreeMap<u64, Kid>,
-    exits: Vec<(u64, i32)>,
+    kids: BTreeMap<TermId, Kid>,
+    exits: Vec<(TermId, i32)>,
     /// Children in their close grace.
     closing: usize,
     /// The fake connection's source, while connected.
@@ -120,7 +120,7 @@ impl Headless {
 }
 
 /// The child of session `id` is gone (pidfd or PTY EOF): reap it and record its code.
-fn child_gone(h: &mut Headless, id: u64) {
+fn child_gone(h: &mut Headless, id: TermId) {
     if let Some(k) = h.kids.get_mut(&id).filter(|k| k.exit.is_none()) {
         k.exit = Some(k.pty.wait().map(exit_code).unwrap_or(1));
     }
@@ -136,7 +136,7 @@ impl Backend for Headless {
         argv: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
         _grant: Option<String>,
-    ) -> Result<(u64, u32), String> {
+    ) -> Result<(TermId, u32), String> {
         if self.is_lost() {
             return Err("no Wayland connection".into());
         }
@@ -147,7 +147,7 @@ impl Backend for Headless {
             size: (cfg.cols, cfg.rows),
         })
         .map_err(|e| format!("pty: {e}"))?;
-        let id = self.next;
+        let id = TermId(self.next);
         self.next += 1;
         let pid = pty.pid();
         let mut master = pty.master().try_clone().map_err(|e| e.to_string())?;
@@ -193,7 +193,7 @@ impl Backend for Headless {
         Ok((id, pid))
     }
 
-    fn close(&mut self, id: u64) {
+    fn close(&mut self, id: TermId) {
         let Some(k) = self.kids.remove(&id) else {
             return;
         };
@@ -216,7 +216,7 @@ impl Backend for Headless {
     }
 
     fn reap(&mut self) {
-        let done: Vec<u64> = self
+        let done: Vec<TermId> = self
             .kids
             .iter()
             .filter(|(_, k)| k.exit.is_some())
@@ -232,7 +232,7 @@ impl Backend for Headless {
         }
     }
 
-    fn drain_exits(&mut self) -> Vec<(u64, i32)> {
+    fn drain_exits(&mut self) -> Vec<(TermId, i32)> {
         std::mem::take(&mut self.exits)
     }
 
@@ -272,11 +272,11 @@ impl Backend for Headless {
         false
     }
 
-    fn is_detached(&self, id: u64) -> bool {
+    fn is_detached(&self, id: TermId) -> bool {
         self.kids.get(&id).is_some_and(|k| !k.attached)
     }
 
-    fn attach(&mut self, id: u64, _grant: Option<String>) -> Result<u32, String> {
+    fn attach(&mut self, id: TermId, _grant: Option<String>) -> Result<u32, String> {
         if self.is_lost() {
             return Err("no Wayland connection".into());
         }
