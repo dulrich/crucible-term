@@ -904,7 +904,10 @@ fn serve<B: Backend>(
             eprintln!("crucible-term: daemon: {e}; detached, reconnecting");
             arm_reconnect(&handle);
         }
-        if let Some(sig) = state.borrow().shutdown {
+        // Read the flag into a local: an `if let` scrutinee's `Ref` would live through the body
+        // and the `borrow_mut` below would panic.
+        let shutdown = state.borrow().shutdown;
+        if let Some(sig) = shutdown {
             let name = if sig == libc::SIGHUP {
                 "SIGHUP"
             } else {

@@ -756,6 +756,9 @@ fn sigterm_keeps_the_record_and_the_next_keyed_open_replays_it() {
         "{}",
         e.log()
     );
+    // The shutdown save itself completed (not just the periodic save before it), with no panic.
+    assert!(e.log().contains("records saved for"), "{}", e.log());
+    assert!(!e.log().contains("panicked"), "{}", e.log());
     std::thread::sleep(Duration::from_millis(1200));
     assert!(
         e.record_text().contains("OLD-HISTORY"),
