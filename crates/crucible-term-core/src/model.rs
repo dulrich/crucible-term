@@ -155,7 +155,8 @@ pub enum Event {
         /// The decoded text.
         text: String,
     },
-    /// OSC 52 asked to read the selection. Not answered in WP-1 (policy is WP-3's).
+    /// OSC 52 asked to read the selection. Policy belongs to the caller (crucible-term's
+    /// `clipboard::osc52_policy`), which never answers it.
     ClipboardLoad {
         /// True for the primary selection.
         primary: bool,
