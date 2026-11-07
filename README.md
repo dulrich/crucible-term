@@ -2,7 +2,7 @@
 
 The terminal for Crucible Dev Env (CDE): a Rust Wayland terminal built on the rio-vt core, with a fast CPU renderer and light resource use. It is designed to grow into a per-user daemon whose sessions survive window loss and can be attached to from other hosts.
 
-The executable is `cterm` (the crate and project are `crucible-term`). The current release is 0.4.4. It runs either as a standalone per-window terminal or as a thin client of a per-user daemon that owns every PTY, and its sessions survive a lost Wayland connection and reattach. Multi-host attachment over ssh is not built yet. Release history is in [`CHANGELOG.md`](CHANGELOG.md).
+The executable is `cterm` (the crate and project are `crucible-term`). The current release is 0.5.0. It runs either as a standalone per-window terminal or as a thin client of a per-user daemon that owns every PTY, and its sessions survive a lost Wayland connection and reattach. Multi-host attachment over ssh is not built yet. Release history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Usage
 
