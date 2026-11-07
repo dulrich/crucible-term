@@ -16,8 +16,9 @@ pub mod headless;
 pub mod paths;
 mod state;
 
-use crate::client::{GRANT_VAR, SESSION_VAR, strip_grant};
+use crate::client::{GRANT_VAR, SESSION_VAR};
 use crate::config;
+use crate::spawn_env::strip_cde_vars;
 use crate::window::identity;
 use crate::window::{self, Host, TermId};
 use crate::wire::{self, Msg, Open};
@@ -158,27 +159,15 @@ fn take_delay(slot: &mut Option<Duration>, granted: bool) -> Option<Duration> {
 /// names, the client's overrides on top, then its cwd, app id and title.
 fn open_config(o: &Open) -> window::Config {
     let lookup = |k: &str| o.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-    let path = config::config_path(&lookup);
-    let (settings, warnings) = config::load(
-        path.as_deref(),
-        &|p| std::fs::read_to_string(p),
-        &o.overrides,
-    );
-    for w in warnings {
-        eprintln!("{w}");
-    }
-    let mut cfg = window::Config {
-        settings,
-        cwd: o.cwd.clone(),
-        ..window::Config::default()
-    };
-    if let Some(id) = &o.app_id {
-        cfg.app_id = id.clone();
-    }
-    if let Some(t) = &o.title {
-        cfg.title = t.clone();
-    }
-    cfg
+    config::window_config(
+        &lookup,
+        config::Spawn {
+            overrides: &o.overrides,
+            cwd: o.cwd.clone(),
+            app_id: o.app_id.as_deref(),
+            title: o.title.as_deref(),
+        },
+    )
 }
 
 /// Run an accepted `open`: build the config, open the window, answer the client.
@@ -186,7 +175,7 @@ fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: b
     let cfg = open_config(&o);
     let grant = if granted { o.grant } else { None };
     let key = o.session_key;
-    match b.open(&cfg, o.argv, strip_grant(o.env), grant) {
+    match b.open(&cfg, o.argv, strip_cde_vars(o.env), grant) {
         Ok((id, root_pid)) => {
             let mut rec = SessionRec {
                 conn: Some(conn),

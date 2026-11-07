@@ -12,6 +12,7 @@ mod outbox;
 mod render;
 mod selection;
 mod session_life;
+mod spawn_env;
 mod window;
 mod wire;
 
@@ -75,32 +76,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let path = config::config_path(&|k| std::env::var_os(k));
-    let (settings, warnings) = config::load(
-        path.as_deref(),
-        &|p| std::fs::read_to_string(p),
-        &cli.overrides,
+    let cfg = config::window_config(
+        &|k| std::env::var_os(k),
+        config::Spawn {
+            overrides: &cli.overrides,
+            cwd: working_directory(cli.working_directory),
+            app_id: cli.app_id.as_deref(),
+            title: cli.title.as_deref(),
+        },
     );
-    for w in warnings {
-        eprintln!("{w}");
-    }
-    let mut cfg = window::Config {
-        settings,
-        cwd: working_directory(cli.working_directory),
-        ..window::Config::default()
-    };
-    if let Some(id) = &cli.app_id {
-        cfg.app_id = id.clone();
-    }
-    if let Some(t) = &cli.title {
-        cfg.title = t.clone();
-    }
     let argv = cli
         .exec
         .unwrap_or_else(|| vec![shell(std::env::var_os("SHELL"))]);
     // The grant and session key are for this spawn only: no child environment ever carries it.
     let grant = std::env::var_os(client::GRANT_VAR).map(|g| g.to_string_lossy().into_owned());
-    let env = client::strip_grant(crucible_term_core::pty::inherited_env());
+    let env = spawn_env::strip_cde_vars(crucible_term_core::pty::inherited_env());
     if client::route(cfg.settings.mode, grant.is_some(), cli.standalone) == client::Route::Daemon {
         let open = wire::Open {
             argv: argv.clone(),

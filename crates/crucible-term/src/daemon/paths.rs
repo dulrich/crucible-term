@@ -43,11 +43,7 @@ pub fn socket_paths(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Paths, Str
 
 /// `$XDG_STATE_HOME/crucible-term/daemon.log`, fallback `~/.local/state/crucible-term/daemon.log`.
 pub fn log_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let nonempty = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let base = nonempty("XDG_STATE_HOME")
-        .filter(|p| p.is_absolute())
-        .or_else(|| nonempty("HOME").map(|h| h.join(".local/state")))?;
-    Some(base.join("crucible-term").join("daemon.log"))
+    Some(crate::config::xdg_home(env, "XDG_STATE_HOME", ".local/state")?.join("daemon.log"))
 }
 
 #[cfg(test)]

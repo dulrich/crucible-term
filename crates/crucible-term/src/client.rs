@@ -1,4 +1,4 @@
-//! The thin client: mode selection, grant stripping, and the `cterm` side of the daemon wire.
+//! The thin client: mode selection and the `cterm` side of the daemon wire.
 //!
 //! [`run`] reaches the per-display daemon (starting it on demand under `flock` on the sibling
 //! `.lock`, with a readiness pipe and a 2 s budget), sends `hello` and `open`, then waits for
@@ -30,13 +30,6 @@ const CLOSE_WAIT: Duration = Duration::from_millis(1500);
 
 /// The CDE session key variable; it never reaches a child's environment.
 pub const SESSION_VAR: &str = "CRUCIBLE_TERM_SESSION";
-
-/// `env` without `CRUCIBLE_WINDOW_GRANT` or `CRUCIBLE_TERM_SESSION`.
-pub fn strip_grant(env: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
-    env.into_iter()
-        .filter(|(k, _)| k != GRANT_VAR && k != SESSION_VAR)
-        .collect()
-}
 
 /// A session key is exactly 32 lowercase hex chars.
 pub fn valid_key(k: &str) -> bool {
@@ -402,21 +395,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grant_is_stripped() {
-        let env = vec![
-            ("A".into(), "1".into()),
-            (GRANT_VAR.into(), "secret".into()),
-            ("CRUCIBLE_WINDOW_GRANTX".into(), "keep".into()),
-        ];
-        let out = strip_grant(env);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|(k, _)| k != GRANT_VAR));
-    }
-
-    #[test]
     fn the_session_key_is_stripped_and_validated() {
         let env = vec![("A".into(), "1".into()), (SESSION_VAR.into(), "k".into())];
-        assert_eq!(strip_grant(env), vec![("A".into(), "1".into())]);
+        assert_eq!(
+            crate::spawn_env::strip_cde_vars(env),
+            vec![("A".into(), "1".into())]
+        );
         let good = "0123456789abcdef0123456789abcdef";
         assert_eq!(session_key(Some(good.into())), Some(good.into()));
         for bad in [

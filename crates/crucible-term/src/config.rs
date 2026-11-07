@@ -111,23 +111,23 @@ fn set_mode(s: &mut Settings, v: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn set_detached_timeout(s: &mut Settings, n: f64) -> Result<(), String> {
-    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > f64::from(u32::MAX) {
-        return Err(format!(
-            "detached-timeout {n}: expected a non-negative integer of seconds"
-        ));
+/// The seconds field `key` (`daemon-linger` | `detached-timeout`) names.
+fn seconds_field<'a>(s: &'a mut Settings, key: &str) -> &'a mut u64 {
+    if key == "daemon-linger" {
+        &mut s.daemon_linger
+    } else {
+        &mut s.detached_timeout
     }
-    s.detached_timeout = n as u64;
-    Ok(())
 }
 
-fn set_linger(s: &mut Settings, n: f64) -> Result<(), String> {
+/// Set a whole-seconds key (`daemon-linger` | `detached-timeout`), up to `u32::MAX`.
+fn set_seconds(s: &mut Settings, key: &str, n: f64) -> Result<(), String> {
     if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > f64::from(u32::MAX) {
         return Err(format!(
-            "daemon-linger {n}: expected a non-negative integer of seconds"
+            "{key} {n}: expected a non-negative integer of seconds"
         ));
     }
-    s.daemon_linger = n as u64;
+    *seconds_field(s, key) = n as u64;
     Ok(())
 }
 
@@ -140,11 +140,62 @@ const MAX_SIZE: f32 = 200.0;
 
 /// The config file path from an environment lookup (injectable, so tests need no real `$HOME`).
 pub fn config_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(xdg_home(env, "XDG_CONFIG_HOME", ".config")?.join("config.kdl"))
+}
+
+/// `$<var>/crucible-term` when `var` is a non-empty absolute path, else
+/// `$HOME/<home_rel>/crucible-term`; `None` without a usable `$HOME`.
+pub fn xdg_home(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    var: &str,
+    home_rel: &str,
+) -> Option<PathBuf> {
     let nonempty = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let base = nonempty("XDG_CONFIG_HOME")
+    let base = nonempty(var)
         .filter(|p| p.is_absolute())
-        .or_else(|| nonempty("HOME").map(|h| h.join(".config")))?;
-    Some(base.join("crucible-term").join("config.kdl"))
+        .or_else(|| nonempty("HOME").map(|h| h.join(home_rel)))?;
+    Some(base.join("crucible-term"))
+}
+
+/// What a window spawn adds on top of the config file: its overrides, cwd, app id and title.
+pub struct Spawn<'a> {
+    /// Raw `-o key=value` overrides.
+    pub overrides: &'a [String],
+    /// The child's working directory.
+    pub cwd: PathBuf,
+    /// xdg-toplevel app id, when given.
+    pub app_id: Option<&'a str>,
+    /// Initial title, when given.
+    pub title: Option<&'a str>,
+}
+
+/// Resolve a window config: `config.kdl` from the path `env` names, `sp.overrides` on top (each
+/// warning printed to stderr), then the spawn's cwd, app id and title.
+pub fn window_config(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    sp: Spawn<'_>,
+) -> crate::window::Config {
+    let path = config_path(env);
+    let (settings, warnings) = load(
+        path.as_deref(),
+        &|p| std::fs::read_to_string(p),
+        sp.overrides,
+    );
+    for w in warnings {
+        eprintln!("{w}");
+    }
+    let mut cfg = crate::window::Config {
+        settings,
+        cwd: sp.cwd,
+        ..crate::window::Config::default()
+    };
+    if let Some(id) = sp.app_id {
+        cfg.app_id = id.to_string();
+    }
+    if let Some(t) = sp.title {
+        cfg.title = t.to_string();
+    }
+    cfg
 }
 
 /// Read and parse the config file through `read`, then apply `overrides` (raw `key=value`
@@ -202,87 +253,14 @@ pub fn parse(file: &str, src: &str, s: &mut Settings, warns: &mut Vec<String>) {
         warns.push(format!("crucible-term: config: {file}:{line}: {msg}"));
     };
     for node in doc.nodes() {
-        let pos = |i: usize| node.get(i);
-        match node.name().value() {
-            "font" => {
-                match pos(0).and_then(KdlValue::as_string) {
-                    Some(f) if !f.is_empty() => s.family = f.to_string(),
-                    _ => w(node, "font: expected a family name string".into()),
-                }
-                if let Some(v) = node.get("size") {
-                    match v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) {
-                        Some(n) => set_size(s, n).unwrap_or_else(|m| w(node, m)),
-                        None => w(node, "font size: expected a number".into()),
-                    }
-                }
-            }
-            "colors" => {
-                for c in node.children().map(KdlDocument::nodes).unwrap_or_default() {
-                    let cv = |i: usize| c.get(i);
-                    let r = match c.name().value() {
-                        "alpha" => match cv(0).and_then(num) {
-                            Some(a) => set_alpha(s, a),
-                            None => Err("alpha: expected a number".into()),
-                        },
-                        "palette" => match (
-                            cv(0).and_then(KdlValue::as_integer),
-                            cv(1).and_then(KdlValue::as_string),
-                        ) {
-                            (Some(i), Some(col)) => set_palette(s, i, col),
-                            _ => Err("palette: expected <0-15> \"#rrggbb\"".into()),
-                        },
-                        k @ ("foreground" | "background" | "cursor") => {
-                            match cv(0).and_then(KdlValue::as_string) {
-                                Some(col) => set_color(s, k, col),
-                                None => Err(format!("{k}: expected \"#rrggbb\"")),
-                            }
-                        }
-                        k => Err(format!("unknown key colors.{k} (ignored)")),
-                    };
-                    if let Err(m) = r {
-                        w(c, m);
-                    }
-                }
-            }
-            "scrollback" => match node.get("lines").or_else(|| pos(0)).and_then(num) {
-                Some(n) => set_scrollback(s, n).unwrap_or_else(|m| w(node, m)),
-                None => w(node, "scrollback: expected lines=<n>".into()),
-            },
-            "pad" => match (
-                pos(0).and_then(KdlValue::as_integer),
-                pos(1).and_then(KdlValue::as_integer),
-            ) {
-                (Some(x), Some(y)) => set_pad(s, x, y).unwrap_or_else(|m| w(node, m)),
-                _ => w(node, "pad: expected two integers <x> <y>".into()),
-            },
-            "center" => s.center = true,
-            "mode" => match pos(0).and_then(KdlValue::as_string) {
-                Some(m) => set_mode(s, m).unwrap_or_else(|m| w(node, m)),
-                None => w(node, "mode: expected standalone|daemon|auto".into()),
-            },
-            "daemon-linger" => match pos(0).and_then(num) {
-                Some(n) => set_linger(s, n).unwrap_or_else(|m| w(node, m)),
-                None => w(node, "daemon-linger: expected seconds".into()),
-            },
-            "detached-timeout" => match pos(0).and_then(num) {
-                Some(n) => set_detached_timeout(s, n).unwrap_or_else(|m| w(node, m)),
-                None => w(node, "detached-timeout: expected seconds".into()),
-            },
-            "cursor" => {
-                if let Some(v) = node.get("shape") {
-                    match v.as_string() {
-                        Some(n) => set_shape(s, n).unwrap_or_else(|m| w(node, m)),
-                        None => w(node, "cursor shape: expected a string".into()),
-                    }
-                }
-                if let Some(v) = node.get("blink") {
-                    match v.as_bool() {
-                        Some(b) => s.cursor_blink = b,
-                        None => w(node, "cursor blink: expected #true or #false".into()),
-                    }
-                }
-            }
-            k => w(node, format!("unknown key {k} (ignored)")),
+        let k = node.name().value();
+        match KEYS
+            .iter()
+            .find(|d| d.kdl == Some(k))
+            .and_then(|d| d.from_kdl)
+        {
+            Some(set) => set(node, s, &mut w),
+            None => w(node, format!("unknown key {k} (ignored)")),
         }
     }
 }
@@ -403,79 +381,266 @@ pub fn apply_override(s: &mut Settings, raw: &str, warns: &mut Vec<String>) {
     }
 }
 
-fn apply_key(s: &mut Settings, key: &str, val: &str) -> Result<(), String> {
-    let float = || {
-        val.parse::<f64>()
-            .map_err(|_| format!("{key}: expected a number"))
-    };
-    match key {
-        "font" => {
-            let mut parts = val.split(':');
-            let fam = parts.next().unwrap_or("").trim();
-            if fam.is_empty() {
-                return Err("font: empty family".into());
-            }
-            let mut size = None;
-            for p in parts {
-                match p.trim().split_once('=') {
-                    Some(("size", n)) => {
-                        size = Some(
-                            n.trim()
-                                .parse::<f64>()
-                                .map_err(|_| format!("font size {n:?}: expected a number"))?,
-                        )
-                    }
-                    _ => return Err(format!("font attribute {p:?} unsupported (only size=)")),
-                }
-            }
-            if let Some(n) = size {
-                set_size(s, n)?;
-            }
-            s.family = fam.to_string();
-            Ok(())
-        }
-        "font.size" => set_size(s, float()?),
-        "colors.foreground" | "colors.background" => {
-            set_color(s, key.trim_start_matches("colors."), val)
-        }
-        "colors.cursor" => {
-            // foot's `cursor=<text> <cursor>`: the second colour is the cursor's.
-            let c = val.split_whitespace().last().unwrap_or("");
-            set_color(s, "cursor", c)
-        }
-        "colors.alpha" => set_alpha(s, float()?),
-        "scrollback" | "scrollback.lines" => set_scrollback(s, float()?),
-        "pad" => {
-            let mut words = val.split_whitespace();
-            let dims = words.next().unwrap_or("");
-            let center = match words.next() {
-                None => false,
-                Some("center") if words.next().is_none() => true,
-                Some(_) => return Err("pad: expected <x>x<y> [center]".into()),
-            };
-            let (x, y) = dims
-                .split_once('x')
-                .and_then(|(x, y)| Some((x.parse::<i128>().ok()?, y.parse::<i128>().ok()?)))
-                .ok_or("pad: expected <x>x<y> [center]")?;
-            set_pad(s, x, y)?;
-            s.center = center;
-            Ok(())
-        }
-        "cursor.shape" | "cursor.style" => set_shape(s, val),
-        "mode" => set_mode(s, val),
-        "daemon-linger" => set_linger(s, float()?),
-        "detached-timeout" => set_detached_timeout(s, float()?),
-        "cursor.blink" => {
-            s.cursor_blink = parse_bool(val).ok_or("cursor.blink: expected true|false|yes|no")?;
-            Ok(())
-        }
-        k if k.starts_with("colors.palette.") => {
+/// A warning sink for one KDL node: `(node, message)`.
+type Warn<'a> = dyn FnMut(&KdlNode, String) + 'a;
+/// Apply a typed KDL node onto the settings, warning per bad value.
+type FromKdl = fn(&KdlNode, &mut Settings, &mut Warn<'_>);
+/// Apply one `-o` string value; the arguments are the (alias-normalised) key, then the value.
+type FromOverride = fn(&mut Settings, &str, &str) -> Result<(), String>;
+
+/// One config key: its KDL node name and its `-o` names, each with its own value parser.
+struct Key {
+    /// The top-level KDL node name, if the key has one.
+    kdl: Option<&'static str>,
+    /// The `-o` key names; a name ending in `.` matches as a prefix.
+    o: &'static [&'static str],
+    /// Typed KDL values onto the settings.
+    from_kdl: Option<FromKdl>,
+    /// A `-o` string onto the settings.
+    from_o: Option<FromOverride>,
+}
+
+/// The one key table both the KDL file and `-o` overrides go through.
+const KEYS: &[Key] = &[
+    Key {
+        kdl: Some("font"),
+        o: &["font"],
+        from_kdl: Some(kdl_font),
+        from_o: Some(o_font),
+    },
+    Key {
+        kdl: None,
+        o: &["font.size"],
+        from_kdl: None,
+        from_o: Some(|s, k, v| set_size(s, o_float(k, v)?)),
+    },
+    Key {
+        kdl: Some("colors"),
+        o: &["colors.foreground", "colors.background"],
+        from_kdl: Some(kdl_colors),
+        from_o: Some(|s, k, v| set_color(s, k.trim_start_matches("colors."), v)),
+    },
+    Key {
+        kdl: None,
+        o: &["colors.cursor"],
+        from_kdl: None,
+        // foot's `cursor=<text> <cursor>`: the second colour is the cursor's.
+        from_o: Some(|s, _, v| set_color(s, "cursor", v.split_whitespace().last().unwrap_or(""))),
+    },
+    Key {
+        kdl: None,
+        o: &["colors.alpha"],
+        from_kdl: None,
+        from_o: Some(|s, k, v| set_alpha(s, o_float(k, v)?)),
+    },
+    Key {
+        kdl: None,
+        o: &["colors.palette."],
+        from_kdl: None,
+        from_o: Some(|s, k, v| {
             let i = k["colors.palette.".len()..]
                 .parse::<i128>()
                 .map_err(|_| "palette: bad index".to_string())?;
-            set_palette(s, i, val)
+            set_palette(s, i, v)
+        }),
+    },
+    Key {
+        kdl: Some("scrollback"),
+        o: &["scrollback", "scrollback.lines"],
+        from_kdl: Some(|node, s, w| {
+            match node.get("lines").or_else(|| node.get(0)).and_then(num) {
+                Some(n) => set_scrollback(s, n).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "scrollback: expected lines=<n>".into()),
+            }
+        }),
+        from_o: Some(|s, k, v| set_scrollback(s, o_float(k, v)?)),
+    },
+    Key {
+        kdl: Some("pad"),
+        o: &["pad"],
+        from_kdl: Some(|node, s, w| {
+            match (
+                node.get(0).and_then(KdlValue::as_integer),
+                node.get(1).and_then(KdlValue::as_integer),
+            ) {
+                (Some(x), Some(y)) => set_pad(s, x, y).unwrap_or_else(|m| w(node, m)),
+                _ => w(node, "pad: expected two integers <x> <y>".into()),
+            }
+        }),
+        from_o: Some(o_pad),
+    },
+    Key {
+        kdl: Some("center"),
+        o: &[],
+        from_kdl: Some(|_, s, _| s.center = true),
+        from_o: None,
+    },
+    Key {
+        kdl: Some("mode"),
+        o: &["mode"],
+        from_kdl: Some(
+            |node, s, w| match node.get(0).and_then(KdlValue::as_string) {
+                Some(m) => set_mode(s, m).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "mode: expected standalone|daemon|auto".into()),
+            },
+        ),
+        from_o: Some(|s, _, v| set_mode(s, v)),
+    },
+    Key {
+        kdl: Some("daemon-linger"),
+        o: &["daemon-linger"],
+        from_kdl: Some(kdl_seconds),
+        from_o: Some(|s, k, v| set_seconds(s, k, o_float(k, v)?)),
+    },
+    Key {
+        kdl: Some("detached-timeout"),
+        o: &["detached-timeout"],
+        from_kdl: Some(kdl_seconds),
+        from_o: Some(|s, k, v| set_seconds(s, k, o_float(k, v)?)),
+    },
+    Key {
+        kdl: Some("cursor"),
+        o: &["cursor.shape", "cursor.style"],
+        from_kdl: Some(kdl_cursor),
+        from_o: Some(|s, _, v| set_shape(s, v)),
+    },
+    Key {
+        kdl: None,
+        o: &["cursor.blink"],
+        from_kdl: None,
+        from_o: Some(|s, _, v| {
+            s.cursor_blink = parse_bool(v).ok_or("cursor.blink: expected true|false|yes|no")?;
+            Ok(())
+        }),
+    },
+];
+
+fn kdl_font(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    match node.get(0).and_then(KdlValue::as_string) {
+        Some(f) if !f.is_empty() => s.family = f.to_string(),
+        _ => w(node, "font: expected a family name string".into()),
+    }
+    if let Some(v) = node.get("size") {
+        match v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) {
+            Some(n) => set_size(s, n).unwrap_or_else(|m| w(node, m)),
+            None => w(node, "font size: expected a number".into()),
         }
-        _ => Err(format!("unknown key {key} (ignored)")),
+    }
+}
+
+fn kdl_colors(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    for c in node.children().map(KdlDocument::nodes).unwrap_or_default() {
+        let cv = |i: usize| c.get(i);
+        let r = match c.name().value() {
+            "alpha" => match cv(0).and_then(num) {
+                Some(a) => set_alpha(s, a),
+                None => Err("alpha: expected a number".into()),
+            },
+            "palette" => match (
+                cv(0).and_then(KdlValue::as_integer),
+                cv(1).and_then(KdlValue::as_string),
+            ) {
+                (Some(i), Some(col)) => set_palette(s, i, col),
+                _ => Err("palette: expected <0-15> \"#rrggbb\"".into()),
+            },
+            k @ ("foreground" | "background" | "cursor") => {
+                match cv(0).and_then(KdlValue::as_string) {
+                    Some(col) => set_color(s, k, col),
+                    None => Err(format!("{k}: expected \"#rrggbb\"")),
+                }
+            }
+            k => Err(format!("unknown key colors.{k} (ignored)")),
+        };
+        if let Err(m) = r {
+            w(c, m);
+        }
+    }
+}
+
+fn kdl_seconds(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    let key = node.name().value();
+    match node.get(0).and_then(num) {
+        Some(n) => set_seconds(s, key, n).unwrap_or_else(|m| w(node, m)),
+        None => w(node, format!("{key}: expected seconds")),
+    }
+}
+
+fn kdl_cursor(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    if let Some(v) = node.get("shape") {
+        match v.as_string() {
+            Some(n) => set_shape(s, n).unwrap_or_else(|m| w(node, m)),
+            None => w(node, "cursor shape: expected a string".into()),
+        }
+    }
+    if let Some(v) = node.get("blink") {
+        match v.as_bool() {
+            Some(b) => s.cursor_blink = b,
+            None => w(node, "cursor blink: expected #true or #false".into()),
+        }
+    }
+}
+
+/// A `-o` number value; the error names the key.
+fn o_float(key: &str, val: &str) -> Result<f64, String> {
+    val.parse::<f64>()
+        .map_err(|_| format!("{key}: expected a number"))
+}
+
+fn o_font(s: &mut Settings, _: &str, val: &str) -> Result<(), String> {
+    let mut parts = val.split(':');
+    let fam = parts.next().unwrap_or("").trim();
+    if fam.is_empty() {
+        return Err("font: empty family".into());
+    }
+    let mut size = None;
+    for p in parts {
+        match p.trim().split_once('=') {
+            Some(("size", n)) => {
+                size = Some(
+                    n.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("font size {n:?}: expected a number"))?,
+                )
+            }
+            _ => return Err(format!("font attribute {p:?} unsupported (only size=)")),
+        }
+    }
+    if let Some(n) = size {
+        set_size(s, n)?;
+    }
+    s.family = fam.to_string();
+    Ok(())
+}
+
+fn o_pad(s: &mut Settings, _: &str, val: &str) -> Result<(), String> {
+    let mut words = val.split_whitespace();
+    let dims = words.next().unwrap_or("");
+    let center = match words.next() {
+        None => false,
+        Some("center") if words.next().is_none() => true,
+        Some(_) => return Err("pad: expected <x>x<y> [center]".into()),
+    };
+    let (x, y) = dims
+        .split_once('x')
+        .and_then(|(x, y)| Some((x.parse::<i128>().ok()?, y.parse::<i128>().ok()?)))
+        .ok_or("pad: expected <x>x<y> [center]")?;
+    set_pad(s, x, y)?;
+    s.center = center;
+    Ok(())
+}
+
+fn apply_key(s: &mut Settings, key: &str, val: &str) -> Result<(), String> {
+    let hit = |n: &&str| match n.strip_suffix('.') {
+        Some(_) => key.starts_with(*n),
+        None => key == *n,
+    };
+    match KEYS
+        .iter()
+        .find(|d| d.o.iter().any(hit))
+        .and_then(|d| d.from_o)
+    {
+        Some(set) => set(s, key, val),
+        None => Err(format!("unknown key {key} (ignored)")),
     }
 }
 
@@ -600,5 +765,30 @@ mod tests {
         assert_eq!(ov(&mut s, "colors.alpha=abc").len(), 1);
         assert_eq!(ov(&mut s, "colors.alpha=7").len(), 1);
         assert_eq!(s.theme.alpha, 255);
+    }
+
+    #[test]
+    fn seconds_keys_share_one_setter_from_both_sources() {
+        let (mut s, w) = parsed("daemon-linger 5\ndetached-timeout 1.5\nmode \"auto\"\n");
+        assert_eq!((s.daemon_linger, s.detached_timeout), (5, 30));
+        assert_eq!(s.mode, RunMode::Auto);
+        assert_eq!(
+            w,
+            [
+                "crucible-term: config: c.kdl:2: detached-timeout 1.5: expected a non-negative integer of seconds"
+            ]
+        );
+        assert!(ov(&mut s, "detached-timeout=7").is_empty());
+        assert_eq!(
+            ov(&mut s, "daemon-linger=-1"),
+            [
+                "crucible-term: -o daemon-linger=-1: daemon-linger -1: expected a non-negative integer of seconds"
+            ]
+        );
+        assert_eq!((s.daemon_linger, s.detached_timeout), (5, 7));
+        assert_eq!(
+            ov(&mut s, "colors.palette.x=#000000"),
+            ["crucible-term: -o colors.palette.x=#000000: palette: bad index"]
+        );
     }
 }
