@@ -17,6 +17,9 @@
 //! mode "standalone"                        // standalone | daemon | auto (default standalone)
 //! daemon-linger 0                          // daemon idle-exit seconds; 0 = stay resident
 //! detached-timeout 30                      // seconds a detached session waits for reattach after a reconnect; 0 = never
+//! scrollback-persist #false                // daemon: keep a record of each keyed session on disk (survives reboot)
+//! persist-lines 2000                       // daemon: history rows per record (clamped to scrollback)
+//! persist-days 14                          // daemon: records older than this are deleted at startup; 0 = never
 //! ```
 //!
 //! **Errors never stop the terminal.** A whole-file syntax error prints one
@@ -37,6 +40,12 @@
 //! `colors.cursor` (`<text> <cursor>`) takes the second colour. Booleans accept
 //! `true|false|yes|no`. An unknown or invalid `-o` key warns (`crucible-term: -o <key>: <msg>`)
 //! and is ignored.
+//!
+//! The daemon keys (`daemon-linger`, `detached-timeout`, `scrollback-persist`, `persist-lines`,
+//! `persist-days`) are read from the file the daemon loads when it starts. `scrollback-persist`
+//! (default off) keeps a durable record of each keyed session (see `daemon::store`); in the file
+//! its value is the KDL boolean `#true` (a bare `true` is a syntax error). `persist-lines` is
+//! clamped to `scrollback` when used; `persist-days 0` never ages records out.
 
 use crate::render::{Rgb, Theme};
 use crucible_term_core::CursorKind;
@@ -70,6 +79,13 @@ pub struct Settings {
     /// Seconds a session still detached after a Wayland reconnect waits for a reattach before it
     /// is closed (SIGHUP grace); 0 = never.
     pub detached_timeout: u64,
+    /// Daemon: keep a durable record of each keyed session under
+    /// `$XDG_STATE_HOME/crucible-term/sessions/` and replay it on the next keyed open.
+    pub scrollback_persist: bool,
+    /// Daemon: history rows saved per record (clamped to `scrollback`).
+    pub persist_lines: usize,
+    /// Daemon: records older than this many days are deleted at startup; 0 = never.
+    pub persist_days: u64,
 }
 
 impl Default for Settings {
@@ -86,6 +102,9 @@ impl Default for Settings {
             mode: RunMode::Standalone,
             daemon_linger: 0,
             detached_timeout: 30,
+            scrollback_persist: false,
+            persist_lines: 2000,
+            persist_days: 14,
         }
     }
 }
@@ -128,6 +147,25 @@ fn set_seconds(s: &mut Settings, key: &str, n: f64) -> Result<(), String> {
         ));
     }
     *seconds_field(s, key) = n as u64;
+    Ok(())
+}
+
+/// Set a count key (`persist-lines` | `persist-days`): a non-negative integer, at most
+/// [`MAX_SCROLLBACK`] lines or 36500 days.
+fn set_count(s: &mut Settings, key: &str, n: f64) -> Result<(), String> {
+    let max = if key == "persist-lines" {
+        MAX_SCROLLBACK as f64
+    } else {
+        36_500.0
+    };
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > max {
+        return Err(format!("{key} {n}: expected an integer in 0-{max}"));
+    }
+    if key == "persist-lines" {
+        s.persist_lines = n as usize;
+    } else {
+        s.persist_days = n as u64;
+    }
     Ok(())
 }
 
@@ -499,6 +537,28 @@ const KEYS: &[Key] = &[
         from_o: Some(|s, k, v| set_seconds(s, k, o_float(k, v)?)),
     },
     Key {
+        kdl: Some("scrollback-persist"),
+        o: &["scrollback-persist"],
+        from_kdl: Some(kdl_persist),
+        from_o: Some(|s, _, v| {
+            s.scrollback_persist =
+                parse_bool(v).ok_or("scrollback-persist: expected true|false|yes|no")?;
+            Ok(())
+        }),
+    },
+    Key {
+        kdl: Some("persist-lines"),
+        o: &["persist-lines"],
+        from_kdl: Some(kdl_count),
+        from_o: Some(|s, k, v| set_count(s, k, o_float(k, v)?)),
+    },
+    Key {
+        kdl: Some("persist-days"),
+        o: &["persist-days"],
+        from_kdl: Some(kdl_count),
+        from_o: Some(|s, k, v| set_count(s, k, o_float(k, v)?)),
+    },
+    Key {
         kdl: Some("cursor"),
         o: &["cursor.shape", "cursor.style"],
         from_kdl: Some(kdl_cursor),
@@ -562,6 +622,26 @@ fn kdl_seconds(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
     match node.get(0).and_then(num) {
         Some(n) => set_seconds(s, key, n).unwrap_or_else(|m| w(node, m)),
         None => w(node, format!("{key}: expected seconds")),
+    }
+}
+
+/// `scrollback-persist` alone, or with `#true` / `#false` (a `"true"`-style string is accepted too).
+fn kdl_persist(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    let v = match node.get(0) {
+        None => Some(true),
+        Some(v) => v.as_bool().or_else(|| v.as_string().and_then(parse_bool)),
+    };
+    match v {
+        Some(b) => s.scrollback_persist = b,
+        None => w(node, "scrollback-persist: expected #true or #false".into()),
+    }
+}
+
+fn kdl_count(node: &KdlNode, s: &mut Settings, w: &mut Warn<'_>) {
+    let key = node.name().value();
+    match node.get(0).and_then(num) {
+        Some(n) => set_count(s, key, n).unwrap_or_else(|m| w(node, m)),
+        None => w(node, format!("{key}: expected a number")),
     }
 }
 
@@ -790,5 +870,28 @@ mod tests {
             ov(&mut s, "colors.palette.x=#000000"),
             ["crucible-term: -o colors.palette.x=#000000: palette: bad index"]
         );
+    }
+    #[test]
+    fn persist_keys_default_off_and_parse_from_both_sources() {
+        let d = Settings::default();
+        assert_eq!(
+            (d.scrollback_persist, d.persist_lines, d.persist_days),
+            (false, 2000, 14)
+        );
+        let (mut s, w) = parsed("scrollback-persist #true\npersist-lines 500\npersist-days 0\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(
+            (s.scrollback_persist, s.persist_lines, s.persist_days),
+            (true, 500, 0)
+        );
+        assert!(parsed("scrollback-persist\n").0.scrollback_persist);
+        // KDL v2: a bare `true` is a syntax error (the whole file falls back to defaults).
+        assert!(!parsed("scrollback-persist true\n").0.scrollback_persist);
+        assert!(!parsed("scrollback-persist #false\n").0.scrollback_persist);
+        assert_eq!(parsed("persist-lines -1\n").1.len(), 1);
+        assert!(ov(&mut s, "scrollback-persist=no").is_empty());
+        assert!(ov(&mut s, "persist-days=30").is_empty());
+        assert_eq!((s.scrollback_persist, s.persist_days), (false, 30));
+        assert_eq!(ov(&mut s, "persist-days=1.5").len(), 1);
     }
 }

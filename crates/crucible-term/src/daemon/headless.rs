@@ -10,8 +10,10 @@
 //! a real loss), and `CTERM_DEBUG_HEADLESS_RECONNECT_MS=M` makes the display reachable again M
 //! ms after the loss (unset: never).
 
+use super::store;
 use super::{Backend, TermId};
 use crate::session_life;
+use crucible_term_core::Session;
 use crucible_term_core::pty::{Pty, SpawnSpec, exit_code};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -39,6 +41,12 @@ struct Kid {
     exit: Option<i32>,
     /// Has a (fake) surface; cleared by a loss, set again by [`Backend::attach`].
     attached: bool,
+    /// The VT state fed from the PTY drain (so the record store can capture and replay).
+    session: Session,
+    /// Bumped on every PTY read.
+    generation: u64,
+    last_output: Instant,
+    scrollback: usize,
 }
 
 /// The headless backend; the calloop data in headless mode.
@@ -166,7 +174,15 @@ impl Backend for Headless {
                     loop {
                         match master.read(&mut buf) {
                             Ok(0) => break,
-                            Ok(_) => {}
+                            Ok(n) => {
+                                if let Some(k) = h.kids.get_mut(&id) {
+                                    k.session.feed(&buf[..n]);
+                                    let _ = k.session.take_replies();
+                                    let _ = k.session.take_events();
+                                    k.generation += 1;
+                                    k.last_output = Instant::now();
+                                }
+                            }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 return Ok(PostAction::Continue);
                             }
@@ -188,6 +204,14 @@ impl Backend for Headless {
                 tokens,
                 exit: None,
                 attached: true,
+                session: Session::new(
+                    usize::from(cfg.cols),
+                    usize::from(cfg.rows),
+                    cfg.settings.scrollback,
+                ),
+                generation: 0,
+                last_output: Instant::now(),
+                scrollback: cfg.settings.scrollback,
             },
         );
         Ok((id, pid))
@@ -288,5 +312,21 @@ impl Backend for Headless {
             Some(_) => Err(format!("session {id} is bound")),
             None => Err(format!("no session {id}")),
         }
+    }
+    fn view(&self, id: TermId) -> Option<store::View<'_>> {
+        self.kids.get(&id).map(|k| store::View {
+            session: &k.session,
+            generation: k.generation,
+            last_output: k.last_output,
+            finishing: k.exit.is_some(),
+        })
+    }
+
+    fn restore(&mut self, id: TermId, rec: &store::Record) -> Option<(usize, u64)> {
+        let k = self.kids.get_mut(&id)?;
+        let (cols, rows) = k.session.size();
+        let (s, n) = store::restored(rec, cols, rows, k.scrollback);
+        k.session = s;
+        Some((n, k.generation))
     }
 }

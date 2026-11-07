@@ -46,3 +46,28 @@ fn empty_argv_is_an_error() {
     s.argv.clear();
     assert!(Pty::spawn(&s).is_err());
 }
+
+/// A parent that blocks SIGTERM (as the daemon does for its signalfd) never hands the block to
+/// the child: the child's `SigBlk` is empty.
+#[test]
+fn the_child_starts_with_an_empty_signal_mask() {
+    std::thread::spawn(|| {
+        #[allow(unsafe_code)]
+        // SAFETY: plain libc calls on a stack sigset, on this test's own thread.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGHUP);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+        let mut p = Pty::spawn(&spec("grep SigBlk /proc/self/status")).expect("spawn");
+        let mut out = Vec::new();
+        p.read_to_end(&mut out).expect("read");
+        assert_eq!(p.wait().expect("wait").code(), Some(0));
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("SigBlk:\t0000000000000000"), "{text:?}");
+    })
+    .join()
+    .expect("thread");
+}

@@ -9,12 +9,17 @@
 //! is retried every second ([`RECONNECT`]). An `open` while detached first tries the display
 //! once and is refused if it is still gone.
 //!
+//! With `scrollback-persist` it also keeps a durable record of each keyed session ([`store`]),
+//! replayed by the next keyed open that names no live session, and handles SIGTERM/SIGHUP (a
+//! signalfd on the loop): save every session, keep every record, exit 0.
+//!
 //! State (connections, window → connection) is held in an `Rc<RefCell<State>>` captured by the
 //! calloop sources, so the window host carries no daemon fields.
 
 pub mod headless;
 pub mod paths;
 mod state;
+pub mod store;
 
 use crate::client::{GRANT_VAR, SESSION_VAR};
 use crate::config;
@@ -94,6 +99,15 @@ pub trait Backend: 'static {
     /// Bind a new surface to the existing, surface-less session `id` (binding the window
     /// identity with `grant`); returns its root pid.
     fn attach(&mut self, id: TermId, grant: Option<String>) -> Result<u32, String>;
+    /// Session `id`'s VT state and output activity, for its durable record.
+    fn view(&self, _id: TermId) -> Option<store::View<'_>> {
+        None
+    }
+    /// Replace the (still output-less) session `id` with `rec` replayed for its size
+    /// ([`store::restored`]); returns the restored row count and the output generation.
+    fn restore(&mut self, _id: TermId, _rec: &store::Record) -> Option<(usize, u64)> {
+        None
+    }
 }
 
 impl Backend for Host {
@@ -136,6 +150,12 @@ impl Backend for Host {
     }
     fn attach(&mut self, id: TermId, grant: Option<String>) -> Result<u32, String> {
         Host::attach(self, id, grant).map_err(|e| e.to_string())
+    }
+    fn view(&self, id: TermId) -> Option<store::View<'_>> {
+        Host::view(self, id)
+    }
+    fn restore(&mut self, id: TermId, rec: &store::Record) -> Option<(usize, u64)> {
+        Host::restore(self, id, rec)
     }
 }
 
@@ -193,6 +213,7 @@ fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: b
                         "crucible-term: daemon: client {conn}: session key already names live session {old}; session {id} is not reattachable"
                     );
                 } else {
+                    rec.record = claim_record(st, b, id, &k);
                     rec.key = Some(k);
                 }
             }
@@ -210,6 +231,35 @@ fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: b
             st.send(conn, &Msg::Refused { reason });
         }
     }
+}
+
+/// The record half of a granted, keyed open that registered `key` on the new session `id`
+/// (reattach and no-steal were ruled out first): take the key's record and, when this daemon
+/// newly owns it, replay it into the session before the child's first output (no dispatch has
+/// run since the spawn).
+fn claim_record<B: Backend>(
+    st: &mut State,
+    b: &mut B,
+    id: TermId,
+    key: &str,
+) -> Option<store::Owned> {
+    let p = st.persist.as_mut()?;
+    let mut o = match p.claim(key, id) {
+        store::Claim::Fresh(o) => o,
+        store::Claim::Reused(o) => return Some(o),
+        store::Claim::None => return None,
+    };
+    match store::load(&p.dir, key) {
+        Ok(Some(r)) => {
+            if let Some((n, generation)) = b.restore(id, &r) {
+                store::Persist::saved_at(&mut o, generation);
+                eprintln!("crucible-term: daemon: restored session {id} from record ({n} rows)");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("crucible-term: daemon: record skipped: {e}"),
+    }
+    Some(o)
 }
 
 /// The reattach rule for a *granted* open: if its session key names a detached session of this
@@ -322,6 +372,7 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64, m: Ms
         }
         Msg::Close => {
             if let Some(id) = st.find(|r| r.conn == Some(conn)) {
+                st.final_capture(b, id);
                 b.close(id);
             }
             true
@@ -558,6 +609,68 @@ fn detach() -> ExitCode {
     }
 }
 
+/// Session records plus the shutdown signals that save them (`scrollback-persist`).
+struct Persisting {
+    store: store::Persist,
+    sigfd: OwnedFd,
+}
+
+/// Block SIGTERM and SIGHUP on this (still single) thread, so every later thread inherits the
+/// block, and return a non-blocking signalfd for them. The PTY child's pre-exec resets the mask.
+fn signal_fd() -> Result<OwnedFd, String> {
+    #[allow(unsafe_code)]
+    // SAFETY: sigset manipulation on a stack value, then pthread_sigmask and signalfd with valid
+    // pointers; the returned descriptor is fresh and owned only by the `OwnedFd`.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        let r = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        if r != 0 {
+            return Err(format!("sigmask: {}", std::io::Error::from_raw_os_error(r)));
+        }
+        let fd = libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+        if fd < 0 {
+            return Err(format!("signalfd: {}", std::io::Error::last_os_error()));
+        }
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Start the record store (sweep, writer thread) and the shutdown signal fd. Called before any
+/// other thread exists.
+fn start_persist(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    s: &config::Settings,
+) -> Result<Persisting, String> {
+    let dir = store::records_dir(env).ok_or("no state directory (XDG_STATE_HOME or HOME)")?;
+    let sigfd = signal_fd()?;
+    let timing = store::Timing::from_env(
+        env(store::TIMING_VAR)
+            .and_then(|v| v.into_string().ok())
+            .as_deref(),
+    );
+    let store = store::Persist::start(
+        dir,
+        s.persist_lines.min(s.scrollback),
+        s.persist_days,
+        timing,
+    )?;
+    Ok(Persisting { store, sigfd })
+}
+
+/// Read every pending signal from the signalfd; the last one's number.
+fn read_signals(fd: &OwnedFd) -> Option<i32> {
+    // `struct signalfd_siginfo` is 128 bytes; `ssi_signo` is its first u32.
+    let mut last = None;
+    let mut buf = [0u8; 128];
+    while let Ok(128) = rustix::io::read(fd, &mut buf) {
+        last = i32::try_from(u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]])).ok();
+    }
+    last
+}
+
 /// `cterm daemon`.
 pub fn run() -> ExitCode {
     if std::env::var_os(DETACH_VAR).is_some() {
@@ -595,6 +708,17 @@ pub fn run() -> ExitCode {
             .and_then(|v| v.into_string().ok())
             .as_deref(),
     );
+    let persist = if settings.scrollback_persist {
+        match start_persist(&env, &settings) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("crucible-term: daemon: scrollback-persist: {e}; records off");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let headless = std::env::var_os(HEADLESS_VAR).is_some_and(|v| v == "1");
     eprintln!(
         "crucible-term: daemon: pid {} listening on {}{}",
@@ -630,9 +754,12 @@ pub fn run() -> ExitCode {
             b,
             listener,
             ready,
-            linger,
-            open_delay,
-            detached_timeout,
+            Opts {
+                linger,
+                open_delay,
+                detached_timeout,
+                persist,
+            },
         )
     } else {
         match Host::new(true) {
@@ -641,9 +768,12 @@ pub fn run() -> ExitCode {
                 host,
                 listener,
                 ready,
-                linger,
-                open_delay,
-                detached_timeout,
+                Opts {
+                    linger,
+                    open_delay,
+                    detached_timeout,
+                    persist,
+                },
             ),
             Err(e) => Err(e.to_string()),
         }
@@ -673,18 +803,32 @@ fn arm_reconnect<B: Backend>(handle: &LoopHandle<'static, B>) {
     }
 }
 
+/// What [`serve`] runs with beyond the loop, backend, listener and readiness pipe.
+struct Opts {
+    linger: Option<Duration>,
+    open_delay: Option<Duration>,
+    detached_timeout: Option<Duration>,
+    persist: Option<Persisting>,
+}
+
 fn serve<B: Backend>(
     mut event_loop: EventLoop<'static, B>,
     mut b: B,
     listener: UnixListener,
     ready: Option<OwnedFd>,
-    linger: Option<Duration>,
-    open_delay: Option<Duration>,
-    detached_timeout: Option<Duration>,
+    o: Opts,
 ) -> Result<(), String> {
+    let Opts {
+        linger,
+        open_delay,
+        detached_timeout,
+        persist,
+    } = o;
+    let (persist, sigfd) = persist.map(|p| (p.store, p.sigfd)).unzip();
     let state = Rc::new(RefCell::new(State {
         delay: open_delay,
         detached_timeout,
+        persist,
         ..State::default()
     }));
     let own_uid = rustix::process::getuid().as_raw();
@@ -704,6 +848,20 @@ fn serve<B: Backend>(
             .map_err(|e| e.to_string())?;
     }
     // Listening (and, in Wayland mode, connected): tell the starting client.
+    if let Some(fd) = sigfd {
+        let state = state.clone();
+        handle
+            .insert_source(
+                Generic::new(fd, Interest::READ, Mode::Level),
+                move |_, fd, _: &mut B| {
+                    if let Some(sig) = read_signals(fd) {
+                        state.borrow_mut().shutdown = Some(sig);
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(fd) = ready {
         let _ = rustix::io::write(&fd, b"r");
     }
@@ -716,6 +874,9 @@ fn serve<B: Backend>(
                 let left = l.saturating_sub(idle_since.elapsed());
                 if left.is_zero() {
                     eprintln!("crucible-term: daemon: idle for {}s, exiting", l.as_secs());
+                    if let Some(p) = state.borrow_mut().persist.take() {
+                        p.close_out();
+                    }
                     return Ok(());
                 }
                 Some(left)
@@ -731,6 +892,7 @@ fn serve<B: Backend>(
                 .values()
                 .filter_map(|r| r.expiry)
                 .map(|(Expiry::Orphan(t) | Expiry::Detached(t))| t)
+                .chain(record_deadline(&st, &b))
                 .min()
                 .map(|d| d.saturating_duration_since(Instant::now()))
         };
@@ -742,12 +904,48 @@ fn serve<B: Backend>(
             eprintln!("crucible-term: daemon: {e}; detached, reconnecting");
             arm_reconnect(&handle);
         }
+        if let Some(sig) = state.borrow().shutdown {
+            let name = if sig == libc::SIGHUP {
+                "SIGHUP"
+            } else {
+                "SIGTERM"
+            };
+            eprintln!("crucible-term: daemon: {name}: saving session records and exiting");
+            let mut st = state.borrow_mut();
+            if let Some(p) = st.persist.take() {
+                p.shutdown(
+                    st.sessions
+                        .iter_mut()
+                        .filter_map(|(&id, r)| Some((r.record.as_mut()?, b.view(id)))),
+                );
+            }
+            return Ok(());
+        }
+        // Periodic and final captures, before the reap drops finished sessions.
+        {
+            let mut st = state.borrow_mut();
+            let st = &mut *st;
+            if let Some(p) = &st.persist {
+                let now = Instant::now();
+                for (&id, r) in &mut st.sessions {
+                    if let (Some(o), Some(v)) = (r.record.as_mut(), b.view(id)) {
+                        p.tick(o, &v, now, false);
+                    }
+                }
+            }
+        }
         b.reap();
         let exits = b.drain_exits();
         if !exits.is_empty() {
             let mut st = state.borrow_mut();
             for (id, code) in exits {
-                let Some(conn) = st.sessions.remove(&id).and_then(|r| r.conn) else {
+                let Some(r) = st.sessions.remove(&id) else {
+                    continue;
+                };
+                if let (Some(p), Some(o)) = (st.persist.as_mut(), r.record) {
+                    p.release(o, Instant::now());
+                }
+                let Some(conn) = r.conn else {
                     continue;
                 };
                 st.send(conn, &Msg::Exited { code });
@@ -767,7 +965,20 @@ fn serve<B: Backend>(
             Instant::now(),
         );
         was_lost = lost;
+        if let Some(p) = state.borrow_mut().persist.as_mut() {
+            p.expire(Instant::now());
+        }
     }
+}
+
+/// When the record store next needs the loop: a dirty session's capture or a pending deletion.
+fn record_deadline<B: Backend>(st: &State, b: &B) -> Option<Instant> {
+    let p = st.persist.as_ref()?;
+    st.sessions
+        .iter()
+        .filter_map(|(&id, r)| p.due(r.record.as_ref()?, &b.view(id)?))
+        .chain(p.next_deletion())
+        .min()
 }
 
 #[cfg(test)]

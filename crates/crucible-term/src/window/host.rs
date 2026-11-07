@@ -43,7 +43,7 @@ use smithay_client_toolkit::{
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_seat, wl_surface};
@@ -527,6 +527,8 @@ impl Host {
             close_requested: false,
             diag: Diag::from_env(),
             force_present: false,
+            out_gen: 0,
+            last_output: Instant::now(),
         };
         term.apply_cursor_defaults();
         if term.diag.mem() {
@@ -589,6 +591,33 @@ impl Host {
         t.dirty = true;
         t.focused = true;
         Ok(root_pid)
+    }
+
+    /// Session `id`'s VT state and output activity (the daemon's record capture).
+    pub(crate) fn view(&self, id: TermId) -> Option<crate::daemon::store::View<'_>> {
+        self.terms.get(&id).map(|t| crate::daemon::store::View {
+            session: &t.session,
+            generation: t.out_gen,
+            last_output: t.last_output,
+            finishing: t.exit.is_some() || t.close_requested,
+        })
+    }
+
+    /// Replace window `id`'s session, before any PTY output, with `rec` replayed at the
+    /// session's size; returns the restored row count and the output generation.
+    pub(crate) fn restore(
+        &mut self,
+        id: TermId,
+        rec: &crate::daemon::store::Record,
+    ) -> Option<(usize, u64)> {
+        let t = self.terms.get_mut(&id)?;
+        let (cols, rows) = t.session.size();
+        let (s, n) = crate::daemon::store::restored(rec, cols, rows, t.cfg.settings.scrollback);
+        t.session = s;
+        t.apply_cursor_defaults();
+        t.full = true;
+        t.dirty = true;
+        Some((n, t.out_gen))
     }
 
     /// Whether the compositor advertises the window-identity global.

@@ -586,3 +586,337 @@ fn the_session_key_never_reaches_the_daemon_or_the_child() {
     let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
     assert!(!String::from_utf8_lossy(&environ).contains("CRUCIBLE_TERM_SESSION"));
 }
+
+// ---- durable session records (`scrollback-persist`) ----
+
+impl Env {
+    /// An env whose daemon persists records on the short TEST-ONLY cadence (quiet 200 ms,
+    /// max age 1 s, deletion grace 800 ms) and logs every save.
+    fn persisting(name: &str) -> Env {
+        let e = Env::new(name);
+        e.config("scrollback-persist #true\n");
+        e
+    }
+
+    fn config(&self, kdl: &str) {
+        std::fs::write(self.root.join("cfg/crucible-term/config.kdl"), kdl).unwrap();
+    }
+
+    fn records(&self) -> PathBuf {
+        self.root.join("state/crucible-term/sessions")
+    }
+
+    fn record(&self) -> PathBuf {
+        self.records().join(format!("{KEY}.vt"))
+    }
+
+    fn record_text(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(self.record()).unwrap_or_default()).into_owned()
+    }
+
+    /// A granted, keyed `cterm` running `script` (which should end in a loop that exits on HUP).
+    fn keyed_sh(&self, script: &str) -> Command {
+        let mut c = self.sh(script);
+        c.env("CRUCIBLE_WINDOW_GRANT", "g")
+            .env("CRUCIBLE_TERM_SESSION", KEY)
+            .env("CTERM_DEBUG_HEADLESS_IDENTITY", "1")
+            .env("CTERM_DEBUG_PERSIST_MS", "200,1000,800");
+        c
+    }
+}
+
+fn until(within: Duration, f: impl Fn() -> bool) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < within {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f()
+}
+
+fn signal(pid: i32, sig: rustix::process::Signal) {
+    let _ = rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), sig);
+}
+
+/// A loop that records its pid in `ready` and exits 0 on SIGHUP.
+fn hup_loop(ready: &Path) -> String {
+    format!(
+        "trap 'exit 0' HUP; echo $$ > {}; while :; do sleep 0.05; done",
+        ready.display()
+    )
+}
+
+/// Off by default: a keyed session writes nothing and the records directory is never created.
+#[test]
+fn records_are_off_by_default() {
+    let e = Env::new("persist-off");
+    let ready = e.root.join("ready");
+    let mut c = e
+        .keyed_sh(&format!("echo MARK; {}", hup_loop(&ready)))
+        .spawn()
+        .expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!e.records().exists(), "{}", e.log());
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
+/// A keyed session is saved once it goes quiet (0600 in a 0700 directory, versioned header),
+/// is not rewritten while unchanged, and a real close deletes it after the grace.
+#[test]
+fn a_record_is_written_once_while_unchanged_and_deleted_after_close() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::persisting("persist-write");
+    let ready = e.root.join("ready");
+    let c = e
+        .keyed_sh(&format!("echo MARK-ONE; {}", hup_loop(&ready)))
+        .spawn()
+        .expect("client");
+    assert!(
+        until(Duration::from_secs(5), || e
+            .record_text()
+            .contains("MARK-ONE")),
+        "{}",
+        e.log()
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!((mode(&e.record()), mode(&e.records())), (0o600, 0o700));
+    assert!(
+        e.record_text()
+            .starts_with(&format!("cterm-session 1 key={KEY} cols=80 rows=24 ")),
+        "{}",
+        e.record_text()
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(e.log().matches("saved record").count(), 1, "{}", e.log());
+    // SIGTERM to the client sends `close`: a real close.
+    signal(c.id() as i32, rustix::process::Signal::TERM);
+    let _ = c.wait_with_output();
+    assert!(
+        until(Duration::from_secs(5), || !e.record().exists()),
+        "{}",
+        e.log()
+    );
+    assert!(e.log().contains(&format!("deleted record {KEY}")));
+}
+
+/// While the alternate screen is active the last primary-screen record stands.
+#[test]
+fn the_alternate_screen_is_never_saved() {
+    let e = Env::persisting("persist-alt");
+    let ready = e.root.join("ready");
+    let mut c = e
+        .keyed_sh(&format!(
+            "echo PRIMARY; sleep 0.6; printf '\\033[?1049hALTSCREEN'; {}",
+            hup_loop(&ready)
+        ))
+        .spawn()
+        .expect("client");
+    assert!(
+        until(Duration::from_secs(5), || e
+            .record_text()
+            .contains("PRIMARY")),
+        "{}",
+        e.log()
+    );
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !e.record_text().contains("ALTSCREEN"),
+        "{}",
+        e.record_text()
+    );
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
+/// SIGTERM to the daemon keeps the record; the next keyed open (a new daemon) replays it above
+/// the new child's output, and the next save carries both.
+#[test]
+fn sigterm_keeps_the_record_and_the_next_keyed_open_replays_it() {
+    let e = Env::persisting("persist-term");
+    let ready = e.root.join("ready");
+    let mut c = e
+        .keyed_sh(&format!("echo OLD-HISTORY; {}", hup_loop(&ready)))
+        .spawn()
+        .expect("client");
+    assert!(until(Duration::from_secs(5), || e
+        .record_text()
+        .contains("OLD-HISTORY")));
+    let pid = e.daemon_pid().expect("daemon");
+    signal(pid, rustix::process::Signal::TERM);
+    assert!(until(Duration::from_secs(5), || !alive(pid)), "{}", e.log());
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(
+        e.log().contains("SIGTERM: saving session records"),
+        "{}",
+        e.log()
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(
+        e.record_text().contains("OLD-HISTORY"),
+        "kept after the grace"
+    );
+    let ready2 = e.root.join("ready2");
+    let mut c2 = e
+        .keyed_sh(&format!("echo NEW-CHILD; {}", hup_loop(&ready2)))
+        .spawn()
+        .expect("client");
+    wait_log(&e, "from record (");
+    assert!(
+        e.log().contains("restored session 1 from record ("),
+        "{}",
+        e.log()
+    );
+    assert!(until(Duration::from_secs(5), || e
+        .record_text()
+        .contains("NEW-CHILD")));
+    let t = e.record_text();
+    let (old, sep, new) = (
+        t.find("OLD-HISTORY").unwrap(),
+        t.find("restored from record").unwrap(),
+        t.find("NEW-CHILD").unwrap(),
+    );
+    assert!(old < sep && sep < new, "{t}");
+    let _ = c2.kill();
+    let _ = c2.wait();
+}
+
+/// A reboot's SIGHUP reaches the daemon and the shell at once: the child's exit must not count
+/// as a close, so the record survives.
+#[test]
+fn sighup_arriving_with_the_childs_exit_keeps_the_record() {
+    let e = Env::persisting("persist-hup");
+    let ready = e.root.join("ready");
+    let mut c = e
+        .keyed_sh(&format!("echo HUP-MARK; {}", hup_loop(&ready)))
+        .spawn()
+        .expect("client");
+    assert!(until(Duration::from_secs(5), || e
+        .record_text()
+        .contains("HUP-MARK")));
+    let pid = e.daemon_pid().expect("daemon");
+    signal(read_pid(&ready), rustix::process::Signal::HUP);
+    signal(pid, rustix::process::Signal::HUP);
+    assert!(until(Duration::from_secs(5), || !alive(pid)), "{}", e.log());
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(e.record_text().contains("HUP-MARK"), "{}", e.log());
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
+/// Reattach and no-steal keep priority: neither replays, and the no-steal session writes nothing.
+#[test]
+fn reattach_and_no_steal_never_replay() {
+    let e = Env::persisting("persist-prio");
+    let ready = e.root.join("ready");
+    let old = e
+        .keyed_sh(&format!("echo FIRST; {}", hup_loop(&ready)))
+        .env("CTERM_DEBUG_HEADLESS_LOSS_MS", "600")
+        .env("CTERM_DEBUG_HEADLESS_RECONNECT_MS", "200")
+        .spawn()
+        .expect("client");
+    assert!(until(Duration::from_secs(5), || e
+        .record_text()
+        .contains("FIRST")));
+    // No-steal (still attached): a second session, not registered, never writes.
+    let mut b = Raw::open(&e, "echo INTRUDER; sleep 5", Some("g"), Some(KEY));
+    assert!(!b.opened().1);
+    wait_log(&e, "daemon: reconnected");
+    let mut r = Raw::open(&e, "exit 9", Some("g"), Some(KEY));
+    assert!(r.opened().1, "reattached");
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!e.log().contains("from record"), "{}", e.log());
+    assert!(!e.record_text().contains("INTRUDER"), "{}", e.record_text());
+    drop(b);
+    r.s.write_all(&frame(6, &[])).unwrap();
+    let _ = old.wait_with_output();
+}
+
+/// E2: a detached-timeout close is an abandoned session, and an orphan-grace close (the client
+/// died while the display was up) a real one: both records are deleted after the grace, even
+/// though the timeout clears the reattach key first.
+#[test]
+fn timeout_and_orphan_closes_delete_the_record() {
+    let e = Env::persisting("persist-e2");
+    e.config("scrollback-persist #true\ndetached-timeout 1\n");
+    let ready = e.root.join("ready");
+    let c = e
+        .keyed_sh(&format!("echo TIMEOUT; {}", hup_loop(&ready)))
+        .env("CTERM_DEBUG_HEADLESS_LOSS_MS", "600")
+        .env("CTERM_DEBUG_HEADLESS_RECONNECT_MS", "100")
+        .spawn()
+        .expect("client");
+    assert!(until(Duration::from_secs(5), || e
+        .record_text()
+        .contains("TIMEOUT")));
+    wait_log(&e, "unclaimed after 1s; closing");
+    assert!(
+        until(Duration::from_secs(5), || !e.record().exists()),
+        "{}",
+        e.log()
+    );
+    let _ = c.wait_with_output();
+    // Orphan: the client is SIGKILLed while connected.
+    let ready2 = e.root.join("ready2");
+    let mut c2 = e
+        .keyed_sh(&format!("echo ORPHAN; {}", hup_loop(&ready2)))
+        .spawn()
+        .expect("client");
+    assert!(
+        until(Duration::from_secs(5), || e
+            .record_text()
+            .contains("ORPHAN")),
+        "{}",
+        e.log()
+    );
+    let _ = c2.kill();
+    let _ = c2.wait();
+    assert!(
+        until(Duration::from_secs(8), || !e.record().exists()),
+        "{}",
+        e.log()
+    );
+}
+
+/// The startup sweep deletes aged records and dead daemons' temp files; a record of an unknown
+/// version is skipped with a log line, left on disk, and the session opens fresh.
+#[test]
+fn the_sweep_and_an_unknown_version() {
+    let e = Env::persisting("persist-sweep");
+    std::fs::create_dir_all(e.records()).unwrap();
+    let old = e.records().join("feedfeedfeedfeedfeedfeedfeedfeed.vt");
+    std::fs::write(&old, b"cterm-session 1 key=x cols=1 rows=1\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 86_400))
+        .unwrap();
+    let tmp = e.records().join(format!(".{KEY}.vt.999999999.tmp"));
+    std::fs::write(&tmp, b"x").unwrap();
+    std::fs::write(
+        e.record(),
+        format!("cterm-session 9 key={KEY} cols=80 rows=24\nFUTURE"),
+    )
+    .unwrap();
+    let ready = e.root.join("ready");
+    let mut c = e
+        .keyed_sh(&format!("sleep 0.3; {}", hup_loop(&ready)))
+        .spawn()
+        .expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    assert!(!old.exists() && !tmp.exists(), "{}", e.log());
+    assert!(
+        e.log().contains("record skipped:") && e.log().contains("unknown version"),
+        "{}",
+        e.log()
+    );
+    assert!(!e.log().contains("from record ("), "{}", e.log());
+    let _ = c.kill();
+    let _ = c.wait();
+}

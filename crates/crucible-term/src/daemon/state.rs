@@ -35,6 +35,10 @@ pub(super) struct SessionRec {
     /// Session key it can be reattached under (registered only for granted opens).
     pub(super) key: Option<String>,
     pub(super) expiry: Option<Expiry>,
+    /// The durable record this session owns (`scrollback-persist`). Kept apart from `key`: a
+    /// detached timeout clears the key, and the record still gets its final capture and its
+    /// delayed deletion.
+    pub(super) record: Option<super::store::Owned>,
 }
 
 impl std::fmt::Display for TermId {
@@ -52,12 +56,25 @@ pub(super) struct State {
     pub(super) delay: Option<Duration>,
     /// `detached-timeout` (`None`: never).
     pub(super) detached_timeout: Option<Duration>,
+    /// Session records (`scrollback-persist`), when on.
+    pub(super) persist: Option<super::store::Persist>,
+    /// SIGTERM or SIGHUP arrived (persistence on): save and exit.
+    pub(super) shutdown: Option<i32>,
 }
 
 impl State {
     pub(super) fn send(&mut self, conn: u64, m: &Msg) {
         if let Some(c) = self.conns.get_mut(&conn) {
             let _ = c.stream.write_all(&wire::encode(m));
+        }
+    }
+
+    /// Capture session `id`'s record now if it changed (before the backend drops its session).
+    pub(super) fn final_capture<B: Backend>(&mut self, b: &B, id: TermId) {
+        if let (Some(p), Some(r)) = (&self.persist, self.sessions.get_mut(&id))
+            && let (Some(o), Some(v)) = (r.record.as_mut(), b.view(id))
+        {
+            p.tick(o, &v, Instant::now(), true);
         }
     }
 
@@ -72,6 +89,11 @@ impl State {
 /// - reconnected (lost → connected): every live session still detached gets `now + timeout`;
 /// - a deadline that passes on a still-detached session closes it (SIGHUP grace) and drops its
 ///   key (never reattached); a passed orphan expiry closes a session still attached and unowned.
+///
+/// Both closes take the session's final record capture first; the record identity
+/// (`SessionRec::record`) survives the cleared key, and both count as real closes (a timeout is an
+/// abandoned session, an orphan a client that died while the display was up), so the record is
+/// deleted after the grace unless a shutdown signal arrives first.
 pub(super) fn detached_clock<B: Backend>(
     st: &mut State,
     b: &mut B,
@@ -80,6 +102,7 @@ pub(super) fn detached_clock<B: Backend>(
     now: Instant,
 ) {
     let timeout = st.detached_timeout;
+    let mut close = Vec::new();
     for (&id, r) in &mut st.sessions {
         let detached = b.is_detached(id);
         match r.expiry {
@@ -93,17 +116,21 @@ pub(super) fn detached_clock<B: Backend>(
                         timeout.map_or(0, |t| t.as_secs())
                     );
                     r.key = None;
-                    b.close(id);
+                    close.push(id);
                 }
             }
             Some(Expiry::Orphan(d)) if d <= now => {
                 r.expiry = None;
                 if !detached && r.conn.is_none() {
-                    b.close(id);
+                    close.push(id);
                 }
             }
             _ => {}
         }
+    }
+    for id in close {
+        st.final_capture(b, id);
+        b.close(id);
     }
 }
 

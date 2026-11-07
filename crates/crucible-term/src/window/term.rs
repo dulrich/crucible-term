@@ -183,6 +183,10 @@ pub struct Term {
     pub(super) diag: Diag,
     /// The next draw presents even inside a mode 2026 hold (the resume repaint).
     pub(super) force_present: bool,
+    /// Bumped on every PTY read (the daemon's record store compares it).
+    pub(super) out_gen: u64,
+    /// When PTY output was last read.
+    pub(super) last_output: Instant,
 }
 
 /// Copy full-width bands of rows (`(y, height)`, `stride` bytes per row) from one slot of the
@@ -270,6 +274,8 @@ impl Term {
                 Ok(0) => return self.child_gone(),
                 Ok(n) => {
                     self.session.feed(&buf[..n]);
+                    self.out_gen += 1;
+                    self.last_output = Instant::now();
                     total += n;
                     if total >= 4 << 20 {
                         break;

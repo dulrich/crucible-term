@@ -107,10 +107,19 @@ impl Pty {
             .stdout(stdio(&slave)?)
             .stderr(stdio(&slave)?);
         // SAFETY: the closure runs in the forked child before exec and only makes
-        // async-signal-safe system calls (setsid, ioctl, close_range); it allocates nothing.
+        // async-signal-safe system calls (sigemptyset, pthread_sigmask, signal, setsid, ioctl,
+        // close_range); `set` is a stack value; it allocates nothing.
         #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(|| {
+                // A daemon that blocks SIGTERM/SIGHUP for its signalfd must not hand that mask
+                // (or any inherited disposition) to the shell: empty mask, default dispositions.
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+                for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
                 rustix::process::setsid()?;
                 // rustix's raw fd 0, not `std::io::stdin()`: that lazily allocates its
                 // buffer, which is not async-signal-safe after fork.

@@ -1,4 +1,4 @@
-//! Pure path derivation for the daemon socket, lock and log, over an injected env lookup.
+//! Pure path derivation for the daemon socket, lock, log and session records, over an injected env lookup.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,12 @@ pub fn log_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     Some(crate::config::xdg_home(env, "XDG_STATE_HOME", ".local/state")?.join("daemon.log"))
 }
 
+/// `$XDG_STATE_HOME/crucible-term/sessions` (fallback under `~/.local/state`): the durable session
+/// records, shared by every display's daemon (see `store`).
+pub fn sessions_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(crate::config::xdg_home(env, "XDG_STATE_HOME", ".local/state")?.join("sessions"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +88,9 @@ mod tests {
             Some("/h/.local/state/crucible-term/daemon.log".into())
         );
         assert_eq!(log_path(&env(&[])), None);
+        assert_eq!(
+            sessions_dir(&env(&[("XDG_STATE_HOME", "/s")])),
+            Some("/s/crucible-term/sessions".into())
+        );
     }
 }
