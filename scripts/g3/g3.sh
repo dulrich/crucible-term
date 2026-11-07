@@ -20,7 +20,7 @@ XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME in scratch (/
 daemon.log never touch the live ones. cterm is spawned DIRECTLY by CDE in daemon mode (`-o mode=auto`, CDE `restore-session #true`) onto a
 crafted workspace of three terminals across two panes (sleep 1001 and sleep 1002 stacked in pane 1, sleep 1003 in pane 2) running
 `crucible resume` wrappers; every session is asserted to be in daemon mode and a silent standalone fallback aborts it as a harness failure.
-Only pids this script recorded (with their start time) are ever signalled.
+Only pids this script recorded (with their start time) are ever signalled, with one exception: the scoped sweep of `cterm daemon` processes (same user, exact daemon cmdline) whose XDG_RUNTIME_DIR is under the g3 work root (/tmp/cde-g3w), run before a scratch dir is deleted and at exit.
 
   kill       SIGKILL the recorded daemon; wait up to G3_WAIT_S (10) for three `crucible resume --lost` placeholders, then `crucible msg save`.
              (a) the saved workspace still lists the three terminals in their original pane and slot order with command and cwd (a watcher
@@ -118,6 +118,32 @@ sigrec() { # SIG pid
 	echo "HARNESS FAILURE: refusing to signal unrecorded pid $2"
 	return 1
 }
+# scoped sweep: TERM, then (start time re-checked) KILL, every user-owned `cterm daemon` whose XDG_RUNTIME_DIR starts with the prefix
+sweep_daemons() { # prefix
+	local pre=$1 d p st cur env i
+	local found=() sts=()
+	[ -n "$pre" ] || return 0
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ "$(stat -c %u "$d" 2>/dev/null)" = "$(id -u)" ] || continue
+		[ "$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" = "$CT daemon " ] || continue
+		env=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -1) || true
+		case $env in "$pre"*) ;; *) continue ;; esac
+		st=$(starttime "$p") || continue
+		found+=("$p")
+		sts+=("$st")
+	done
+	[ ${#found[@]} -gt 0 ] || return 0
+	echo "SWEEP $pre: ${found[*]}"
+	for p in "${found[@]}"; do kill "$p" 2>/dev/null || true; done
+	sleep 1
+	for i in "${!found[@]}"; do
+		p=${found[$i]}
+		cur=$(starttime "$p" 2>/dev/null) || continue
+		if [ "$cur" = "${sts[$i]}" ]; then kill -KILL "$p" 2>/dev/null || true; fi
+	done
+	return 0
+}
 kids_of() { perl -e 'my $r=shift; opendir(D,"/proc"); for my $p (grep /^\d+$/, readdir D){ open(F,"<","/proc/$p/stat") or next; my $s=<F>; close F; $s=~/^\d+ \(.*\) \S (\d+)/ or next; print "$p\n" if $1==$r }' "$1"; }
 alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ] && ! grep -q '^State:.*Z' "/proc/$1/status" 2>/dev/null; }
 
@@ -128,6 +154,7 @@ CLIENTS=()
 cleanup() {
 	closecomps
 	killrec
+	sweep_daemons "$W/"
 	[ -z "$T" ] || rm -rf "$T"
 	return 0
 }
@@ -328,6 +355,7 @@ assert_daemon_mode() { # expected window count
 		alive "$c" || continue
 		[ "$(nshells "$c")" = 0 ] || { echo "HARNESS FAILURE: client $c has a child (standalone window)"; return 1; }
 	done
+	rec "$DPID"
 	echo "ASSERT daemon-mode ok: daemon pid $DPID cmdline='$cmd' shells=$want clients=${#CLIENTS[@]} (none with children)"
 }
 
@@ -372,6 +400,7 @@ g3_start() { # tag
 	wait_calm "$TAG"
 	cond_record "$TAG start"
 	T=$W/$TAG
+	sweep_daemons "$T/"
 	rm -rf "$T"
 	mkdir -p "$T/config/cde" "$T/config/crucible-term" "$T/state/crucible-term" "$T/data" "$T/run"
 	chmod 700 "$T/run"
@@ -443,6 +472,7 @@ g3_stop() {
 	cp "$WSFILE" "$OUT/logs/$TAG.workspace.kdl" 2>/dev/null || true
 	comp_log >"$OUT/logs/$TAG.compositor.log"
 	killrec
+	sweep_daemons "$T/"
 	rm -rf "$T"
 	T="" CLIENTS=() DPID="" CPID=""
 }
@@ -473,6 +503,11 @@ bringup() {
 		sleep 0.2
 	done
 	echo "BRINGUP daemon=$DPID wrappers R1=$R1 R2=$R2 R3=$R3"
+	if [ -z "$DPID" ]; then
+		echo "HARNESS FAILURE: daemon pid not found"
+		dlog | tail -20
+		return 1
+	fi
 	if [ -z "$R1" ] || [ -z "$R2" ] || [ -z "$R3" ]; then
 		echo "HARNESS FAILURE: the restored wrappers did not all appear"
 		tail -20 "$T"/log.* || true
