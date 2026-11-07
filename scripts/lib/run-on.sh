@@ -1,4 +1,4 @@
-# run-on.sh — launch a nested compositor into a CDE scratch workspace (plans/harness-run-on-2026-11.md).
+# run-on.sh — launch a nested compositor into a CDE scratch workspace.
 # Sourced by the bash drivers (g1, g2, spike-mem, g3); bash + coreutils only. Builds a per-launch bash wrapper with printf %q.
 #
 #   . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/run-on.sh"     # captures the LIVE CDE_SOCKET here, before any driver override

@@ -1,4 +1,4 @@
-// build.rs — fleet build-id helper (plans/fleet-build-version-gate.md, Decision 3).
+// build.rs — fleet build-id helper.
 // Copy-in template: save as the crate's `build.rs` (std only, no build-dependencies).
 //
 // Embeds FLEET_BUILD_ID at build time. A non-empty GIT_SHA env value wins verbatim

@@ -1,4 +1,4 @@
-# build-id.sh — fleet build-id helper (plans/fleet-build-version-gate.md, Decision 3).
+# build-id.sh — fleet build-id helper.
 # Sourceable copy-in template; bash + coreutils + git only.
 #
 #   . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/build-id.sh"
