@@ -14,7 +14,7 @@ use crate::font::{FontPool, Metrics, PooledFonts};
 use crate::outbox::Outbox;
 use crate::render::{self, Canvas, CursorDraw, Pad, Theme};
 use crate::selection::{invalidated, merge_damage};
-use crucible_term_core::pty::Pty;
+use crucible_term_core::pty::{Pty, exit_code};
 use crucible_term_core::{Damage, Event, Session};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{LoopHandle, RegistrationToken};
@@ -153,11 +153,6 @@ pub struct Term {
     pub(super) commits: u64,
     /// The next draw presents even inside a mode 2026 hold (the resume repaint).
     pub(super) force_present: bool,
-}
-
-pub(super) fn exit_code(s: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
 }
 
 /// Copy full-width bands of rows (`(y, height)`, `stride` bytes per row) from one slot of the

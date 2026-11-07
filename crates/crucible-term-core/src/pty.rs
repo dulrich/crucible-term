@@ -195,6 +195,12 @@ fn set_size(fd: impl AsFd, (cols, rows): (u16, u16)) -> Result<(), PtyError> {
     )
 }
 
+/// A child's exit status as one code: its exit code, else `128 + signal` (as a shell reports).
+pub fn exit_code(s: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+}
+
 /// The process environment plus nothing else — a convenience for [`SpawnSpec::env`].
 pub fn inherited_env() -> Vec<(OsString, OsString)> {
     std::env::vars_os().collect()

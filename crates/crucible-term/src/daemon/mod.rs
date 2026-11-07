@@ -72,10 +72,6 @@ pub trait Backend: 'static {
     fn drain_exits(&mut self) -> Vec<(u64, i32)>;
     /// No window and no child in its grace.
     fn is_idle(&self) -> bool;
-    /// A dispatch timeout the backend needs while it polls (none: block).
-    fn poll_hint(&self) -> Option<Duration> {
-        None
-    }
     /// The loop failed (the Wayland connection is lost): detach every session and return true,
     /// or return false to end the daemon.
     fn on_lost(&mut self) -> bool {
@@ -854,10 +850,7 @@ fn serve<B: Backend>(
                 .min()
                 .map(|d| d.saturating_duration_since(Instant::now()))
         };
-        let timeout = [b.poll_hint(), linger_left, deadline_left]
-            .into_iter()
-            .flatten()
-            .min();
+        let timeout = [linger_left, deadline_left].into_iter().flatten().min();
         if let Err(e) = event_loop.dispatch(timeout, &mut b) {
             if !b.on_lost() {
                 return Err(format!("event loop (Wayland connection lost?): {e}"));

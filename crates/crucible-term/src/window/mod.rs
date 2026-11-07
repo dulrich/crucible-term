@@ -85,8 +85,7 @@ fn wl(e: impl std::fmt::Display) -> WindowError {
 
 #[cfg(test)]
 mod tests {
-    use super::term::exit_code;
-    use crucible_term_core::pty::{Pty, SpawnSpec};
+    use crucible_term_core::pty::{Pty, SpawnSpec, exit_code};
     use rustix::event::{PollFd, PollFlags, poll};
     use std::time::{Duration, Instant};
 

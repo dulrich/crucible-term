@@ -11,6 +11,7 @@ mod font;
 mod outbox;
 mod render;
 mod selection;
+mod session_life;
 mod window;
 mod wire;
 

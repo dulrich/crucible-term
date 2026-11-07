@@ -11,10 +11,11 @@ use super::identity::generated::crucible_window_identity_v1::{
 use super::identity::{OpenSteps, open_in_order};
 use super::input::{self, SeatInput};
 use super::routing::{Routes, TermId};
-use super::term::{Surf, Term, exit_code};
+use super::term::{Surf, Term};
 use super::{Config, WindowError, lifecycle, wl};
 use crate::font::FontPool;
 use crate::outbox::Outbox;
+use crate::session_life;
 use crucible_term_core::Session;
 use crucible_term_core::pty::{Pty, SpawnSpec};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
@@ -43,7 +44,7 @@ use smithay_client_toolkit::{
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_seat, wl_surface};
@@ -55,11 +56,6 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
-
-/// How long a closed window's child gets to exit on SIGHUP before it counts as killed.
-const CLOSE_GRACE: Duration = Duration::from_millis(500);
-/// Poll period of the close-grace timer (it exists only while a close is pending).
-const CLOSE_POLL: Duration = Duration::from_millis(10);
 
 /// The connection-bound half of the host: registry, globals, seat, `Shm` and the identity
 /// manager, plus the connection's calloop source. Dropped whole when the connection is lost
@@ -147,27 +143,6 @@ pub(crate) fn display_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<Pat
         return Some(name);
     }
     Some(PathBuf::from(env("XDG_RUNTIME_DIR")?).join(name))
-}
-
-/// One step of the close grace: the child's `try_wait` result at `now` against `deadline`.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Grace {
-    /// Not exited yet; poll again.
-    Wait,
-    /// The exit code to record (`128 + 1` once the deadline passed, as if killed by SIGHUP).
-    Done(i32),
-}
-
-pub(super) fn grace_step(
-    status: std::io::Result<Option<std::process::ExitStatus>>,
-    now: Instant,
-    deadline: Instant,
-) -> Grace {
-    match status {
-        Ok(Some(s)) => Grace::Done(exit_code(s)),
-        Ok(None) if now < deadline => Grace::Wait,
-        _ => Grace::Done(128 + 1),
-    }
 }
 
 fn lp(e: impl std::fmt::Display) -> WindowError {
@@ -538,28 +513,15 @@ impl Host {
         // The child's exit also arrives on a pidfd, so a background grandchild holding the
         // slave cannot keep the window open after the shell is gone. Without pidfd the PTY EOF
         // path above still ends the window.
-        match rustix::process::Pid::from_raw(pty.pid() as i32)
-            .map(|p| rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()))
-        {
-            Some(Ok(fd)) => {
-                sources.push(
-                    self.handle
-                        .insert_source(
-                            Generic::new(fd, Interest::READ, Mode::Level),
-                            move |_, _, host| {
-                                let focus = host.routes.holds_focus(id);
-                                if let Some(t) = host.terms.get_mut(&id) {
-                                    t.on_child_exited(&mut host.seat_in, focus);
-                                }
-                                Ok(PostAction::Remove)
-                            },
-                        )
-                        .map_err(lp)?,
-                );
-            }
-            Some(Err(e)) => eprintln!("crucible-term: pidfd_open: {e}; relying on PTY EOF"),
-            None => {}
-        }
+        sources.extend(
+            session_life::watch_exit(&self.handle, pty.pid(), move |host: &mut Host| {
+                let focus = host.routes.holds_focus(id);
+                if let Some(t) = host.terms.get_mut(&id) {
+                    t.on_child_exited(&mut host.seat_in, focus);
+                }
+            })
+            .map_err(lp)?,
+        );
 
         let mut term = Term {
             id,
@@ -720,39 +682,13 @@ impl Host {
 
     /// SIGHUP the child, then poll `try_wait` on a host timer until it exits or the grace
     /// deadline passes. Never blocks the loop the other windows share.
-    fn begin_grace(&mut self, id: TermId, mut pty: Pty) {
-        if let Some(pid) = rustix::process::Pid::from_raw(pty.pid() as i32) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::HUP);
-        }
-        let deadline = Instant::now() + CLOSE_GRACE;
+    fn begin_grace(&mut self, id: TermId, pty: Pty) {
         self.closing += 1;
-        let r =
-            self.handle
-                .insert_source(Timer::from_duration(Duration::ZERO), move |_, _, host| {
-                    let status = pty.try_wait();
-                    let exited = matches!(status, Ok(Some(_)));
-                    match grace_step(status, Instant::now(), deadline) {
-                        Grace::Wait => TimeoutAction::ToDuration(CLOSE_POLL),
-                        Grace::Done(code) => {
-                            if !exited {
-                                // Past the deadline: SIGKILL and reap at once, so a long-lived
-                                // daemon keeps no zombie. The recorded code stays 128 + 1.
-                                if let Some(pid) = rustix::process::Pid::from_raw(pty.pid() as i32)
-                                {
-                                    let _ = rustix::process::kill_process(
-                                        pid,
-                                        rustix::process::Signal::KILL,
-                                    );
-                                }
-                                let _ = pty.wait();
-                            }
-                            host.exits.insert(id, code);
-                            host.closing -= 1;
-                            TimeoutAction::Drop
-                        }
-                    }
-                });
-        if r.is_err() {
+        let armed = session_life::begin_grace(&self.handle, pty, move |host: &mut Host, code| {
+            host.exits.insert(id, code);
+            host.closing -= 1;
+        });
+        if !armed {
             self.closing -= 1;
             self.exits.insert(id, 128 + 1);
         }
@@ -1063,33 +999,12 @@ delegate_xdg_shell!(Host);
 delegate_xdg_window!(Host);
 delegate_registry!(Host);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::process::ExitStatusExt;
-
-    /// The close grace as a pure step: an exit inside the window is the child's code, an
-    /// unexited child past the deadline (or a wait error) counts as killed by SIGHUP.
-    #[test]
-    fn close_grace_steps_to_exit_or_sighup_code() {
-        let now = Instant::now();
-        let later = now + CLOSE_GRACE;
-        let exited = std::process::ExitStatus::from_raw(3 << 8);
-        assert_eq!(grace_step(Ok(Some(exited)), now, later), Grace::Done(3));
-        let killed = std::process::ExitStatus::from_raw(15);
-        assert_eq!(grace_step(Ok(Some(killed)), now, later), Grace::Done(143));
-        assert_eq!(grace_step(Ok(None), now, later), Grace::Wait);
-        assert_eq!(grace_step(Ok(None), later, later), Grace::Done(129));
-        let err = std::io::Error::other("x");
-        assert_eq!(grace_step(Err(err), now, later), Grace::Done(129));
-    }
-}
-
 /// The detach path without a compositor: a [`Host`] whose Wayland half is absent owns sessions
 /// exactly as a detached daemon does.
 #[cfg(test)]
 mod detached_tests {
     use super::*;
+    use std::time::Instant;
 
     fn host(detachable: bool, display: Option<PathBuf>) -> (EventLoop<'static, Host>, Host) {
         let ev: EventLoop<Host> = EventLoop::try_new().expect("event loop");

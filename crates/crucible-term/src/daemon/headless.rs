@@ -11,7 +11,8 @@
 //! ms after the loss (unset: never).
 
 use super::Backend;
-use crucible_term_core::pty::{Pty, SpawnSpec};
+use crate::session_life;
+use crucible_term_core::pty::{Pty, SpawnSpec, exit_code};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
@@ -23,8 +24,6 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-/// SIGHUP grace before SIGKILL, as the Wayland host's close grace.
-const GRACE: Duration = Duration::from_millis(500);
 /// TEST-ONLY: lose the fake Wayland connection N ms after start.
 pub const LOSS_VAR: &str = "CTERM_DEBUG_HEADLESS_LOSS_MS";
 /// TEST-ONLY: the fake display is reachable again M ms after the loss.
@@ -36,8 +35,8 @@ pub const IDENTITY_VAR: &str = "CTERM_DEBUG_HEADLESS_IDENTITY";
 struct Kid {
     pty: Pty,
     tokens: Vec<RegistrationToken>,
-    /// Set once closed: the SIGHUP grace deadline.
-    deadline: Option<Instant>,
+    /// Set once the child exited (pidfd or PTY EOF), as the Wayland host's `Term::exit`.
+    exit: Option<i32>,
     /// Has a (fake) surface; cleared by a loss, set again by [`Backend::attach`].
     attached: bool,
 }
@@ -48,6 +47,8 @@ pub struct Headless {
     next: u64,
     kids: BTreeMap<u64, Kid>,
     exits: Vec<(u64, i32)>,
+    /// Children in their close grace.
+    closing: usize,
     /// The fake connection's source, while connected.
     fake: Option<RegistrationToken>,
     /// When the fake connection was lost.
@@ -66,6 +67,7 @@ impl Headless {
             next: 1,
             kids: BTreeMap::new(),
             exits: Vec::new(),
+            closing: 0,
             fake: None,
             lost_at: None,
             back_after: None,
@@ -117,14 +119,10 @@ impl Headless {
     }
 }
 
-fn exit_code(s: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
-}
-
-fn signal(pid: u32, sig: rustix::process::Signal) {
-    if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
-        let _ = rustix::process::kill_process(p, sig);
+/// The child of session `id` is gone (pidfd or PTY EOF): reap it and record its code.
+fn child_gone(h: &mut Headless, id: u64) {
+    if let Some(k) = h.kids.get_mut(&id).filter(|k| k.exit.is_none()) {
+        k.exit = Some(k.pty.wait().map(exit_code).unwrap_or(1));
     }
 }
 
@@ -163,39 +161,32 @@ impl Backend for Headless {
         );
         tokens.push(
             self.handle
-                .insert_source(drain, move |_, _, _| {
+                .insert_source(drain, move |_, _, h| {
                     let mut buf = [0u8; 4096];
                     loop {
                         match master.read(&mut buf) {
-                            Ok(0) => return Ok(PostAction::Remove),
+                            Ok(0) => break,
                             Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 return Ok(PostAction::Continue);
                             }
-                            Err(_) => return Ok(PostAction::Remove),
+                            Err(_) => break,
                         }
                     }
+                    child_gone(h, id);
+                    Ok(PostAction::Remove)
                 })
                 .map_err(|e| e.to_string())?,
         );
-        // The pidfd only wakes the loop; `reap` does the `try_wait`.
-        if let Some(Ok(fd)) = rustix::process::Pid::from_raw(pid as i32)
-            .map(|p| rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()))
-        {
-            tokens.push(
-                self.handle
-                    .insert_source(Generic::new(fd, Interest::READ, Mode::Level), |_, _, _| {
-                        Ok(PostAction::Remove)
-                    })
-                    .map_err(|e| e.to_string())?,
-            );
-        }
+        tokens.extend(session_life::watch_exit(&self.handle, pid, move |h| {
+            child_gone(h, id)
+        })?);
         self.kids.insert(
             id,
             Kid {
                 pty,
                 tokens,
-                deadline: None,
+                exit: None,
                 attached: true,
             },
         );
@@ -203,33 +194,41 @@ impl Backend for Headless {
     }
 
     fn close(&mut self, id: u64) {
-        if let Some(k) = self.kids.get_mut(&id).filter(|k| k.deadline.is_none()) {
-            signal(k.pty.pid(), rustix::process::Signal::HUP);
-            k.deadline = Some(Instant::now() + GRACE);
+        let Some(k) = self.kids.remove(&id) else {
+            return;
+        };
+        for t in k.tokens {
+            self.handle.remove(t);
+        }
+        if let Some(code) = k.exit {
+            self.exits.push((id, code));
+            return;
+        }
+        self.closing += 1;
+        let armed = session_life::begin_grace(&self.handle, k.pty, move |h: &mut Headless, c| {
+            h.exits.push((id, c));
+            h.closing -= 1;
+        });
+        if !armed {
+            self.closing -= 1;
+            self.exits.push((id, 128 + 1));
         }
     }
 
     fn reap(&mut self) {
-        let now = Instant::now();
-        let mut done = Vec::new();
-        for (&id, k) in &mut self.kids {
-            match k.pty.try_wait() {
-                Ok(Some(s)) => done.push((id, exit_code(s))),
-                Ok(None) if k.deadline.is_none_or(|d| now < d) => {}
-                _ => {
-                    signal(k.pty.pid(), rustix::process::Signal::KILL);
-                    let _ = k.pty.wait();
-                    done.push((id, 128 + 1));
-                }
-            }
-        }
-        for (id, code) in done {
+        let done: Vec<u64> = self
+            .kids
+            .iter()
+            .filter(|(_, k)| k.exit.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in done {
             if let Some(k) = self.kids.remove(&id) {
                 for t in k.tokens {
                     self.handle.remove(t);
                 }
+                self.exits.extend(k.exit.map(|c| (id, c)));
             }
-            self.exits.push((id, code));
         }
     }
 
@@ -238,14 +237,7 @@ impl Backend for Headless {
     }
 
     fn is_idle(&self) -> bool {
-        self.kids.is_empty()
-    }
-
-    fn poll_hint(&self) -> Option<Duration> {
-        self.kids
-            .values()
-            .any(|k| k.deadline.is_some())
-            .then_some(Duration::from_millis(10))
+        self.kids.is_empty() && self.closing == 0
     }
 
     fn on_lost(&mut self) -> bool {
@@ -289,7 +281,7 @@ impl Backend for Headless {
             return Err("no Wayland connection".into());
         }
         match self.kids.get_mut(&id) {
-            Some(k) if !k.attached && k.deadline.is_none() => {
+            Some(k) if !k.attached && k.exit.is_none() => {
                 k.attached = true;
                 Ok(k.pty.pid())
             }
