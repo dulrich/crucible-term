@@ -3,7 +3,7 @@
 //! drawn by us), `wl_shm` buffers from a `SlotPool`, frame-callback paced redraws, fractional
 //! scale through `wp_fractional_scale_v1` + `wp_viewporter` (integer `wl_output` scale
 //! otherwise), and each PTY master as a calloop source. Keyboard, pointer, selection and
-//! clipboard are in [`input`]; surface and focus routing in [`routing`]. Standalone [`run`] is a
+//! clipboard are in [`input`] (the selection targets and their sctk handlers in `seat_selection`); surface and focus routing in [`routing`]. Standalone [`run`] is a
 //! host with one window.
 //!
 //! With no PTY output and no blink the loop blocks in `dispatch(None)`: no timers, idle CPU ~0.
@@ -16,6 +16,7 @@ pub(crate) mod identity;
 mod input;
 pub(crate) mod lifecycle;
 mod routing;
+mod seat_selection;
 mod term;
 
 pub(crate) use host::Host;

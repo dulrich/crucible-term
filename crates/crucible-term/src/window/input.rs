@@ -15,28 +15,18 @@
 
 use super::host::Host;
 use super::routing::TermId;
+use super::seat_selection::{Clipboard, Primary, Target};
 use super::term::Term;
-use crate::clipboard::{self, MIME_TYPES, Osc52};
+use crate::clipboard::{self, Osc52};
 use crate::render;
 use crate::selection::{Clicks, Kind, Point, Selection};
 use crucible_term_core::{
     Key, Mods, MouseAction, MouseButton, MouseEvent, MouseMode, encode_key, encode_mouse,
 };
-use smithay_client_toolkit::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
-use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
-use smithay_client_toolkit::data_device_manager::data_source::{CopyPasteSource, DataSourceHandler};
-use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, ReadPipe, WritePipe};
-use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
-use smithay_client_toolkit::primary_selection::device::{
-    PrimarySelectionDevice, PrimarySelectionDeviceHandler,
-};
-use smithay_client_toolkit::primary_selection::selection::{
-    PrimarySelectionSource, PrimarySelectionSourceHandler,
-};
+use smithay_client_toolkit::data_device_manager::ReadPipe;
 use smithay_client_toolkit::reexports::calloop::PostAction;
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::{Interest, Mode};
-use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
 };
@@ -44,17 +34,9 @@ use smithay_client_toolkit::seat::pointer::{
     BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, CursorIcon, PointerEvent, PointerEventKind, PointerHandler,
     ThemedPointer,
 };
-use smithay_client_toolkit::{
-    delegate_data_device, delegate_keyboard, delegate_pointer, delegate_primary_selection,
-};
+use smithay_client_toolkit::{delegate_keyboard, delegate_pointer};
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::time::Duration;
-use wayland_client::protocol::wl_data_device::WlDataDevice;
-use wayland_client::protocol::wl_data_device_manager::DndAction;
-use wayland_client::protocol::wl_data_source::WlDataSource;
 use wayland_client::protocol::{wl_keyboard, wl_pointer, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle};
 
@@ -75,14 +57,8 @@ pub struct SeatInput {
     pub(super) mods: Mods,
     /// The latest input serial, used for `set_selection`.
     serial: u32,
-    data_mgr: Option<DataDeviceManagerState>,
-    data_device: Option<DataDevice>,
-    primary_mgr: Option<PrimarySelectionManagerState>,
-    primary_device: Option<PrimarySelectionDevice>,
-    copy_source: Option<CopyPasteSource>,
-    primary_source: Option<PrimarySelectionSource>,
-    clip_text: Arc<str>,
-    primary_text: Arc<str>,
+    pub(super) clipboard: Target<Clipboard>,
+    pub(super) primary: Target<Primary>,
     /// The connection the devices belong to (`None`: detached, every device gone).
     qh: Option<QueueHandle<Host>>,
 }
@@ -139,20 +115,10 @@ impl SeatInput {
         qh: &QueueHandle<Host>,
     ) -> SeatInput {
         SeatInput {
-            keyboard: None,
-            pointer: None,
-            cursor: CursorState::default(),
-            mods: Mods::default(),
-            serial: 0,
-            data_mgr: DataDeviceManagerState::bind(globals, qh).ok(),
-            data_device: None,
-            primary_mgr: PrimarySelectionManagerState::bind(globals, qh).ok(),
-            primary_device: None,
-            copy_source: None,
-            primary_source: None,
-            clip_text: Arc::from(""),
-            primary_text: Arc::from(""),
+            clipboard: Target::bind(globals, qh),
+            primary: Target::bind(globals, qh),
             qh: Some(qh.clone()),
+            ..SeatInput::detached()
         }
     }
 
@@ -200,14 +166,8 @@ impl SeatInput {
             cursor: CursorState::default(),
             mods: Mods::default(),
             serial: 0,
-            data_mgr: None,
-            data_device: None,
-            primary_mgr: None,
-            primary_device: None,
-            copy_source: None,
-            primary_source: None,
-            clip_text: Arc::from(""),
-            primary_text: Arc::from(""),
+            clipboard: Target::unbound(),
+            primary: Target::unbound(),
             qh: None,
         }
     }
@@ -218,36 +178,26 @@ impl SeatInput {
         qh: &QueueHandle<Host>,
         seat: &wayland_client::protocol::wl_seat::WlSeat,
     ) {
-        if self.data_device.is_none() {
-            self.data_device = self.data_mgr.as_ref().map(|m| m.get_data_device(qh, seat));
-        }
-        if self.primary_device.is_none() {
-            self.primary_device = self
-                .primary_mgr
-                .as_ref()
-                .map(|m| m.get_selection_device(qh, seat));
-        }
+        self.clipboard.bind_device(qh, seat);
+        self.primary.bind_device(qh, seat);
     }
 
     fn set_clipboard(&mut self, text: String, serial: u32) {
-        let (Some(mgr), Some(dev), Some(qh)) = (&self.data_mgr, &self.data_device, &self.qh) else {
-            return;
-        };
-        let src = mgr.create_copy_paste_source(qh, MIME_TYPES);
-        src.set_selection(dev, serial);
-        self.clip_text = Arc::from(text);
-        self.copy_source = Some(src);
+        self.clipboard.set(self.qh.as_ref(), text, serial);
     }
 
     fn set_primary(&mut self, text: String, serial: u32) {
-        let (Some(mgr), Some(dev), Some(qh)) = (&self.primary_mgr, &self.primary_device, &self.qh)
-        else {
-            return;
-        };
-        let src = mgr.create_selection_source(qh, MIME_TYPES);
-        src.set_selection(dev, serial);
-        self.primary_text = Arc::from(text);
-        self.primary_source = Some(src);
+        self.primary.set(self.qh.as_ref(), text, serial);
+    }
+}
+
+/// The core button for an evdev button code; `None`: not one we report or act on.
+fn mouse_button(code: u32) -> Option<MouseButton> {
+    match code {
+        BTN_LEFT => Some(MouseButton::Left),
+        BTN_MIDDLE => Some(MouseButton::Middle),
+        BTN_RIGHT => Some(MouseButton::Right),
+        _ => None,
     }
 }
 
@@ -470,17 +420,10 @@ impl Term {
                     self.report(mods, MouseAction::Motion, held);
                 }
             }
-            PointerEventKind::Press {
-                button,
-                serial,
-                time,
-            } => {
+            PointerEventKind::Press { button, serial, .. } => {
                 seat.serial = serial;
-                let b = match button {
-                    BTN_LEFT => MouseButton::Left,
-                    BTN_MIDDLE => MouseButton::Middle,
-                    BTN_RIGHT => MouseButton::Right,
-                    _ => return,
+                let Some(b) = mouse_button(button) else {
+                    return;
                 };
                 if reporting {
                     if self.report(mods, MouseAction::Press, b) {
@@ -488,7 +431,6 @@ impl Term {
                     }
                     return;
                 }
-                let _ = time;
                 match b {
                     MouseButton::Left => self.begin_selection(mods.ctrl),
                     MouseButton::Middle => self.paste_primary(seat),
@@ -497,11 +439,8 @@ impl Term {
             }
             PointerEventKind::Release { button, serial, .. } => {
                 seat.serial = serial;
-                let b = match button {
-                    BTN_LEFT => MouseButton::Left,
-                    BTN_MIDDLE => MouseButton::Middle,
-                    BTN_RIGHT => MouseButton::Right,
-                    _ => return,
+                let Some(b) = mouse_button(button) else {
+                    return;
                 };
                 // A reported press always gets its release, even if Shift is held by now.
                 if self.inp.reported == Some(b) {
@@ -658,36 +597,19 @@ impl Term {
     }
 
     fn paste_clipboard(&mut self, seat: &SeatInput) {
-        let Some(offer) = seat
-            .data_device
-            .as_ref()
-            .and_then(|d| d.data().selection_offer())
-        else {
-            return;
-        };
-        let Some(mime) = offer.with_mime_types(clipboard::pick_mime) else {
-            return;
-        };
-        match offer.receive(mime.to_string()) {
-            Ok(pipe) => self.read_paste(pipe),
-            Err(e) => eprintln!("crucible-term: paste: {e}"),
-        }
+        self.paste_from(seat.clipboard.receive());
     }
 
     fn paste_primary(&mut self, seat: &SeatInput) {
-        let Some(offer) = seat
-            .primary_device
-            .as_ref()
-            .and_then(|d| d.data().selection_offer())
-        else {
-            return;
-        };
-        let Some(mime) = offer.with_mime_types(clipboard::pick_mime) else {
-            return;
-        };
-        match offer.receive(mime.to_string()) {
-            Ok(pipe) => self.read_paste(pipe),
-            Err(e) => eprintln!("crucible-term: paste: {e}"),
+        self.paste_from(seat.primary.receive());
+    }
+
+    /// Read the pipe a target opened on its selection offer (`None`: nothing to paste).
+    fn paste_from(&mut self, pipe: Option<Result<ReadPipe, String>>) {
+        match pipe {
+            Some(Ok(pipe)) => self.read_paste(pipe),
+            Some(Err(e)) => eprintln!("crucible-term: paste: {e}"),
+            None => {}
         }
     }
 
@@ -736,15 +658,6 @@ impl Term {
         self.snap_to_bottom();
         self.send(&bytes);
     }
-}
-
-/// Answer a data request on a background thread so a slow reader cannot stall the UI.
-fn serve(fd: OwnedFd, text: Arc<str>) {
-    let _ = std::thread::Builder::new()
-        .name("selection-write".into())
-        .spawn(move || {
-            let _ = File::from(fd).write_all(text.as_bytes());
-        });
 }
 
 impl Host {
@@ -908,138 +821,8 @@ impl PointerHandler for Host {
     }
 }
 
-impl DataDeviceHandler for Host {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlDataDevice,
-        _: f64,
-        _: f64,
-        _: &wl_surface::WlSurface,
-    ) {
-    }
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-}
-
-impl DataOfferHandler for Host {
-    fn source_actions(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &mut DragOffer,
-        _: DndAction,
-    ) {
-    }
-    fn selected_action(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &mut DragOffer,
-        _: DndAction,
-    ) {
-    }
-}
-
-impl DataSourceHandler for Host {
-    fn accept_mime(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlDataSource,
-        _: Option<String>,
-    ) {
-    }
-
-    fn send_request(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        source: &WlDataSource,
-        mime: String,
-        fd: WritePipe,
-    ) {
-        if self
-            .seat_in
-            .copy_source
-            .as_ref()
-            .is_some_and(|s| s.inner() == source)
-            && MIME_TYPES.contains(&mime.as_str())
-        {
-            serve(OwnedFd::from(fd), self.seat_in.clip_text.clone());
-        }
-    }
-
-    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
-        if self
-            .seat_in
-            .copy_source
-            .as_ref()
-            .is_some_and(|s| s.inner() == source)
-        {
-            self.seat_in.copy_source = None;
-        }
-    }
-
-    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
-    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
-    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
-}
-
-impl PrimarySelectionDeviceHandler for Host {
-    fn selection(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
-    ) {
-    }
-}
-
-impl PrimarySelectionSourceHandler for Host {
-    fn send_request(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        source: &ZwpPrimarySelectionSourceV1,
-        mime: String,
-        fd: WritePipe,
-    ) {
-        if self
-            .seat_in
-            .primary_source
-            .as_ref()
-            .is_some_and(|s| s.inner() == source)
-            && MIME_TYPES.contains(&mime.as_str())
-        {
-            serve(OwnedFd::from(fd), self.seat_in.primary_text.clone());
-        }
-    }
-
-    fn cancelled(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        source: &ZwpPrimarySelectionSourceV1,
-    ) {
-        if self
-            .seat_in
-            .primary_source
-            .as_ref()
-            .is_some_and(|s| s.inner() == source)
-        {
-            self.seat_in.primary_source = None;
-        }
-    }
-}
-
 delegate_keyboard!(Host);
 delegate_pointer!(Host);
-delegate_data_device!(Host);
-delegate_primary_selection!(Host);
 
 #[cfg(test)]
 mod tests {
