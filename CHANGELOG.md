@@ -4,6 +4,12 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.5.1 — 2026-11-09
+
+### Changed
+
+- The deploy builds every host on the deploying machine with that host's `target-cpu` (host-a native, host-b broadwell, du-c300 silvermont) and ships `cterm` and its desktop entry over ssh, so a target needs no checkout and no cargo. The staged `cterm --build` must pass on the target before anything is installed. `all` now covers du-c300 and continues past a failed host.
+
 ## 0.5.0 — 2026-11-07
 
 ### Added
