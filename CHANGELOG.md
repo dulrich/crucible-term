@@ -4,7 +4,7 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
-## Unreleased
+## 0.5.2 — 2026-11-13
 
 ### Added
 
