@@ -20,7 +20,12 @@
 //! scrollback-persist #false                // daemon: keep a record of each keyed session on disk (survives reboot)
 //! persist-lines 2000                       // daemon: history rows per record (clamped to scrollback)
 //! persist-days 14                          // daemon: records older than this are deleted at startup; 0 = never
+//! include "~/.config/cde/terminal-theme/cterm.kdl"   // read another file in place
 //! ```
+//!
+//! `include "<path>"` takes one string: `~`/`~/` is `$HOME`, other relative paths resolve against
+//! the including file's directory. The file is parsed at that point (later keys win), up to depth
+//! 4; a missing, unreadable or malformed included file warns and is skipped.
 //!
 //! **Errors never stop the terminal.** A whole-file syntax error prints one
 //! `crucible-term: config: <file>:<line>: <msg>` line and every key keeps its default. A bad
@@ -217,6 +222,7 @@ pub fn window_config(
     let (settings, warnings) = load(
         path.as_deref(),
         &|p| std::fs::read_to_string(p),
+        env,
         sp.overrides,
     );
     for w in warnings {
@@ -241,13 +247,15 @@ pub fn window_config(
 pub fn load(
     path: Option<&Path>,
     read: &dyn Fn(&Path) -> std::io::Result<String>,
+    env: &dyn Fn(&str) -> Option<OsString>,
     overrides: &[String],
 ) -> (Settings, Vec<String>) {
     let mut s = Settings::default();
     let mut warns = Vec::new();
+    let io = Io { read, env };
     if let Some(path) = path {
         match read(path) {
-            Ok(src) => parse(&path.display().to_string(), &src, &mut s, &mut warns),
+            Ok(src) => parse(&io, path, &src, &mut s, &mut warns, 0),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warns.push(format!(
                 "crucible-term: config: {}:1: cannot read: {e}",
@@ -266,8 +274,79 @@ fn line_of(src: &str, offset: usize) -> usize {
     1 + src.chars().take(offset).filter(|&c| c == '\n').count()
 }
 
-/// Parse `src` (named `file` in messages) onto `s`, pushing warning lines.
-pub fn parse(file: &str, src: &str, s: &mut Settings, warns: &mut Vec<String>) {
+/// The injectable file reader and environment lookup the parser uses for `include`.
+struct Io<'a> {
+    read: &'a dyn Fn(&Path) -> std::io::Result<String>,
+    env: &'a dyn Fn(&str) -> Option<OsString>,
+}
+
+/// Deepest `include` nesting followed: the main file is depth 0, so its includes are depth 1.
+const MAX_INCLUDE_DEPTH: usize = 4;
+
+/// Resolve an `include` path: a leading `~` or `~/` is `$HOME`, an absolute path stays, any
+/// other path is relative to `base` (the including file's directory). `None` for `~` with no
+/// usable `$HOME`.
+fn resolve_include(io: &Io<'_>, base: &Path, raw: &str) -> Option<PathBuf> {
+    if raw == "~" || raw.starts_with("~/") {
+        let home = (io.env)("HOME").filter(|h| !h.is_empty())?;
+        return Some(PathBuf::from(home).join(raw[1..].trim_start_matches('/')));
+    }
+    Some(base.join(raw))
+}
+
+/// Apply an `include "<path>"` node: parse the file in place (later keys win), warning and
+/// continuing when it is missing, unreadable, too deeply nested or the node is malformed.
+fn include(
+    io: &Io<'_>,
+    file: &Path,
+    node: &KdlNode,
+    s: &mut Settings,
+    depth: usize,
+    warns: &mut Vec<String>,
+    mut w: impl FnMut(&mut Vec<String>, String),
+) {
+    let args: Vec<_> = node.entries().iter().collect();
+    let raw = match args.as_slice() {
+        [e] if e.name().is_none() => e.value().as_string(),
+        _ => None,
+    };
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        w(warns, "include: expected one path string".into());
+        return;
+    };
+    if depth >= MAX_INCLUDE_DEPTH {
+        w(
+            warns,
+            format!("include {raw}: nested deeper than {MAX_INCLUDE_DEPTH} (skipped)"),
+        );
+        return;
+    }
+    let base = file.parent().unwrap_or_else(|| Path::new(""));
+    let Some(path) = resolve_include(io, base, raw) else {
+        w(warns, format!("include {raw}: $HOME is not set (skipped)"));
+        return;
+    };
+    match (io.read)(&path) {
+        Ok(src) => parse(io, &path, &src, s, warns, depth + 1),
+        Err(e) => w(
+            warns,
+            format!("include {}: cannot read: {e} (skipped)", path.display()),
+        ),
+    }
+}
+
+/// Parse `src` (the file `path`, named in messages) onto `s`, pushing warning lines. `depth` is
+/// the include nesting of this file.
+fn parse(
+    io: &Io<'_>,
+    path: &Path,
+    src: &str,
+    s: &mut Settings,
+    warns: &mut Vec<String>,
+    depth: usize,
+) {
+    let file = path.display().to_string();
+    let file = file.as_str();
     let doc = match KdlDocument::parse(src) {
         Ok(d) => d,
         Err(e) => {
@@ -286,12 +365,19 @@ pub fn parse(file: &str, src: &str, s: &mut Settings, warns: &mut Vec<String>) {
             return;
         }
     };
-    let mut w = |node: &KdlNode, msg: String| {
-        let line = line_of(src, node.span().offset());
-        warns.push(format!("crucible-term: config: {file}:{line}: {msg}"));
-    };
     for node in doc.nodes() {
         let k = node.name().value();
+        let line = line_of(src, node.span().offset());
+        if k == "include" {
+            include(io, path, node, s, depth, warns, |warns, msg| {
+                warns.push(format!("crucible-term: config: {file}:{line}: {msg}"));
+            });
+            continue;
+        }
+        let mut w = |node: &KdlNode, msg: String| {
+            let line = line_of(src, node.span().offset());
+            warns.push(format!("crucible-term: config: {file}:{line}: {msg}"));
+        };
         match KEYS
             .iter()
             .find(|d| d.kdl == Some(k))
@@ -731,7 +817,19 @@ mod tests {
     fn parsed(src: &str) -> (Settings, Vec<String>) {
         let mut s = Settings::default();
         let mut w = Vec::new();
-        parse("c.kdl", src, &mut s, &mut w);
+        let read = |_: &Path| Err(std::io::ErrorKind::NotFound.into());
+        let env = |_: &str| None;
+        parse(
+            &Io {
+                read: &read,
+                env: &env,
+            },
+            Path::new("c.kdl"),
+            src,
+            &mut s,
+            &mut w,
+            0,
+        );
         (s, w)
     }
 
@@ -806,13 +904,21 @@ mod tests {
     #[test]
     fn load_reads_through_the_injected_reader() {
         let read = |_: &Path| Ok("scrollback lines=7\n".to_string());
-        let (s, w) = load(Some(Path::new("/c")), &read, &["scrollback=9".into()]);
+        let (s, w) = load(
+            Some(Path::new("/c")),
+            &read,
+            &|_| None,
+            &["scrollback=9".into()],
+        );
         assert_eq!((s.scrollback, w.len()), (9, 0));
         let missing = |_: &Path| Err(std::io::ErrorKind::NotFound.into());
-        let (s, w) = load(Some(Path::new("/c")), &missing, &[]);
+        let (s, w) = load(Some(Path::new("/c")), &missing, &|_| None, &[]);
         assert_eq!((s.scrollback, w.len()), (10_000, 0));
         let denied = |_: &Path| Err(std::io::ErrorKind::PermissionDenied.into());
-        assert_eq!(load(Some(Path::new("/c")), &denied, &[]).1.len(), 1);
+        assert_eq!(
+            load(Some(Path::new("/c")), &denied, &|_| None, &[]).1.len(),
+            1
+        );
     }
 
     #[test]
@@ -893,5 +999,89 @@ mod tests {
         assert!(ov(&mut s, "persist-days=30").is_empty());
         assert_eq!((s.scrollback_persist, s.persist_days), (false, 30));
         assert_eq!(ov(&mut s, "persist-days=1.5").len(), 1);
+    }
+
+    /// Load `/h/c.kdl` from an in-memory file map with `HOME=/hm/u`.
+    fn load_files(files: &[(&str, &str)]) -> (Settings, Vec<String>) {
+        let map: std::collections::HashMap<PathBuf, String> = files
+            .iter()
+            .map(|(p, c)| (PathBuf::from(p), (*c).to_string()))
+            .collect();
+        let read = move |p: &Path| {
+            map.get(p)
+                .cloned()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let env = |k: &str| (k == "HOME").then(|| OsString::from("/hm/u"));
+        load(Some(Path::new("/h/c.kdl")), &read, &env, &[])
+    }
+
+    #[test]
+    fn include_expands_tilde_and_resolves_relative_to_the_including_dir() {
+        let (s, w) = load_files(&[
+            ("/h/c.kdl", "include \"~/t/a.kdl\"\ninclude \"sub/b.kdl\"\n"),
+            ("/hm/u/t/a.kdl", "scrollback lines=11\n"),
+            ("/h/sub/b.kdl", "pad 3 4\n"),
+        ]);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!((s.scrollback, s.pad), (11, (3, 4)));
+    }
+
+    #[test]
+    fn include_later_keys_win_in_both_directions() {
+        let inc = ("/h/i.kdl", "scrollback lines=5\n");
+        let (s, _) = load_files(&[("/h/c.kdl", "scrollback lines=1\ninclude \"i.kdl\"\n"), inc]);
+        assert_eq!(s.scrollback, 5, "included file overrides earlier keys");
+        let (s, _) = load_files(&[("/h/c.kdl", "include \"i.kdl\"\nscrollback lines=1\n"), inc]);
+        assert_eq!(s.scrollback, 1, "later keys override the included file");
+    }
+
+    #[test]
+    fn include_missing_file_warns_once_and_continues() {
+        let (s, w) = load_files(&[("/h/c.kdl", "include \"gone.kdl\"\nscrollback lines=8\n")]);
+        assert_eq!(s.scrollback, 8);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("c.kdl:1") && w[0].contains("/h/gone.kdl"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn include_nests_and_stops_past_depth_four() {
+        let files = [
+            ("/h/c.kdl", "include \"1.kdl\"\n"),
+            ("/h/1.kdl", "include \"2.kdl\"\n"),
+            ("/h/2.kdl", "include \"3.kdl\"\n"),
+            ("/h/3.kdl", "include \"4.kdl\"\n"),
+            ("/h/4.kdl", "scrollback lines=4\ninclude \"5.kdl\"\n"),
+            ("/h/5.kdl", "scrollback lines=5\n"),
+        ];
+        let (s, w) = load_files(&files);
+        assert_eq!(s.scrollback, 4, "depth 4 is read, depth 5 is not");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("4.kdl:2") && w[0].contains("nested deeper"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn include_cycle_is_bounded() {
+        let (_, w) = load_files(&[("/h/c.kdl", "include \"c.kdl\"\n")]);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn include_malformed_shapes_and_broken_included_file_warn() {
+        let (s, w) = load_files(&[
+            (
+                "/h/c.kdl",
+                "include\ninclude 5\ninclude \"a\" \"b\"\ninclude \"bad.kdl\"\nscrollback lines=9\n",
+            ),
+            ("/h/bad.kdl", "pad {{{\n"),
+        ]);
+        assert_eq!(s.scrollback, 9);
+        assert_eq!(w.len(), 4, "{w:?}");
     }
 }

@@ -4,6 +4,12 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## Unreleased
+
+### Added
+
+- Config `include "<path>"`: reads another config file in place (leading `~` is `$HOME`, otherwise relative to the including file's directory; later keys win; nesting up to depth 4; a missing or malformed included file warns and is skipped).
+
 ## 0.5.1 — 2026-11-09
 
 ### Changed

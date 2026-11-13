@@ -687,6 +687,7 @@ pub fn run() -> ExitCode {
     let (settings, warnings) = config::load(
         config::config_path(&env).as_deref(),
         &|p| std::fs::read_to_string(p),
+        &env,
         &[],
     );
     for w in warnings {

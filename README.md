@@ -34,7 +34,10 @@ scrollback lines=10000               // default 10000, at most 1000000 (clamped 
 pad 6 6                              // logical px, default 2 2
 center                               // optionally centre the grid in the spare pixels
 cursor shape="block" blink=#false    // block | underline | beam; the child's DECSCUSR still overrides
+include "~/.config/cde/terminal-theme/cterm.kdl"   // read another config file in place
 ```
+
+`include "<path>"` (exactly one string) reads another config file at that point, so a theme can live in a generated or shared file. A leading `~` or `~/` is `$HOME`, an absolute path is used as is, and any other path is relative to the directory of the file that contains the `include`. Later keys win throughout: keys after the `include` override the included file's, and the included file's keys override earlier ones. Several `include` nodes are allowed and an included file may include others, up to depth 4 (deeper ones warn and are skipped, which also bounds cycles). A missing or unreadable included file warns once and is skipped; a malformed one warns and is ignored, like the main file. Included files are read whenever the config is read (each new window, and when the daemon starts); changing an included file is not watched, so it takes effect for the next window or daemon start, as for the main file.
 
 A broken file never stops the terminal: each problem prints one `crucible-term: config: <file>:<line>: <msg>` line on stderr and that key keeps its default; a whole-file syntax error keeps all defaults. Unknown keys warn and are ignored.
 
