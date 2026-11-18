@@ -1,9 +1,11 @@
-// build.rs — fleet build-id helper.
+// build.rs — fleet build-id helper (canonical copy-in template).
 // Copy-in template: save as the crate's `build.rs` (std only, no build-dependencies).
 //
 // Embeds FLEET_BUILD_ID at build time. A non-empty GIT_SHA env value wins verbatim
 // (container builds without .git); otherwise the tool-scoped id is computed from
-// CARGO_MANIFEST_DIR (tool root = nearest ancestor holding AGENTS.md, else the repo root).
+// CARGO_MANIFEST_DIR (tool root = nearest ancestor holding AGENTS.md, else the repo root):
+// last commit under the tool root ignoring control-plane paths (BUILD_ID_EXCLUDES, relative
+// to the tool root), plus `-dirty` when a tracked non-excluded file is modified.
 //
 // main.rs usage:
 //   let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,6 +20,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Pathspecs every build-id git call uses, relative to the tool root (same literal text in every language).
+const BUILD_ID_EXCLUDES: [&str; 5] = [
+    ".",
+    ":(exclude)plans",
+    ":(exclude)references",
+    ":(exclude,glob)**/FEEDBACK.md",
+    ":(exclude,glob)**/INITIATIVE.md",
+];
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
@@ -55,22 +66,26 @@ fn build_id(dir: &Path) -> String {
             _ => break,
         }
     }
-    let tool_s = tool.to_string_lossy().into_owned();
-    let sha = git(&top, &["log", "-1", "--format=%H", "--", &tool_s])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let sha = git(
+        &tool,
+        &[
+            &["log", "-1", "--format=%H", "--"][..],
+            &BUILD_ID_EXCLUDES[..],
+        ]
+        .concat(),
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
     if sha.is_empty() {
         return "unknown".into();
     }
     let dirty = git(
-        &top,
+        &tool,
         &[
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-            "--",
-            &tool_s,
-        ],
+            &["status", "--porcelain", "--untracked-files=no", "--"][..],
+            &BUILD_ID_EXCLUDES[..],
+        ]
+        .concat(),
     )
     .is_some_and(|s| !s.trim().is_empty());
     if dirty { format!("{sha}-dirty") } else { sha }
