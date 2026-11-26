@@ -24,6 +24,7 @@ pub mod model;
 pub mod pty;
 mod session;
 pub mod snapshot;
+pub mod viewer;
 
 pub use delta::Delta;
 pub use input::{
@@ -35,3 +36,4 @@ pub use model::{
     Width,
 };
 pub use session::Session;
+pub use viewer::{Frame, Viewer};

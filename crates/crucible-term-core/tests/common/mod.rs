@@ -115,3 +115,55 @@ pub fn fed(cols: usize, rows: usize, sb: usize, bytes: &[u8]) -> Session {
 pub fn line(s: &Session, y: usize) -> String {
     s.screen_row(y).text()
 }
+
+/// The spike's dense fixture (the one the 24 KB one-line-scroll figure was measured on).
+pub mod dense_fixture {
+    use super::Rng;
+
+    const WORDS: &[&str] = &[
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "fn",
+        "let",
+        "mut",
+        "=>",
+        "λ",
+        "→",
+        "漢字",
+        "e\u{301}x",
+    ];
+
+    /// One dense coloured line of about `cols - 10` columns (an SGR change per word).
+    fn dense(r: &mut Rng, cols: usize, o: &mut String) {
+        let mut w = 0;
+        while w + 12 < cols {
+            match r.below(3) {
+                0 => o.push_str(&format!(
+                    "\x1b[38;2;{};{};{}m",
+                    r.below(256),
+                    r.below(256),
+                    r.below(256)
+                )),
+                1 => o.push_str(&format!("\x1b[0;{};48;5;{}m", 1 + r.below(4), r.below(256))),
+                _ => o.push_str(&format!("\x1b[0;{}m", 31 + r.below(7))),
+            }
+            let word = WORDS[r.below(WORDS.len() as u64) as usize];
+            o.push_str(word);
+            o.push(' ');
+            w += word.chars().count() + 2;
+        }
+        o.push_str("\x1b[0m\r\n");
+    }
+
+    /// `n` dense lines of `cols` columns.
+    pub fn dense_lines(r: &mut Rng, cols: usize, n: usize) -> Vec<u8> {
+        let mut o = String::new();
+        for _ in 0..n {
+            dense(r, cols, &mut o);
+        }
+        o.into_bytes()
+    }
+}
