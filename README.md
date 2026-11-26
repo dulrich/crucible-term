@@ -2,7 +2,7 @@
 
 The terminal for Crucible Dev Env (CDE): a Rust Wayland terminal built on the rio-vt core, with a fast CPU renderer and light resource use. It is designed to grow into a per-user daemon whose sessions survive window loss and can be attached to from other hosts.
 
-The executable is `cterm` (the crate and project are `crucible-term`). The current release is 0.5.1. It runs either as a standalone per-window terminal or as a thin client of a per-user daemon that owns every PTY, and its sessions survive a lost Wayland connection and reattach. Multi-host attachment over ssh is not built yet. Release history is in [`CHANGELOG.md`](CHANGELOG.md).
+The executable is `cterm` (the crate and project are `crucible-term`). The current release is 0.7.0. It runs either as a standalone per-window terminal or as a thin client of a per-user daemon that owns every PTY, and its sessions survive a lost Wayland connection and reattach. `cterm attach` views a running session from any terminal, locally or over ssh (see Attach). Release history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Usage
 
@@ -57,6 +57,7 @@ A broken file never stops the terminal: each problem prints one `crucible-term: 
 | `mode=standalone\|daemon\|auto` | how the window runs (see Modes) |
 | `daemon-linger=<s>` | daemon idle-exit seconds (see Modes) |
 | `daemon-start=<service\|spawn>` | how a client reaches the daemon (see Modes) |
+| `attach-prefix=C-<char>` | prefix key of `cterm attach` (default `C-\`; see Attach) |
 | `detached-timeout=<s>` | seconds a detached session waits for reattach after a reconnect or after its last viewer left; default 0 = never (see Modes) |
 | `scrollback-persist=true\|false` | daemon: keep a durable record of each keyed session (default false; see Modes) |
 | `persist-lines=<n>` | daemon: history rows per record (default 2000, clamped to `scrollback`) |
@@ -75,9 +76,22 @@ A broken file never stops the terminal: each problem prints one `crucible-term: 
 - Reattach by session key: CDE exports `CRUCIBLE_TERM_SESSION` (32 lowercase hex) to each granted spawn; the client sends it in `open` (a malformed value is ignored with one warning) and strips it from the child's environment on every path, like the grant. A *granted* open whose key names a *detached* session rebinds a new window to that live session (same root pid) instead of spawning; the previous client, if still connected, gets `superseded` and exits 0 silently. A key that names an attached session is never stolen (the new window spawns, unregistered, and the daemon logs it), and a key without a grant never reattaches.
 - `detached-timeout N` (seconds, default 0 = never; daemon config): when the display comes back, each session still detached and without an attached viewer gets N s to be reattached, else it is closed through the SIGHUP grace and logged. A reattach cancels its clock, and so does attaching a viewer; when the last viewer of a session that is still detached leaves (detach or hang-up) while the display is connected, the clock is armed again at N s. Another loss before expiry cancels every clock until the next reconnect.
 - Durable scrollback (`scrollback-persist #true`, daemon config, default off; in the file the value must be the KDL boolean `#true`, a bare `true` is a syntax error): the daemon keeps one record per keyed session in `$XDG_STATE_HOME/crucible-term/sessions/<key>.vt` (directory `0700`, files `0600`, written atomically). A record is a versioned header plus the generic VT snapshot of the last `persist-lines` history rows and the screen: what was displayed, never raw PTY bytes or the environment. It is saved when output goes quiet (2 s) or after 30 s of unsaved output, never while the alternate screen is active (the last primary-screen record stands), and not when nothing changed. A granted open whose key names no live session but has a record replays it above the new child, below a faint `-- restored from record --` line (`restored session <id> from record (<n> rows)` in the log); reattach and no-steal keep priority, and replay output never reaches the PTY. A real close (child exit, window close, detached timeout, a client that died) writes the final state and deletes the record 6 s later; SIGTERM or SIGHUP to the daemon cancels pending deletions, saves every live session and exits 0, so a reboot keeps the records. Daemons on different runtime directories (nested harnesses) share the directory; a per-key `<key>.lock` (flock) keeps each record to one daemon. At start the daemon deletes records older than `persist-days` and stray temp files of dead daemons. The records can hold secrets that were printed on screen.
-- Fallback: no `XDG_RUNTIME_DIR` or `WAYLAND_DISPLAY`, a daemon that cannot be reached or started within 2 s, a protocol-version mismatch (the wire is v2), or a `no-identity` or `no-wayland` refusal → the client runs the window standalone in-process with one warning.
+- Fallback: no `XDG_RUNTIME_DIR` or `WAYLAND_DISPLAY`, a daemon that cannot be reached or started within 2 s, a protocol-version mismatch (the wire is v3), or a `no-identity` or `no-wayland` refusal → the client runs the window standalone in-process with one warning.
 - The client exits with its window's exit code. SIGTERM/SIGINT/SIGHUP to the client, or its death, closes the window (the child gets SIGHUP with a 500 ms grace). If the daemon dies the client exits 1 (`crucible-term: daemon connection lost`); `kill -9` of the daemon closes every window; so does SIGTERM or SIGHUP, which with `scrollback-persist` first saves the session records and exits 0.
 - The child environment never contains `CRUCIBLE_WINDOW_GRANT`, in any mode.
+
+## Attach
+
+Three commands reach the sessions of the per-user daemon from any terminal, with no window and no Wayland connection. `SESSION` is a decimal id or a hex key prefix, as `cterm ls` prints them; each command answers `--help`.
+
+- `cterm ls [HOST]` lists the sessions, one line each: id, short key, pid, `COLSxROWS`, window or detached, viewer count, title, working directory.
+- `cterm attach [HOST:]SESSION` views the session in this terminal and types into it, alongside its window and any other viewer; the daemon renders for the viewer. Exit status: 0 on detach, the child's code when the session exits, 1 on a refusal or a lost daemon, 2 on a usage error or without a terminal.
+- `cterm kill [HOST:]SESSION` closes a session as a window close does (SIGHUP, then the grace) and waits for its exit.
+- Prefix key (config `attach-prefix "C-<char>"`, default `C-\`): the prefix then `d` detaches, the prefix twice sends one literal prefix, the prefix then any other key sends both.
+- Size: the session follows the size of the latest active viewer. A viewer that attaches or types sizes it; a key press, paste or pointer press in the session's window takes the size back, and a window whose session another viewer sized shows the grid from its top-left corner, clipped or with a blank margin.
+- `HOST` forms run `ssh [-t] -- HOST cterm …` and relay its exit status; `HOST` is `[A-Za-z0-9._@-]+` and may not start with `-`. The far side needs `cterm` on the PATH of a non-interactive ssh command (a login shell's PATH is not enough), and its daemon running (`cterm.socket` starts it).
+- A daemon older than 0.7.0 does not know attach, and a plain deploy never restarts a running daemon: `attach` reports that the daemon must be restarted. Restarting `cterm.service` ends every shell in it, so pick a moment.
+- The viewer is a terminal viewer only: no scrollback of its own yet (the terminal's own scrollback sees the picture as drawn), and a window close still closes the session.
 
 ## Using it from CDE
 

@@ -4,6 +4,28 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.7.0 — 2026-11-26
+
+Attach: a session of the per-user daemon can be viewed and typed into from any terminal, locally or over ssh. A minor bump: new commands and a changed default.
+
+### Added
+
+- `cterm ls [HOST]`, `cterm attach [HOST:]SESSION` and `cterm kill [HOST:]SESSION`. `HOST` forms run through ssh and need `cterm` on the far non-interactive PATH.
+- Config key `attach-prefix` (default `C-\`): the prefix then `d` detaches, the prefix twice sends one literal prefix.
+- Daemon viewers: connections that attach to a session, receive frames rendered for their own size, and send input and resizes; the latest active viewer sizes the session. A stalled viewer skips frames and is dropped after 30 s undrained.
+- The G4 measurement harness `scripts/g4/` (first frame, bytes, input echo and a stalled viewer, from outside the viewer's PTY).
+
+### Changed
+
+- `detached-timeout` now defaults to 0 (never close a detached session); an attached viewer cancels the clock.
+- The wire protocol stays version 3 and gains attach messages, so 0.6 windows and daemons keep serving each other; a 0.6.0 daemon does not know attach, and `cterm attach` against one says the daemon must be restarted (a plain deploy never restarts a running daemon).
+- A window whose session a viewer sized shows the grid from its top-left corner, clipped or with a blank margin; a key press, paste or pointer press in the window takes the size back.
+
+### Fixed
+
+- The deploy's cutover installs the units and runs `daemon-reload` before the SIGTERM to the legacy daemon and enables the socket after it exits, so a window respawned in the gap can no longer start a second legacy daemon.
+- A keyed session whose record lock another daemon held at open is no longer left unpersisted: the daemon retries the claim every 3 s and captures the live session once it owns the record.
+
 ## 0.6.0 — 2026-11-25
 
 The daemon becomes a systemd user service, so sessions live outside every login session. This is a breaking change: a 0.6 client cannot reach a 0.5 daemon (other socket, other wire version), and clients no longer start the daemon themselves by default.
