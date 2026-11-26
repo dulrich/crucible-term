@@ -187,6 +187,8 @@ colors {
 scrollback lines=10000
 pad 2 2
 center
+// harness daemons are client-spawned on the nested runtime dir, never the user service
+daemon-start "spawn"
 KDL
 	# KDL v2 booleans are `#true`: a bare `true` is a syntax error that drops the whole config
 	if [ "$PERSIST" = 1 ]; then echo "scrollback-persist #true" >>"$T/config/crucible-term/config.kdl"; fi
@@ -316,7 +318,7 @@ start_comp() { # wrapper
 	if [ "$1" = 1 ] && [ "$LEG" = logout ]; then PIPE_INO=$(readlink "/proc/$CPID/fd/1" 2>/dev/null || true); echo "PROBE launcher pipe: $PIPE_INO"; fi
 	DISP=$(nested_display)
 	[ "$T/run" != "$LIVE_RT" ] || die "nested XDG_RUNTIME_DIR is the live one"
-	[ ! -e "$LIVE_RT/cterm/$DISP.sock" ] || echo "NOTE a live cterm daemon socket exists at $LIVE_RT/cterm/$DISP.sock (untouched: nested XDG_RUNTIME_DIR differs)"
+	[ ! -e "$LIVE_RT/cterm/daemon.sock" ] || echo "NOTE a live cterm daemon socket exists at $LIVE_RT/cterm/daemon.sock (untouched: nested XDG_RUNTIME_DIR differs)"
 	echo "== compositor pid $CPID display=$DISP runtime=$T/run"
 }
 

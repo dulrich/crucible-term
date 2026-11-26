@@ -91,7 +91,16 @@ fn main() -> ExitCode {
     // The grant and session key are for this spawn only: no child environment ever carries it.
     let grant = std::env::var_os(client::GRANT_VAR).map(|g| g.to_string_lossy().into_owned());
     let env = spawn_env::strip_cde_vars(crucible_term_core::pty::inherited_env());
-    if client::route(cfg.settings.mode, grant.is_some(), cli.standalone) == client::Route::Daemon {
+    let routed = client::route(cfg.settings.mode, grant.is_some(), cli.standalone);
+    let display = client::display(&|k| std::env::var_os(k));
+    if routed == client::Route::Daemon && display.is_none() {
+        eprintln!(
+            "crucible-term: no absolute Wayland display socket to name to the daemon; running standalone"
+        );
+    }
+    if routed == client::Route::Daemon
+        && let Some(display) = display
+    {
         let open = wire::Open {
             argv: argv.clone(),
             cwd: cfg.cwd.clone(),
@@ -101,8 +110,9 @@ fn main() -> ExitCode {
             title: cli.title,
             grant,
             session_key: client::session_key(std::env::var_os(client::SESSION_VAR)),
+            display,
         };
-        match client::run(open) {
+        match client::run(open, cfg.settings.daemon_start) {
             client::Outcome::Exit(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
             client::Outcome::Failed(e) => {
                 eprintln!("crucible-term: daemon: {e}");

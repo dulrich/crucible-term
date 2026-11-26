@@ -197,6 +197,8 @@ scrollback lines=10000
 pad 2 2
 center
 cursor shape="block" blink=#$BLINK
+// harness daemons are client-spawned on the nested runtime dir, never the user service
+daemon-start "spawn"
 KDL
 }
 
@@ -331,7 +333,7 @@ KDL
 	if [ "$DISP" = wayland-1 ]; then
 		echo "NOTE nested display basename is wayland-1 (same as live); the daemon socket stays separate because XDG_RUNTIME_DIR=$T/run != $LIVE_RT"
 	fi
-	[ ! -e "$LIVE_RT/cterm/$DISP.sock" ] || echo "NOTE a live cterm daemon socket exists at $LIVE_RT/cterm/$DISP.sock (untouched: nested XDG_RUNTIME_DIR differs)"
+	[ ! -e "$LIVE_RT/cterm/daemon.sock" ] || echo "NOTE a live cterm daemon socket exists at $LIVE_RT/cterm/daemon.sock (untouched: nested XDG_RUNTIME_DIR differs)"
 	echo "== $TAG kind=$KIND compositor pid $CPID display=$DISP runtime=$T/run"
 	sleep 3
 	snapshot_known
@@ -362,10 +364,10 @@ start_daemon() { # [env words...]
 	env "$@" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_RUNTIME_DIR="$T/run" WAYLAND_DISPLAY="$DISP" setsid "$CT" daemon >/dev/null 2>>"$T/state/crucible-term/daemon.log" &
 	local i
 	for i in $(seq 1 50); do
-		[ -S "$T/run/cterm/$DISP.sock" ] && break
+		[ -S "$T/run/cterm/daemon.sock" ] && break
 		sleep 0.2
 	done
-	[ -S "$T/run/cterm/$DISP.sock" ] || { echo "daemon did not come up"; tail -3 "$T/state/crucible-term/daemon.log"; return 1; }
+	[ -S "$T/run/cterm/daemon.sock" ] || { echo "daemon did not come up"; tail -3 "$T/state/crucible-term/daemon.log"; return 1; }
 	DPID=$(daemon_pid)
 	[ -n "$DPID" ] || die "no daemon pid in daemon.log"
 	rec "$DPID"
@@ -434,7 +436,7 @@ assert_standalone_mode() { # expected window count
 	local want=$1 c n=0
 	for c in "${CLIENTS[@]}"; do [ "$(nshells "$c")" = 1 ] && n=$((n + 1)); done
 	[ "$n" = "$want" ] || { echo "HARNESS FAILURE: $n of $want clients own a shell"; return 1; }
-	[ ! -S "$T/run/cterm/$DISP.sock" ] || { echo "HARNESS FAILURE: a daemon socket exists in standalone mode"; return 1; }
+	[ ! -S "$T/run/cterm/daemon.sock" ] || { echo "HARNESS FAILURE: a daemon socket exists in standalone mode"; return 1; }
 	echo "ASSERT standalone-mode ok: $want clients each own a shell, no daemon socket"
 }
 

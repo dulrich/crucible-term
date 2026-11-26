@@ -1,7 +1,10 @@
 //! The thin client: mode selection and the `cterm` side of the daemon wire.
 //!
-//! [`run`] reaches the per-display daemon (starting it on demand under `flock` on the sibling
-//! `.lock`, with a readiness pipe and a 2 s budget), sends `hello` and `open`, then waits for
+//! [`run`] reaches the user's daemon at `$XDG_RUNTIME_DIR/cterm/daemon.sock`: with
+//! `daemon-start "service"` (the default) it only connects (systemd's `cterm.socket` starts the
+//! service); with `"spawn"` it starts the daemon on demand under `flock` on the sibling
+//! `daemon.lock`, with a readiness pipe and a 2 s budget. It sends `hello` and `open` (naming
+//! this client's absolute display socket, [`display`]), then waits for
 //! `exited` and returns its code. SIGTERM/SIGINT send `close` (the daemon SIGHUPs the child
 //! with its grace) and the client exits with the relayed code or 128 + signo; SIGHUP only hangs up
 //! (exit 129): the daemon closes the session after its orphan grace unless its own Wayland
@@ -10,7 +13,7 @@
 //! `opened`, the client repoints its inherited stdout/stderr ([`detach_stdio`]): it outlives its
 //! compositor by design and must not hold a launcher's output pipe open across a logout.
 
-use crate::config::RunMode;
+use crate::config::{DaemonStart, RunMode};
 use crate::daemon::{self, paths};
 use crate::wire::{self, HelloVerdict, Msg, Open};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -177,10 +180,28 @@ fn start_daemon(log: Option<std::path::PathBuf>, deadline: Instant) -> Result<()
     }
 }
 
-/// Connect to the daemon, starting it under the lock if nothing listens.
-fn connect(p: &paths::Paths, log: Option<std::path::PathBuf>) -> Result<UnixStream, String> {
-    if let Ok(s) = UnixStream::connect(&p.socket) {
-        return Ok(s);
+/// This client's display for `open.display`: libwayland's socket path for this environment,
+/// only when absolute (else there is none to name and the client runs standalone).
+pub fn display(env: &dyn Fn(&str) -> Option<OsString>) -> Option<std::path::PathBuf> {
+    crate::window::display_path(env).filter(|p| p.is_absolute())
+}
+
+/// Connect to the daemon; with [`DaemonStart::Spawn`], start it under the lock if nothing
+/// listens. [`DaemonStart::Service`] never spawns.
+fn connect(
+    p: &paths::Paths,
+    log: Option<std::path::PathBuf>,
+    start: DaemonStart,
+) -> Result<UnixStream, String> {
+    match UnixStream::connect(&p.socket) {
+        Ok(s) => return Ok(s),
+        Err(e) if start == DaemonStart::Service => {
+            return Err(format!(
+                "{}: {e}; is cterm.socket enabled? (daemon-start \"service\")",
+                p.socket.display()
+            ));
+        }
+        Err(_) => {}
     }
     let deadline = Instant::now() + START_BUDGET;
     {
@@ -241,15 +262,15 @@ fn read_signal(fd: &OwnedFd) -> i32 {
     }
 }
 
-/// Run one window through the daemon.
-pub fn run(open: Open) -> Outcome {
+/// Run one window through the daemon, reached per `start`.
+pub fn run(open: Open, start: DaemonStart) -> Outcome {
     let env = |k: &str| std::env::var_os(k);
     let p = match paths::socket_paths(&env) {
         Ok(p) => p,
         Err(e) => return Outcome::Fallback(format!("no daemon socket ({e})")),
     };
     let log = paths::log_path(&env);
-    let mut stream = match connect(&p, log.clone()) {
+    let mut stream = match connect(&p, log.clone(), start) {
         Ok(s) => s,
         Err(e) => return Outcome::Fallback(format!("daemon unavailable ({e})")),
     };
@@ -282,6 +303,9 @@ pub fn run(open: Open) -> Outcome {
         }
         Ok(Some(Msg::Refused { reason })) if reason == "no-wayland" => {
             return Outcome::Fallback("the daemon has no Wayland connection".into());
+        }
+        Ok(Some(Msg::Refused { reason })) if reason == "other-display" => {
+            return Outcome::Fallback("the daemon is serving another Wayland display".into());
         }
         Ok(Some(Msg::Refused { reason })) => return Outcome::Failed(reason),
         Ok(Some(m)) => return Outcome::Fallback(format!("daemon answered {m:?} to open")),

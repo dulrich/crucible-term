@@ -133,7 +133,8 @@ pub struct Host {
     closing: usize,
     /// Daemon mode: a lost connection detaches the sessions. Standalone: the loop ends.
     detachable: bool,
-    /// The display socket captured at start; reconnects go there.
+    /// Daemon mode: the display last adopted from a client's `open`; reconnects go there.
+    /// Standalone: unused (it connects through the process environment).
     display: Option<PathBuf>,
 }
 
@@ -251,17 +252,24 @@ impl Wl {
 }
 
 impl Host {
-    /// Connect to Wayland and bind the globals. The host stays resident with zero windows; the
-    /// caller drives the returned loop (the daemon inserts its own sources through
-    /// [`EventLoop::handle`]) and calls [`Host::reap`] after each dispatch. `detachable`
-    /// (daemon mode): a lost connection detaches the sessions ([`Host::detach`]) and
-    /// [`Host::reconnect`] retries the display captured here.
+    /// The host and its loop. The host stays resident with zero windows; the caller drives the
+    /// returned loop (the daemon inserts its own sources through [`EventLoop::handle`]) and calls
+    /// [`Host::reap`] after each dispatch.
+    ///
+    /// Standalone (`detachable` false): connect through the process environment now and bind the
+    /// globals. Daemon mode (`detachable` true): start with no connection and never read the
+    /// daemon's own `WAYLAND_DISPLAY`; the daemon adopts a client's display
+    /// ([`Host::set_display`]) and connects with [`Host::reconnect`]; a lost connection detaches
+    /// the sessions ([`Host::detach`]).
     pub(crate) fn new(detachable: bool) -> Result<(EventLoop<'static, Host>, Host), WindowError> {
-        let conn = Connection::connect_to_env().map_err(wl)?;
         let event_loop: EventLoop<Host> = EventLoop::try_new().map_err(lp)?;
         let handle = event_loop.handle();
+        if detachable {
+            return Ok((event_loop, Host::detached(handle, true, None)));
+        }
+        let conn = Connection::connect_to_env().map_err(wl)?;
         let (w, seat_in) = Wl::connect(conn, &handle)?;
-        let mut host = Host::detached(handle, detachable, display_path(&|k| std::env::var_os(k)));
+        let mut host = Host::detached(handle, false, None);
         host.wl = Some(w);
         host.seat_in = seat_in;
         Ok((event_loop, host))
@@ -315,6 +323,16 @@ impl Host {
         true
     }
 
+    /// The display adopted last (daemon mode); `None` before the first adoption.
+    pub(crate) fn display(&self) -> Option<&std::path::Path> {
+        self.display.as_deref()
+    }
+
+    /// Adopt `path` as the display to (re)connect to. Only called with no live connection.
+    pub(crate) fn set_display(&mut self, path: PathBuf) {
+        self.display = Some(path);
+    }
+
     /// No Wayland connection.
     pub(crate) fn is_lost(&self) -> bool {
         self.wl.is_none()
@@ -325,7 +343,7 @@ impl Host {
         self.terms.get(&id).is_some_and(|t| t.surf.is_none())
     }
 
-    /// Connected, or a new connection to the captured display was established now. Detached
+    /// Connected, or a new connection to the adopted display was established now. Detached
     /// sessions stay surface-less until [`Host::attach`] binds them.
     pub(crate) fn reconnect(&mut self) -> bool {
         if self.wl.is_some() {
@@ -346,7 +364,7 @@ impl Host {
                 self.wl = Some(w);
                 self.seat_in = seat_in;
                 eprintln!(
-                    "crucible-term: Wayland reconnected to {}; {} session(s) detached",
+                    "crucible-term: Wayland connected to {}; {} session(s) detached",
                     path.display(),
                     self.terms.len()
                 );

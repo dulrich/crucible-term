@@ -16,6 +16,7 @@
 //! cursor shape="block" blink=#false        // block | underline | beam
 //! mode "standalone"                        // standalone | daemon | auto (default standalone)
 //! daemon-linger 0                          // daemon idle-exit seconds; 0 = stay resident
+//! daemon-start "service"                   // service (connect only) | spawn (start it if absent)
 //! detached-timeout 30                      // seconds a detached session waits for reattach after a reconnect; 0 = never
 //! scrollback-persist #false                // daemon: keep a record of each keyed session on disk (survives reboot)
 //! persist-lines 2000                       // daemon: history rows per record (clamped to scrollback)
@@ -79,6 +80,8 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// How `cterm` (no subcommand) runs its window: in-process, through the daemon, or `auto`.
     pub mode: RunMode,
+    /// How the client reaches the daemon: connect only, or start it when nothing listens.
+    pub daemon_start: DaemonStart,
     /// Daemon idle-exit timeout in seconds with no windows and no clients; 0 = stay resident.
     pub daemon_linger: u64,
     /// Seconds a session still detached after a Wayland reconnect waits for a reattach before it
@@ -105,6 +108,7 @@ impl Default for Settings {
             cursor_shape: CursorKind::Block,
             cursor_blink: false,
             mode: RunMode::Standalone,
+            daemon_start: DaemonStart::Service,
             daemon_linger: 0,
             detached_timeout: 30,
             scrollback_persist: false,
@@ -123,6 +127,26 @@ pub enum RunMode {
     Daemon,
     /// The daemon only when the spawn carries `CRUCIBLE_WINDOW_GRANT`, else standalone.
     Auto,
+}
+
+/// The `daemon-start` config key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonStart {
+    /// Connect only: the daemon is the `cterm.service` user unit (socket-activated); a missing
+    /// or refusing socket falls back to standalone. The default.
+    Service,
+    /// Start `cterm daemon` under the lock when nothing listens (nested harnesses, hosts
+    /// without the unit).
+    Spawn,
+}
+
+fn set_daemon_start(s: &mut Settings, v: &str) -> Result<(), String> {
+    s.daemon_start = match v {
+        "service" => DaemonStart::Service,
+        "spawn" => DaemonStart::Spawn,
+        _ => return Err(format!("daemon-start {v:?}: expected service|spawn")),
+    };
+    Ok(())
 }
 
 fn set_mode(s: &mut Settings, v: &str) -> Result<(), String> {
@@ -611,6 +635,17 @@ const KEYS: &[Key] = &[
         from_o: Some(|s, _, v| set_mode(s, v)),
     },
     Key {
+        kdl: Some("daemon-start"),
+        o: &["daemon-start"],
+        from_kdl: Some(
+            |node, s, w| match node.get(0).and_then(KdlValue::as_string) {
+                Some(m) => set_daemon_start(s, m).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "daemon-start: expected service|spawn".into()),
+            },
+        ),
+        from_o: Some(|s, _, v| set_daemon_start(s, v)),
+    },
+    Key {
         kdl: Some("daemon-linger"),
         o: &["daemon-linger"],
         from_kdl: Some(kdl_seconds),
@@ -972,6 +1007,20 @@ mod tests {
             ]
         );
         assert_eq!((s.daemon_linger, s.detached_timeout), (5, 7));
+        assert_eq!(s.daemon_start, DaemonStart::Service);
+        let (s2, w2) = parsed("daemon-start \"spawn\"\n");
+        assert!(w2.is_empty(), "{w2:?}");
+        assert_eq!(s2.daemon_start, DaemonStart::Spawn);
+        let (s3, w3) = parsed("daemon-start \"fork\"\n");
+        assert_eq!(
+            w3,
+            ["crucible-term: config: c.kdl:1: daemon-start \"fork\": expected service|spawn"]
+        );
+        assert_eq!(s3.daemon_start, DaemonStart::Service);
+        assert!(ov(&mut s, "daemon-start=spawn").is_empty());
+        assert_eq!(s.daemon_start, DaemonStart::Spawn);
+        assert_eq!(ov(&mut s, "daemon-start=x").len(), 1);
+        assert_eq!(s.daemon_start, DaemonStart::Spawn);
         assert_eq!(
             ov(&mut s, "colors.palette.x=#000000"),
             ["crucible-term: -o colors.palette.x=#000000: palette: bad index"]

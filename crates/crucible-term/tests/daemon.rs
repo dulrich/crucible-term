@@ -26,11 +26,25 @@ impl Env {
     }
 
     fn socket(&self) -> PathBuf {
-        self.root.join("run/cterm/w.sock")
+        self.root.join("run/cterm/daemon.sock")
     }
 
+    /// The display socket the clients name (`$XDG_RUNTIME_DIR/w`, never connected headless).
+    fn display(&self) -> PathBuf {
+        self.root.join("run/w")
+    }
+
+    /// `cterm` in daemon mode, spawning its daemon (`daemon-start "spawn"`).
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = self.bare(BIN);
+        c.args(["-o", "mode=daemon", "-o", "daemon-start=spawn"])
+            .args(args);
+        c
+    }
+
+    /// `program` with this test's private env (headless daemon) and no arguments.
+    fn bare(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut c = Command::new(program);
         c.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.root.join("home"))
@@ -39,8 +53,6 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.root.join("cfg"))
             .env("WAYLAND_DISPLAY", "w")
             .env("CTERM_DEBUG_DAEMON_HEADLESS", "1")
-            .args(["-o", "mode=daemon"])
-            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -66,7 +78,12 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        if let Some(pid) = self.daemon_pid().and_then(rustix::process::Pid::from_raw) {
+        // Never ourselves: a listener this test bound reports the test's pid.
+        if let Some(pid) = self
+            .daemon_pid()
+            .filter(|&p| p != std::process::id() as i32)
+            .and_then(rustix::process::Pid::from_raw)
+        {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
         let _ = std::fs::remove_dir_all(&self.root);
@@ -236,7 +253,7 @@ fn the_grant_never_reaches_the_daemon_or_the_child() {
     // A raw `open` that smuggles the grant in its env (grant field absent): the daemon strips it.
     let dump = e.root.join("env");
     let mut s = UnixStream::connect(e.socket()).unwrap();
-    let mut hello = 2u32.to_le_bytes().to_vec();
+    let mut hello = 3u32.to_le_bytes().to_vec();
     bytes(&mut hello, b"test");
     s.write_all(&frame(1, &hello)).unwrap();
     let mut open = Vec::new();
@@ -260,6 +277,7 @@ fn the_grant_never_reaches_the_daemon_or_the_child() {
     );
     open.extend_from_slice(&0u32.to_le_bytes());
     open.extend_from_slice(&[0, 0, 0, 0]);
+    bytes(&mut open, e.display().as_os_str().as_encoded_bytes());
     s.write_all(&frame(2, &open)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     // hello, opened, exited: read until the exited frame (tag 5) arrives.
@@ -375,7 +393,7 @@ fn opt(out: &mut Vec<u8>, v: Option<&str>) {
     }
 }
 
-/// A raw v2 client: `hello`, then `open` of `sh -c script` with `grant` and `key`.
+/// A raw v3 client: `hello`, then `open` of `sh -c script` with `grant` and `key`.
 struct Raw {
     s: UnixStream,
     buf: Vec<u8>,
@@ -383,9 +401,20 @@ struct Raw {
 
 impl Raw {
     fn open(e: &Env, script: &str, grant: Option<&str>, key: Option<&str>) -> Raw {
+        Raw::open_on(e, script, grant, key, &e.display())
+    }
+
+    /// As [`Raw::open`], naming `display`.
+    fn open_on(
+        e: &Env,
+        script: &str,
+        grant: Option<&str>,
+        key: Option<&str>,
+        display: &Path,
+    ) -> Raw {
         let mut s = UnixStream::connect(e.socket()).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut hello = 2u32.to_le_bytes().to_vec();
+        let mut hello = 3u32.to_le_bytes().to_vec();
         bytes(&mut hello, b"test");
         s.write_all(&frame(1, &hello)).unwrap();
         let mut o = Vec::new();
@@ -403,6 +432,7 @@ impl Raw {
         opt(&mut o, None);
         opt(&mut o, grant);
         opt(&mut o, key);
+        bytes(&mut o, display.as_os_str().as_encoded_bytes());
         s.write_all(&frame(2, &o)).unwrap();
         let mut r = Raw { s, buf: Vec::new() };
         assert_eq!(r.next().0, 1, "hello first");
@@ -922,4 +952,132 @@ fn the_sweep_and_an_unknown_version() {
     assert!(!e.log().contains("from record ("), "{}", e.log());
     let _ = c.kill();
     let _ = c.wait();
+}
+
+/// `daemon-start "service"` (the default) only connects: with no socket the client falls back
+/// to standalone with one reason and no daemon is ever spawned.
+#[test]
+fn service_start_never_spawns() {
+    let e = Env::new("service");
+    let mut c = e.bare(BIN);
+    c.args(["-o", "mode=daemon", "-e", "sh", "-c", "exit 0"]);
+    let (_, err) = status(c);
+    assert!(err.contains("daemon.sock"), "{err}");
+    assert!(err.contains("running standalone"), "{err}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!e.socket().exists(), "service mode spawned a daemon");
+    assert!(e.log().is_empty(), "{}", e.log());
+    assert!(!e.root.join("run/cterm/daemon.lock").exists());
+}
+
+/// A daemon that starts with no display adopts the first open's display and serves it; while
+/// that (fake) connection is live, an open naming another display is refused `other-display`
+/// (raw v3 frames) and a `cterm` client from there falls back with its reason.
+#[test]
+fn the_first_open_adopts_its_display_and_another_display_is_refused() {
+    let e = Env::new("adopt");
+    let mut c = e.sh("exit 6");
+    c.env("CTERM_DEBUG_HEADLESS_NO_DISPLAY", "1");
+    assert_eq!(status(c).0, 6);
+    let want = format!("adopting display {}", e.display().display());
+    assert!(e.log().contains(&want), "{}", e.log());
+    assert!(e.log().contains("Wayland connected to"), "{}", e.log());
+    // Same display again: served.
+    let mut same = Raw::open(&e, "exit 2", None, None);
+    same.opened();
+    assert_eq!(same.next().0, 5);
+    // Another display: refused.
+    let mut other = Raw::open_on(&e, "exit 0", None, None, Path::new("/elsewhere/wayland-9"));
+    let (tag, p) = other.next();
+    assert_eq!(tag, 4, "refused");
+    assert_eq!(&p[4..], b"other-display");
+    let mut c = e.sh("exit 0");
+    c.env("WAYLAND_DISPLAY", "/elsewhere/wayland-9");
+    let (_, err) = status(c);
+    assert!(err.contains("another Wayland display"), "{err}");
+    // A relative display is rejected at the wire boundary: the daemon hangs up.
+    let mut bad = Raw::open_on(&e, "exit 0", None, None, Path::new("wayland-1"));
+    let mut b = [0u8; 16];
+    assert_eq!(bad.s.read(&mut b).unwrap_or(0), 0, "bad display was served");
+    assert!(e.log().contains("not an absolute path"), "{}", e.log());
+}
+
+/// `cterm daemon` given a listener on fd 3 with `LISTEN_PID`/`LISTEN_FDS=1` serves on it, never
+/// unlinks the path when it idle-exits, and a second daemon given the same listener serves again.
+#[test]
+fn a_socket_activated_daemon_serves_and_never_unlinks_the_socket() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let e = Env::new("activated");
+    std::fs::create_dir_all(e.root.join("run/cterm")).unwrap();
+    std::fs::write(
+        e.root.join("cfg/crucible-term/config.kdl"),
+        "daemon-linger 1\n",
+    )
+    .unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(e.socket()).unwrap();
+    let raw = listener.as_raw_fd();
+    let start = |n: u32| -> Child {
+        let log = std::fs::File::create(e.root.join(format!("activated-{n}.log"))).unwrap();
+        let mut c = e.bare("sh");
+        c.args([
+            "-c",
+            "export LISTEN_PID=$$ LISTEN_FDS=1; exec \"$0\" daemon",
+            BIN,
+        ])
+        .stderr(log);
+        #[allow(unsafe_code)]
+        // SAFETY: between fork and exec only async-signal-safe dup2/fcntl on fds this process owns.
+        unsafe {
+            c.pre_exec(move || {
+                let r = if raw == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(raw, 3)
+                };
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        c.spawn().expect("daemon")
+    };
+    let exited = |d: &mut Child| {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(6) {
+            if let Some(s) = d.try_wait().unwrap() {
+                return Some(s);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    };
+    let log = |n: u32| {
+        std::fs::read_to_string(e.root.join(format!("activated-{n}.log"))).unwrap_or_default()
+    };
+    let mut d1 = start(1);
+    let mut r = Raw::open(&e, "exit 7", None, None);
+    r.opened();
+    assert_eq!(r.next().0, 5);
+    drop(r);
+    let s1 = exited(&mut d1);
+    let _ = d1.kill();
+    assert!(s1.is_some_and(|s| s.success()), "{}", log(1));
+    assert!(log(1).contains("(socket-activated)"), "{}", log(1));
+    assert!(log(1).contains("idle for 1s"), "{}", log(1));
+    assert!(
+        e.socket().exists(),
+        "the activated daemon unlinked the socket"
+    );
+    let mut d2 = start(2);
+    let mut r = Raw::open(&e, "exit 8", None, None);
+    r.opened();
+    assert_eq!(r.next().0, 5);
+    drop(r);
+    let _ = d2.kill();
+    let _ = d2.wait();
+    // The listener is ours: `SO_PEERCRED` on it names this test, so the guard must not probe it.
+    drop(listener);
+    let _ = std::fs::remove_file(e.socket());
 }

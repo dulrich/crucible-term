@@ -1,42 +1,31 @@
 //! Pure path derivation for the daemon socket, lock, log and session records, over an injected env lookup.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Where the daemon for this Wayland display listens.
+/// Where the user's daemon listens (one per user, whatever display its clients come from).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Paths {
     /// `$XDG_RUNTIME_DIR/cterm`, created `0700`.
     pub dir: PathBuf,
-    /// `<dir>/<basename of WAYLAND_DISPLAY>.sock`.
+    /// `<dir>/daemon.sock` (systemd's `cterm.socket` owns it when the service runs).
     pub socket: PathBuf,
-    /// `<dir>/<basename of WAYLAND_DISPLAY>.lock`.
+    /// `<dir>/daemon.lock`, serialising client-spawned starts (`daemon-start "spawn"`).
     pub lock: PathBuf,
 }
 
-/// The socket paths, or why there are none (no runtime dir or no Wayland display).
+/// The socket paths, or why there are none (no absolute runtime dir). `WAYLAND_DISPLAY` plays
+/// no part.
 pub fn socket_paths(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Paths, String> {
     let runtime = env("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .ok_or("XDG_RUNTIME_DIR is not set")?;
-    let display = env("WAYLAND_DISPLAY")
-        .filter(|v| !v.is_empty())
-        .ok_or("WAYLAND_DISPLAY is not set")?;
-    let base = Path::new(&display)
-        .file_name()
-        .ok_or("WAYLAND_DISPLAY has no basename")?
-        .to_os_string();
     let dir = runtime.join("cterm");
-    let with = |ext: &str| {
-        let mut n = base.clone();
-        n.push(ext);
-        dir.join(n)
-    };
     Ok(Paths {
-        socket: with(".sock"),
-        lock: with(".lock"),
+        socket: dir.join("daemon.sock"),
+        lock: dir.join("daemon.lock"),
         dir,
     })
 }
@@ -47,7 +36,7 @@ pub fn log_path(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 }
 
 /// `$XDG_STATE_HOME/crucible-term/sessions` (fallback under `~/.local/state`): the durable session
-/// records, shared by every display's daemon (see `store`).
+/// records, shared by every daemon of this user (see `store`).
 pub fn sessions_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     Some(crate::config::xdg_home(env, "XDG_STATE_HOME", ".local/state")?.join("sessions"))
 }
@@ -55,6 +44,7 @@ pub fn sessions_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn env(m: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         move |k| m.iter().find(|(n, _)| *n == k).map(|(_, v)| v.into())
@@ -68,10 +58,14 @@ mod tests {
         ]))
         .expect("paths");
         assert_eq!(p.dir, Path::new("/run/user/1000/cterm"));
-        assert_eq!(p.socket, Path::new("/run/user/1000/cterm/wayland-1.sock"));
-        assert_eq!(p.lock, Path::new("/run/user/1000/cterm/wayland-1.lock"));
+        assert_eq!(p.socket, Path::new("/run/user/1000/cterm/daemon.sock"));
+        assert_eq!(p.lock, Path::new("/run/user/1000/cterm/daemon.lock"));
+        // No display at all (an ssh login): the same socket.
+        assert_eq!(
+            socket_paths(&env(&[("XDG_RUNTIME_DIR", "/run/user/1000")])),
+            Ok(p)
+        );
         assert!(socket_paths(&env(&[("WAYLAND_DISPLAY", "wayland-0")])).is_err());
-        assert!(socket_paths(&env(&[("XDG_RUNTIME_DIR", "/run/user/1")])).is_err());
         assert!(
             socket_paths(&env(&[
                 ("XDG_RUNTIME_DIR", "rel"),

@@ -1,5 +1,5 @@
-//! `cterm daemon`: the per-user window daemon. It listens on the per-display socket
-//! ([`paths`]), checks each peer's UID (`SO_PEERCRED`), answers `hello`, and turns each
+//! `cterm daemon`: the per-user window daemon. It listens on the user's socket ([`paths`]): the
+//! listener systemd passes (`cterm.socket`, `LISTEN_FDS`), else one it binds itself; it checks each peer's UID (`SO_PEERCRED`), answers `hello`, and turns each
 //! client's `open` into a window on its backend (the Wayland [`Host`], or the test-only
 //! [`headless`] one), relaying `exited` when the child ends. `close` or EOF from the client
 //! closes the window through the SIGHUP grace. It stays resident after its last window
@@ -8,6 +8,12 @@
 //! client EOF no longer closes it, a child exit is still relayed, and the display it started on
 //! is retried every second ([`RECONNECT`]). An `open` while detached first tries the display
 //! once and is refused if it is still gone.
+//!
+//! It starts with no Wayland connection and never reads its own `WAYLAND_DISPLAY`: each `open`
+//! names the client's display. With no live connection (never connected, or lost) the daemon
+//! adopts that display and connects there (the reconnect retry targets the display adopted
+//! last); with a live connection to another display the open is refused `other-display`
+//! ([`admit`]).
 //!
 //! With `scrollback-persist` it also keeps a durable record of each keyed session ([`store`]),
 //! replayed by the next keyed open that names no live session, and handles SIGTERM/SIGHUP (a
@@ -38,6 +44,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -88,10 +95,16 @@ pub trait Backend: 'static {
     fn is_lost(&self) -> bool {
         false
     }
-    /// Connected, or reconnected now to the display the daemon started on.
+    /// Connected, or (re)connected now to the display adopted last.
     fn reconnect(&mut self) -> bool {
         true
     }
+    /// The display adopted last, if any.
+    fn display(&self) -> Option<&Path> {
+        None
+    }
+    /// Adopt `display` for the next (re)connect.
+    fn set_display(&mut self, _display: PathBuf) {}
     /// Window `id` has no surface (its session survives a client EOF).
     fn is_detached(&self, _id: TermId) -> bool {
         false
@@ -145,6 +158,12 @@ impl Backend for Host {
     fn reconnect(&mut self) -> bool {
         Host::reconnect(self)
     }
+    fn display(&self) -> Option<&Path> {
+        Host::display(self)
+    }
+    fn set_display(&mut self, display: PathBuf) {
+        Host::set_display(self, display);
+    }
     fn is_detached(&self, id: TermId) -> bool {
         Host::is_detached(self, id)
     }
@@ -157,6 +176,69 @@ impl Backend for Host {
     fn restore(&mut self, id: TermId, rec: &store::Record) -> Option<(usize, u64)> {
         Host::restore(self, id, rec)
     }
+}
+
+/// What an `open` naming `want` gets from the display policy (one connection at a time).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admit {
+    /// Live connection to `want`: serve.
+    Serve,
+    /// No live connection, or a live one that adopted no display yet: adopt `want` (and
+    /// connect when not live).
+    Adopt,
+    /// Live connection to another display: refuse `other-display`.
+    OtherDisplay,
+}
+
+/// The display policy: `lost` (no live connection), the display adopted last, the open's.
+pub fn admit(lost: bool, current: Option<&Path>, want: &Path) -> Admit {
+    match current {
+        _ if lost => Admit::Adopt,
+        None => Admit::Adopt,
+        Some(c) if c == want => Admit::Serve,
+        Some(_) => Admit::OtherDisplay,
+    }
+}
+
+/// Apply [`admit`] for `conn`'s open on `display`: adopt and connect as needed. Answers a refusal
+/// (`no-wayland`, `other-display`) and returns false when the open must not be served.
+fn admit_display<B: Backend>(st: &mut State, b: &mut B, conn: u64, display: &Path) -> bool {
+    let lost = b.is_lost();
+    let refuse = match admit(lost, b.display(), display) {
+        Admit::Serve => None,
+        Admit::Adopt => {
+            if b.display() != Some(display) {
+                eprintln!(
+                    "crucible-term: daemon: client {conn}: adopting display {}",
+                    display.display()
+                );
+                b.set_display(display.to_path_buf());
+            }
+            // No live connection: try the display once, synchronously; still unreachable
+            // refuses `no-wayland` so the client falls back to standalone.
+            (lost && !b.reconnect()).then_some("no-wayland")
+        }
+        Admit::OtherDisplay => {
+            eprintln!(
+                "crucible-term: daemon: client {conn}: display {} is not the connected {}; refused",
+                display.display(),
+                b.display()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default()
+            );
+            Some("other-display")
+        }
+    };
+    if let Some(reason) = refuse {
+        st.send(
+            conn,
+            &Msg::Refused {
+                reason: reason.into(),
+            },
+        );
+        return false;
+    }
+    true
 }
 
 /// The peer-UID rule: only our own user may talk to the daemon.
@@ -330,15 +412,7 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64, m: Ms
                 );
                 return true;
             }
-            // Detached: try the display once, synchronously; still lost refuses `no-wayland`
-            // so the client falls back to standalone.
-            if b.is_lost() && !b.reconnect() {
-                st.send(
-                    conn,
-                    &Msg::Refused {
-                        reason: "no-wayland".into(),
-                    },
-                );
+            if !admit_display(st, b, conn, &o.display) {
                 return true;
             }
             let decision = identity::decide(o.grant.is_some(), b.has_identity());
@@ -463,8 +537,10 @@ fn arm_deferred_open<B: Backend>(cx: &Sched<B>, conn: u64, d: Duration, o: Open)
                 .conns
                 .get_mut(&conn)
                 .is_some_and(|c| std::mem::take(&mut c.opening));
+            // Pin E3: the display may have been lost or replaced while the open waited.
             if let Some(o) = o.take()
                 && alive
+                && admit_display(&mut st, b, conn, &o.display)
             {
                 do_open(&mut st, b, conn, o, true);
             }
@@ -558,6 +634,53 @@ fn bind(p: &paths::Paths) -> Result<UnixListener, String> {
     let l = UnixListener::bind(&p.socket).map_err(|e| format!("{}: {e}", p.socket.display()))?;
     l.set_nonblocking(true).map_err(|e| e.to_string())?;
     Ok(l)
+}
+
+/// The socket-activation rule: systemd passed exactly one listener to this very process.
+pub fn activated(listen_pid: Option<&str>, listen_fds: Option<&str>, own_pid: u32) -> bool {
+    listen_pid.and_then(|p| p.trim().parse::<u32>().ok()) == Some(own_pid)
+        && listen_fds.map(str::trim) == Some("1")
+}
+
+/// The `LISTEN_*` variables of socket activation.
+const LISTEN_VARS: [&str; 3] = ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"];
+
+/// The listener systemd passed on fd 3 ([`activated`]), set non-blocking and close-on-exec like
+/// a self-bound one. Unsets the `LISTEN_*` variables either way, so no child ever sees them.
+/// Called while the process is still single-threaded.
+fn inherited_listener() -> Option<Result<UnixListener, String>> {
+    let var = |k: &str| std::env::var(k).ok();
+    let on = activated(
+        var("LISTEN_PID").as_deref(),
+        var("LISTEN_FDS").as_deref(),
+        std::process::id(),
+    );
+    for k in LISTEN_VARS {
+        #[allow(unsafe_code)]
+        // SAFETY: called from `run` before any other thread exists (the record writer starts
+        // later), so nothing reads the environment concurrently.
+        unsafe {
+            std::env::remove_var(k);
+        }
+    }
+    if !on {
+        return None;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: with LISTEN_PID naming this process and LISTEN_FDS=1, systemd's contract hands fd 3
+    // to this process alone; nothing else here owns it. If it is not open, the fcntl below fails
+    // and the value is forgotten without closing anything.
+    let fd = unsafe { OwnedFd::from_raw_fd(3) };
+    if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC) {
+        std::mem::forget(fd);
+        return Some(Err(format!("inherited listener fd 3: {e}")));
+    }
+    let l = UnixListener::from(fd);
+    Some(
+        l.set_nonblocking(true)
+            .map(|()| l)
+            .map_err(|e| format!("inherited listener fd 3: {e}")),
+    )
 }
 
 /// The readiness pipe the starting client passed, if any.
@@ -676,6 +799,7 @@ pub fn run() -> ExitCode {
     if std::env::var_os(DETACH_VAR).is_some() {
         return detach();
     }
+    let inherited = inherited_listener();
     let env = |k: &str| std::env::var_os(k);
     let p = match paths::socket_paths(&env) {
         Ok(p) => p,
@@ -694,7 +818,9 @@ pub fn run() -> ExitCode {
         eprintln!("{w}");
     }
     let ready = ready_fd();
-    let listener = match bind(&p) {
+    // Only a path this process bound is ever unlinked: systemd's socket outlives this daemon.
+    let owns_path = inherited.is_none();
+    let listener = match inherited.unwrap_or_else(|| bind(&p)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("crucible-term: daemon: {e}");
@@ -722,9 +848,10 @@ pub fn run() -> ExitCode {
     };
     let headless = std::env::var_os(HEADLESS_VAR).is_some_and(|v| v == "1");
     eprintln!(
-        "crucible-term: daemon: pid {} listening on {}{}",
+        "crucible-term: daemon: pid {} listening on {}{}{}",
         std::process::id(),
         p.socket.display(),
+        if owns_path { "" } else { " (socket-activated)" },
         if headless {
             " (headless test mode)"
         } else {
@@ -741,6 +868,9 @@ pub fn run() -> ExitCode {
         };
         let mut b = headless::Headless::new(event_loop.handle());
         b.identity = env(headless::IDENTITY_VAR).is_some_and(|v| v == "1");
+        if env(headless::NO_DISPLAY_VAR).is_some_and(|v| v == "1") {
+            b.start_without_display();
+        }
         let ms = |k: &str| {
             headless::Headless::parse_ms(env(k).and_then(|v| v.into_string().ok()).as_deref())
         };
@@ -779,7 +909,9 @@ pub fn run() -> ExitCode {
             Err(e) => Err(e.to_string()),
         }
     };
-    let _ = std::fs::remove_file(&p.socket);
+    if owns_path {
+        let _ = std::fs::remove_file(&p.socket);
+    }
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1010,6 +1142,33 @@ mod tests {
         for off in [None, Some("0"), Some("x"), Some("")] {
             assert_eq!(parse_open_delay(off), None);
         }
+    }
+
+    #[test]
+    fn display_policy_adopts_when_not_live_and_refuses_another_live_display() {
+        let (a, b) = (Path::new("/run/u/wayland-1"), Path::new("/run/u/wayland-2"));
+        assert_eq!(admit(true, None, a), Admit::Adopt, "never connected");
+        assert_eq!(
+            admit(true, Some(b), a),
+            Admit::Adopt,
+            "lost: next open wins"
+        );
+        assert_eq!(admit(false, Some(a), a), Admit::Serve);
+        assert_eq!(admit(false, Some(a), b), Admit::OtherDisplay);
+        assert_eq!(admit(false, None, a), Admit::Adopt);
+    }
+
+    #[test]
+    fn socket_activation_needs_our_pid_and_exactly_one_fd() {
+        assert!(activated(Some("42"), Some("1"), 42));
+        assert!(
+            !activated(Some("41"), Some("1"), 42),
+            "another process's fds"
+        );
+        assert!(!activated(Some("42"), Some("2"), 42));
+        assert!(!activated(None, Some("1"), 42));
+        assert!(!activated(Some("42"), None, 42));
+        assert!(!activated(Some("x"), Some("1"), 42));
     }
 
     #[test]

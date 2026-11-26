@@ -19,8 +19,8 @@ mod routing;
 mod seat_selection;
 mod term;
 
-pub(crate) use host::Host;
 pub use host::run;
+pub(crate) use host::{Host, display_path};
 pub(crate) use routing::TermId;
 
 use crate::config::Settings;

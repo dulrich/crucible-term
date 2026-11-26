@@ -8,7 +8,9 @@
 //! It also fakes a Wayland connection for the detach tests: `CTERM_DEBUG_HEADLESS_LOSS_MS=N`
 //! loses it N ms after start (a socketpair whose peer is dropped, so the loop fails exactly as on
 //! a real loss), and `CTERM_DEBUG_HEADLESS_RECONNECT_MS=M` makes the display reachable again M
-//! ms after the loss (unset: never).
+//! ms after the loss (unset: never). `CTERM_DEBUG_HEADLESS_NO_DISPLAY=1` starts it with no
+//! connection at all (as the real daemon starts): the first open adopts its display and the fake
+//! connects at once.
 
 use super::store;
 use super::{Backend, TermId};
@@ -24,6 +26,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// TEST-ONLY: lose the fake Wayland connection N ms after start.
@@ -33,6 +36,8 @@ pub const RECONNECT_VAR: &str = "CTERM_DEBUG_HEADLESS_RECONNECT_MS";
 /// TEST-ONLY: `1` makes the fake advertise the identity global, so granted opens (and the
 /// session-key reattach) are served.
 pub const IDENTITY_VAR: &str = "CTERM_DEBUG_HEADLESS_IDENTITY";
+/// TEST-ONLY: `1` starts with no (fake) connection and no display, so the first open adopts one.
+pub const NO_DISPLAY_VAR: &str = "CTERM_DEBUG_HEADLESS_NO_DISPLAY";
 
 struct Kid {
     pty: Pty,
@@ -65,6 +70,8 @@ pub struct Headless {
     back_after: Option<Duration>,
     /// Advertise the (fake) identity global.
     pub identity: bool,
+    /// The display adopted last; a (re)connect needs one.
+    display: Option<PathBuf>,
 }
 
 impl Headless {
@@ -80,7 +87,14 @@ impl Headless {
             lost_at: None,
             back_after: None,
             identity: false,
+            display: None,
         }
+    }
+
+    /// Start with no connection: the first open's display is adopted and reachable at once.
+    pub fn start_without_display(&mut self) {
+        self.lost_at = Some(Instant::now());
+        self.back_after = Some(Duration::ZERO);
     }
 
     /// Fake a Wayland connection that is lost `loss` after now; reachable again `back_after`
@@ -284,13 +298,24 @@ impl Backend for Headless {
         self.lost_at.is_some()
     }
 
+    fn display(&self) -> Option<&Path> {
+        self.display.as_deref()
+    }
+
+    fn set_display(&mut self, display: PathBuf) {
+        self.display = Some(display);
+    }
+
     fn reconnect(&mut self) -> bool {
         let Some(at) = self.lost_at else {
             return true;
         };
-        if self.back_after.is_some_and(|d| at.elapsed() >= d) {
+        let Some(d) = &self.display else {
+            return false;
+        };
+        if self.back_after.is_some_and(|b| at.elapsed() >= b) {
             self.lost_at = None;
-            eprintln!("crucible-term: Wayland reconnected (fake)");
+            eprintln!("crucible-term: Wayland connected to {} (fake)", d.display());
             return true;
         }
         false

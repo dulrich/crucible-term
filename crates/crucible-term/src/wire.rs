@@ -11,7 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 /// The wire protocol version; a mismatch makes the client fall back to standalone.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest accepted frame (length field value), 1 MiB.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -34,6 +34,10 @@ pub struct Open {
     pub grant: Option<String>,
     /// `CRUCIBLE_TERM_SESSION` (32 lowercase hex), if valid: names a session to reattach.
     pub session_key: Option<String>,
+    /// The client's Wayland display socket, absolute (rejected at decode otherwise). The daemon
+    /// adopts it when it has no live connection; a live connection to another display refuses
+    /// the open `other-display`.
+    pub display: PathBuf,
 }
 
 /// One message.
@@ -55,7 +59,8 @@ pub enum Msg {
         /// The window rebinds an existing detached session (keyed) instead of a new spawn.
         reattached: bool,
     },
-    /// Daemon → client: the open was refused (`no-identity`, `no-wayland`, or a spawn error).
+    /// Daemon → client: the open was refused (`no-identity`, `no-wayland`, `other-display`, or a
+    /// spawn error).
     Refused {
         /// Why.
         reason: String,
@@ -84,6 +89,8 @@ pub enum WireError {
     BadUtf8,
     /// Bytes left over after the message.
     Trailing,
+    /// `open.display` is empty or not an absolute path.
+    BadDisplay,
 }
 
 impl std::fmt::Display for WireError {
@@ -94,6 +101,7 @@ impl std::fmt::Display for WireError {
             WireError::UnknownTag(t) => write!(f, "unknown message tag {t}"),
             WireError::BadUtf8 => f.write_str("string field is not UTF-8"),
             WireError::Trailing => f.write_str("trailing bytes after message"),
+            WireError::BadDisplay => f.write_str("open display is not an absolute path"),
         }
     }
 }
@@ -161,6 +169,7 @@ pub fn encode(m: &Msg) -> Vec<u8> {
             w.opt(&o.title);
             w.opt(&o.grant);
             w.opt(&o.session_key);
+            w.bytes(o.display.as_os_str().as_bytes());
         }
         Msg::Opened {
             root_pid,
@@ -256,6 +265,10 @@ pub fn decode_body(body: &[u8]) -> Result<Msg, WireError> {
             o.title = r.opt()?;
             o.grant = r.opt()?;
             o.session_key = r.opt()?;
+            o.display = PathBuf::from(r.os()?);
+            if !o.display.is_absolute() {
+                return Err(WireError::BadDisplay);
+            }
             Msg::Open(o)
         }
         T_OPENED => Msg::Opened {
@@ -342,8 +355,12 @@ mod tests {
                 title: None,
                 grant: Some("g".into()),
                 session_key: Some("0123456789abcdef0123456789abcdef".into()),
+                display: "/run/user/1000/wayland-1".into(),
             }),
-            Msg::Open(Open::default()),
+            Msg::Open(Open {
+                display: "/d".into(),
+                ..Open::default()
+            }),
             Msg::Opened {
                 root_pid: 4242,
                 reattached: true,
@@ -403,6 +420,14 @@ mod tests {
         assert_eq!(decode(&[0, 0, 0, 0]), Err(WireError::Oversized(0)));
         assert_eq!(decode_body(&[99]), Err(WireError::UnknownTag(99)));
         assert_eq!(decode_body(&[T_CLOSE, 0]), Err(WireError::Trailing));
+        // The display must be absolute: empty or relative is rejected at the wire boundary.
+        for bad in ["", "wayland-1"] {
+            let f = encode(&Msg::Open(Open {
+                display: bad.into(),
+                ..Open::default()
+            }));
+            assert_eq!(decode(&f), Err(WireError::BadDisplay), "{bad:?}");
+        }
     }
 
     #[test]
@@ -424,7 +449,8 @@ mod tests {
             HelloVerdict::Fallback
         );
         assert_eq!(judge_hello(&Msg::Close, "x"), HelloVerdict::Fallback);
-        // A v1 peer (pre-session-key) falls back rather than misparsing `open`.
+        // A v1 (pre-session-key) or v2 (pre-display) peer falls back rather than misparsing `open`.
         assert_eq!(judge_hello(&h(1, "x"), "x"), HelloVerdict::Fallback);
+        assert_eq!(judge_hello(&h(2, "x"), "x"), HelloVerdict::Fallback);
     }
 }
