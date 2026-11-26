@@ -84,7 +84,7 @@ pub enum Outcome {
 }
 
 /// Read frames from a blocking `stream` until one decodes; `Ok(None)` on EOF.
-fn read_msg(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Result<Option<Msg>> {
+pub(crate) fn read_msg(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Result<Option<Msg>> {
     loop {
         match wire::decode(buf) {
             Ok(Some((m, n))) => {

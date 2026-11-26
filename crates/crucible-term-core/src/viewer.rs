@@ -192,6 +192,16 @@ impl Viewer {
         o.into_bytes()
     }
 
+    /// A state-independent reset for a host terminal whose viewer state is unknown (the daemon
+    /// was lost, or the transport to a remote viewer went away): SGR and scroll region reset,
+    /// cursor visible in the default shape, DECCKM off, DECKPNM, bracketed paste, focus and
+    /// every mouse mode off, the kitty keyboard entry popped (while still on the alternate
+    /// screen, whose stack [`Viewer::enter`] pushed onto), then the alternate screen off.
+    pub fn leave_all() -> Vec<u8> {
+        b"\x1b[0m\x1b[r\x1b[0 q\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?1049l"
+            .to_vec()
+    }
+
     /// The frame that brings this viewer from its last committed state to `screen` (the
     /// session's visible screen, as [`crate::Session::screen`] returns it), `modes` and `style`.
     pub fn frame(&self, screen: &Grid, modes_now: &TermModes, style: CursorStyle) -> Frame {
@@ -422,5 +432,18 @@ fn mouse_code(m: MouseMode) -> Option<u16> {
         MouseMode::Click => Some(1000),
         MouseMode::Drag => Some(1002),
         MouseMode::Any => Some(1003),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Viewer;
+
+    #[test]
+    fn leave_all_is_the_fixed_reset() {
+        assert_eq!(
+            Viewer::leave_all(),
+            b"\x1b[0m\x1b[r\x1b[0 q\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?1049l"
+        );
     }
 }

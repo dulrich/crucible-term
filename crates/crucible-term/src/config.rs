@@ -21,6 +21,7 @@
 //! scrollback-persist #false                // daemon: keep a record of each keyed session on disk (survives reboot)
 //! persist-lines 2000                       // daemon: history rows per record (clamped to scrollback)
 //! persist-days 14                          // daemon: records older than this are deleted at startup; 0 = never
+//! attach-prefix "C-\\"                     // `cterm attach`: the prefix key, C-<char> (then d detaches)
 //! include "~/.config/cde/terminal-theme/cterm.kdl"   // read another file in place
 //! ```
 //!
@@ -95,6 +96,9 @@ pub struct Settings {
     pub persist_lines: usize,
     /// Daemon: records older than this many days are deleted at startup; 0 = never.
     pub persist_days: u64,
+    /// `cterm attach`: the prefix key is Ctrl plus this character (`attach-prefix "C-<char>"`,
+    /// stored lowercase; default `\\`).
+    pub attach_prefix: char,
 }
 
 impl Default for Settings {
@@ -115,6 +119,7 @@ impl Default for Settings {
             scrollback_persist: false,
             persist_lines: 2000,
             persist_days: 14,
+            attach_prefix: '\\',
         }
     }
 }
@@ -147,6 +152,23 @@ fn set_daemon_start(s: &mut Settings, v: &str) -> Result<(), String> {
         "spawn" => DaemonStart::Spawn,
         _ => return Err(format!("daemon-start {v:?}: expected service|spawn")),
     };
+    Ok(())
+}
+
+/// `attach-prefix "C-<char>"`: a character with a C0 control form (`@`, `A`-`Z`, `a`-`z`, `[`,
+/// `\`, `]`, `^`, `_`); letters are stored lowercase.
+fn set_attach_prefix(s: &mut Settings, v: &str) -> Result<(), String> {
+    let bad = || format!("attach-prefix {v:?}: expected C-<char>, e.g. \"C-\\\\\" or \"C-a\"");
+    let rest = v.strip_prefix("C-").ok_or_else(bad)?;
+    let mut chars = rest.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return Err(bad());
+    };
+    let c = c.to_ascii_lowercase();
+    if !(c.is_ascii_lowercase() || "@[\\]^_".contains(c)) {
+        return Err(bad());
+    }
+    s.attach_prefix = c;
     Ok(())
 }
 
@@ -681,6 +703,17 @@ const KEYS: &[Key] = &[
         from_o: Some(|s, k, v| set_count(s, k, o_float(k, v)?)),
     },
     Key {
+        kdl: Some("attach-prefix"),
+        o: &["attach-prefix"],
+        from_kdl: Some(
+            |node, s, w| match node.get(0).and_then(KdlValue::as_string) {
+                Some(m) => set_attach_prefix(s, m).unwrap_or_else(|m| w(node, m)),
+                None => w(node, "attach-prefix: expected a string C-<char>".into()),
+            },
+        ),
+        from_o: Some(|s, _, v| set_attach_prefix(s, v)),
+    },
+    Key {
         kdl: Some("cursor"),
         o: &["cursor.shape", "cursor.style"],
         from_kdl: Some(kdl_cursor),
@@ -1133,5 +1166,19 @@ mod tests {
         ]);
         assert_eq!(s.scrollback, 9);
         assert_eq!(w.len(), 4, "{w:?}");
+    }
+
+    #[test]
+    fn attach_prefix_takes_c_char_forms_only() {
+        let (s, w) = load_files(&[("/h/c.kdl", "attach-prefix \"C-A\"\n")]);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.attach_prefix, 'a');
+        assert_eq!(Settings::default().attach_prefix, '\\');
+        for bad in ["M-a", "C-", "C-ab", "C-1", "a"] {
+            let mut s = Settings::default();
+            let mut w = Vec::new();
+            apply_override(&mut s, &format!("attach-prefix={bad}"), &mut w);
+            assert_eq!((s.attach_prefix, w.len()), ('\\', 1), "{bad}");
+        }
     }
 }

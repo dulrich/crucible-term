@@ -2,6 +2,7 @@
 //! `$SHELL`, fallback `/bin/sh`) on a PTY and exits with the child's exit status. The command
 //! line is in [`cli`], the KDL configuration and `-o` overrides in [`config`].
 
+mod attach;
 mod cli;
 mod client;
 mod clipboard;
@@ -70,9 +71,17 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(cli::Parsed::Daemon) => return daemon::run(),
+        Ok(cli::Parsed::SubHelp(sub)) => {
+            print!("{}", sub.usage());
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Ls(host)) => return attach::ls(host),
+        Ok(cli::Parsed::Attach(t)) => return attach::attach(t),
+        Ok(cli::Parsed::Kill(t)) => return attach::kill(t),
         Ok(cli::Parsed::Run(c)) => c,
         Err(e) => {
-            eprintln!("crucible-term: {e}\n{}", cli::USAGE);
+            let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+            eprintln!("crucible-term: {e}\n{}", cli::usage_of(&args));
             return ExitCode::from(2);
         }
     };
