@@ -584,8 +584,12 @@ fn a_viewer_undrained_past_the_limit_is_dropped_and_the_session_lives() {
 #[test]
 fn kill_answers_once_and_every_viewer_hears_the_exit() {
     let e = Env::new("kill", &[], "");
-    let (mut w, _) = Conn::open(&e, "trap 'exit 3' HUP; while :; do sleep 0.05; done", None);
+    // The child prints ARMED once its trap is set: a kill before that ends the shell by the
+    // signal (129) instead of by the trap.
+    let armed = |n: u8| format!("trap 'exit {n}' HUP; echo ARMED; while :; do sleep 0.05; done");
+    let (mut w, _) = Conn::open(&e, &armed(3), None);
     let (mut v, _) = Viewer::attach(&e, "1", 40, 8);
+    assert!(v.read_until(5 * SEC, |v| v.shows("ARMED")));
     let mut k = Conn::new(&e);
     k.kill("1");
     let (tag, p) = k.next();
@@ -600,8 +604,9 @@ fn kill_answers_once_and_every_viewer_hears_the_exit() {
     );
     assert_eq!(w.next().0, T_EXITED, "the window hears it too");
     // A viewer that kills its own session gets one `Exited`, not two.
-    let (_w2, _) = Conn::open(&e, "trap 'exit 4' HUP; while :; do sleep 0.05; done", None);
+    let (_w2, _) = Conn::open(&e, &armed(4), None);
     let (mut v, _) = Viewer::attach(&e, "2", 40, 8);
+    assert!(v.read_until(5 * SEC, |v| v.shows("ARMED")));
     v.c.kill("2");
     assert!(v.read_until(5 * SEC, |v| v.eof));
     assert_eq!(v.tags.iter().filter(|&&t| t == T_EXITED).count(), 1);
