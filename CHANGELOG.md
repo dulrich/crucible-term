@@ -4,6 +4,23 @@ All notable changes to crucible-term are recorded here, in the [Keep a Changelog
 
 crucible-term uses pre-1.0 semantic versioning: a breaking change to the config or the command-line contract CDE spawns through bumps the minor version; anything else bumps the patch.
 
+## 0.6.0 — 2026-11-25
+
+The daemon becomes a systemd user service, so sessions live outside every login session. This is a breaking change: a 0.6 client cannot reach a 0.5 daemon (other socket, other wire version), and clients no longer start the daemon themselves by default.
+
+### Changed
+
+- One daemon serves the user, not one per display. Its socket is `$XDG_RUNTIME_DIR/cterm/daemon.sock` in a `0700` directory; `WAYLAND_DISPLAY` plays no part in the path, so an ssh login reaches the same socket.
+- The daemon starts with no Wayland connection. A client's `open` names the display it came from (wire protocol version 3) and the daemon connects there; an `open` from a different display than the one it serves is refused with `other-display`, and that client runs standalone.
+- `cterm daemon` uses a listener passed by systemd socket activation when there is one, and otherwise binds the path itself. A service-started daemon logs to the journal (`journalctl --user -u cterm`), not `daemon.log`.
+- The deploy refuses a host while a legacy `cterm daemon` is running outside `cterm.service`, and on a clean host also installs the units, enables `cterm.socket` and enables linger.
+
+### Added
+
+- User units `share/systemd/cterm.socket` and `cterm.service`. The service keeps running across logout (with linger), stops the daemon before its shells so records are saved, and survives one OOM-killed shell.
+- Config key `daemon-start`: `"service"` (default) only connects to the socket; `"spawn"` keeps the old behaviour, where the client starts `cterm daemon` itself when nothing listens (nested harnesses, hosts without the unit).
+- `scripts/deploy.sh --cutover <host>` stops a legacy daemon and switches the host to the service in one step that survives the death of its own terminal; `--check <host>` is a read-only check that the host runs the service daemon with the socket active and linger on.
+
 ## 0.5.2 — 2026-11-13
 
 ### Added
