@@ -53,6 +53,8 @@ pub struct Timing {
     /// Delete a finished session's record this long after it finished (at least 5 s by
     /// default, so a shutdown signal racing the shells' exits keeps it).
     pub grace: Duration,
+    /// Retry a record lock another daemon held at open this often until it is ours.
+    pub claim_retry: Duration,
     /// Log every save (test mode).
     pub log_saves: bool,
 }
@@ -63,13 +65,14 @@ impl Default for Timing {
             quiet: Duration::from_secs(2),
             max_age: Duration::from_secs(30),
             grace: Duration::from_secs(6),
+            claim_retry: Duration::from_secs(3),
             log_saves: false,
         }
     }
 }
 
 impl Timing {
-    /// The default cadence, or the TEST-ONLY `quiet,max_age,grace` ms override.
+    /// The default cadence, or the TEST-ONLY `quiet,max_age,grace[,claim_retry]` ms override.
     pub fn from_env(v: Option<&str>) -> Timing {
         let ms: Option<Vec<u64>> =
             v.and_then(|v| v.split(',').map(|p| p.trim().parse().ok()).collect());
@@ -78,6 +81,14 @@ impl Timing {
                 quiet: Duration::from_millis(q),
                 max_age: Duration::from_millis(m),
                 grace: Duration::from_millis(g),
+                log_saves: true,
+                ..Timing::default()
+            },
+            Some(&[q, m, g, r]) => Timing {
+                quiet: Duration::from_millis(q),
+                max_age: Duration::from_millis(m),
+                grace: Duration::from_millis(g),
+                claim_retry: Duration::from_millis(r),
                 log_saves: true,
             },
             _ => Timing::default(),
@@ -446,7 +457,10 @@ pub enum Claim {
     /// Taken over from this daemon's own finished session awaiting deletion: no replay (that
     /// session was closed), the new session overwrites the record.
     Reused(Owned),
-    /// Not persisted (another daemon owns the key, or the key is unusable).
+    /// Another daemon holds the key's lock: not persisted for now, retried on
+    /// [`Timing::claim_retry`] (logged once, on the first attempt).
+    Busy,
+    /// Not persisted and never retried (the key is unusable, or the lock file errored).
     None,
 }
 
@@ -487,6 +501,15 @@ impl Persist {
 
     /// Take ownership of `key`'s record for a new session (see [`Claim`]).
     pub fn claim(&mut self, key: &str, id: TermId) -> Claim {
+        self.claim_at(key, id, true)
+    }
+
+    /// A retry of a [`Claim::Busy`] open: like [`Persist::claim`] but a further `Busy` is silent.
+    pub fn reclaim(&mut self, key: &str, id: TermId) -> Claim {
+        self.claim_at(key, id, false)
+    }
+
+    fn claim_at(&mut self, key: &str, id: TermId, first: bool) -> Claim {
         if !valid_key(key) {
             eprintln!(
                 "crucible-term: daemon: session {id}: key is not a record name; not persisted"
@@ -507,10 +530,12 @@ impl Persist {
                 dirty_since: None,
             }),
             Err(LockErr::Busy) => {
-                eprintln!(
-                    "crucible-term: daemon: session {id}: its record is owned by another daemon; not persisted"
-                );
-                Claim::None
+                if first {
+                    eprintln!(
+                        "crucible-term: daemon: session {id}: its record is owned by another daemon; not persisted (retrying)"
+                    );
+                }
+                Claim::Busy
             }
             Err(LockErr::Io(e)) => {
                 eprintln!("crucible-term: daemon: session {id}: record lock: {e}; not persisted");

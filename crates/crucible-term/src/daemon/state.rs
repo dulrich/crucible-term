@@ -39,6 +39,16 @@ pub(super) struct SessionRec {
     /// detached timeout clears the key, and the record still gets its final capture and its
     /// delayed deletion.
     pub(super) record: Option<super::store::Owned>,
+    /// Set while the key's record lock was held by another daemon at open: retried until owned.
+    pub(super) claim_wait: Option<ClaimWait>,
+}
+
+/// A busy record claim waiting for its next retry.
+pub(super) struct ClaimWait {
+    /// The record key (kept apart from `SessionRec::key`, which a detached timeout clears).
+    pub(super) key: String,
+    /// When to try the lock next.
+    pub(super) next: Instant,
 }
 
 impl std::fmt::Display for TermId {

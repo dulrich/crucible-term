@@ -1081,3 +1081,210 @@ fn a_socket_activated_daemon_serves_and_never_unlinks_the_socket() {
     drop(listener);
     let _ = std::fs::remove_file(e.socket());
 }
+
+/// A record lock another daemon holds at open is retried: once released the session owns the
+/// record and its (quiet) live screen is captured over the older record, never replayed, and
+/// the busy claim is logged once however many retries ran.
+#[test]
+fn a_busy_record_claim_is_retried_and_never_replays() {
+    let e = Env::persisting("persist-late");
+    std::fs::create_dir_all(e.records()).unwrap();
+    std::fs::write(
+        e.record(),
+        format!("cterm-session 1 key={KEY} cols=80 rows=24\nOLDREC-TEXT"),
+    )
+    .unwrap();
+    // The competitor: hold the key's lock from here.
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(e.records().join(format!("{KEY}.lock")))
+        .unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("the test takes the competitor's lock");
+    let ready = e.root.join("ready");
+    let mut cmd = e.keyed_sh(&format!("echo LIVE-LINE; {}", hup_loop(&ready)));
+    cmd.env("CTERM_DEBUG_PERSIST_MS", "200,1000,800,150");
+    let mut c = cmd.spawn().expect("client");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    assert!(
+        until(Duration::from_secs(5), || e
+            .log()
+            .contains("owned by another daemon")),
+        "{}",
+        e.log()
+    );
+    // Several retry intervals pass while the competitor still holds the lock.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(e.record_text().contains("OLDREC-TEXT") && !e.record_text().contains("LIVE-LINE"));
+    drop(lock);
+    assert!(
+        until(Duration::from_secs(5), || e
+            .record_text()
+            .contains("LIVE-LINE")),
+        "{}",
+        e.log()
+    );
+    let t = e.record_text();
+    assert!(
+        !t.contains("OLDREC-TEXT"),
+        "the live grid is not replaced: {t}"
+    );
+    let log = e.log();
+    assert_eq!(log.matches("owned by another daemon").count(), 1, "{log}");
+    assert!(!log.contains("from record ("), "{log}");
+    assert!(log.contains("claimed late"), "{log}");
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
+/// The text between a `<<'TAG'` line and the line `TAG` in `src`.
+fn heredoc<'a>(src: &'a str, tag: &str) -> &'a str {
+    let open = format!("<<'{tag}'");
+    let start = src.find(&open).expect("heredoc opener");
+    let body = &src[start..];
+    let body = &body[body.find('\n').expect("opener line") + 1..];
+    let end = body
+        .lines()
+        .scan(0, |off, l| {
+            let at = *off;
+            *off += l.len() + 1;
+            Some((at, l))
+        })
+        .find(|(_, l)| *l == tag)
+        .expect("heredoc terminator")
+        .0;
+    &body[..end]
+}
+
+/// The cutover's order, run from the shipped script text against stubs on a scratch tree: the
+/// binary and units are installed (and `daemon-reload` run) before the legacy daemon is
+/// signalled, a window respawned during its exit delay already gets the new binary, and the
+/// socket is enabled only after the legacy daemon has exited.
+#[test]
+fn the_cutover_installs_before_the_sigterm_and_enables_the_socket_after_the_exit() {
+    let t = std::env::temp_dir().join(format!("ctd-cutover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&t);
+    let (stubs, stage, dest) = (t.join("stubs"), t.join("stage"), t.join("dest"));
+    for d in [&stubs, &stage, &t.join("home"), &t.join("run")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let (ev, respawn, ready) = (t.join("events"), t.join("respawn"), t.join("ready"));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let write = |p: PathBuf, s: String| std::fs::write(p, s).unwrap();
+    let exec = |p: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write(
+        stage.join("cterm"),
+        format!(
+            "#!/bin/sh\ncase $1 in --build) echo {id} ;; --version) echo 'cterm 9.9.9' ;; esac\n"
+        ),
+    );
+    exec(&stage.join("cterm"));
+    for f in ["cterm.desktop", "cterm.socket", "cterm.service"] {
+        write(stage.join(f), "x\n".into());
+    }
+    let ev_s = ev.display();
+    write(
+        stubs.join("systemctl"),
+        format!(
+            "#!/bin/sh\necho \"systemctl $*\" >> {ev_s}\ncase $* in *is-active*) echo active ;; esac\nexit 0\n"
+        ),
+    );
+    write(
+        stubs.join("loginctl"),
+        format!(
+            "#!/bin/sh\necho \"loginctl $*\" >> {ev_s}\ncase $* in *show-user*) echo Linger=yes ;; esac\nexit 0\n"
+        ),
+    );
+    exec(&stubs.join("systemctl"));
+    exec(&stubs.join("loginctl"));
+    // The fake legacy daemon: on TERM it checks what a respawned window would run, lingers, exits.
+    write(
+        t.join("legacy.sh"),
+        format!(
+            "trap '{d}/cterm --build > {r}; sleep 0.3; echo legacy-exit >> {ev_s}; exit 0' TERM\n\
+             echo up > {rd}\nwhile :; do sleep 0.05; done\n",
+            d = dest.display(),
+            r = respawn.display(),
+            rd = ready.display()
+        ),
+    );
+    let mut legacy = Command::new("bash")
+        .arg(t.join("legacy.sh"))
+        .spawn()
+        .expect("bash is required");
+    assert!(wait_for(&ready, Duration::from_secs(5)));
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/deploy.sh"),
+    )
+    .expect("deploy.sh");
+    write(
+        t.join("cutover.sh"),
+        format!(
+            "{}\ncterm_legacy_pid() {{ if alive {pid}; then echo {pid}; fi; }}\n{}",
+            heredoc(&src, "LIB"),
+            heredoc(&src, "CUT"),
+            pid = legacy.id()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(t.join("cutover.sh"))
+        .args(["testhost"])
+        .arg(&stage)
+        .arg(&dest)
+        .arg(t.join("apps"))
+        .arg(id)
+        .arg(legacy.id().to_string())
+        .arg("1")
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", t.join("home"))
+        .env("XDG_RUNTIME_DIR", t.join("run"))
+        .env("XDG_STATE_HOME", t.join("state"))
+        .env("XDG_CONFIG_HOME", t.join("cfg"))
+        .env("XDG_DATA_HOME", t.join("data"))
+        .output()
+        .expect("run the cutover");
+    let _ = legacy.kill();
+    let _ = legacy.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let events = std::fs::read_to_string(&ev).unwrap_or_default();
+    let at = |needle: &str| events.lines().position(|l| l.contains(needle));
+    let (reload, exited, enable) = (
+        at("daemon-reload"),
+        at("legacy-exit"),
+        at("enable --now cterm.socket"),
+    );
+    let msg = format!("{stdout}{}\n{events}", String::from_utf8_lossy(&out.stderr));
+    // (iv) success, one RESULT line, the result file under the scratch state dir.
+    assert_eq!(out.status.code(), Some(0), "{msg}");
+    assert_eq!(stdout.trim(), "RESULT: testhost cterm 9.9.9", "{msg}");
+    let result = std::fs::read_to_string(t.join("home/.local/state/crucible-term/cutover-result"))
+        .unwrap_or_default();
+    assert!(result.contains("RESULT: testhost cterm 9.9.9"), "{msg}");
+    // (i) the units were reloaded before the legacy daemon exited; (ii) the socket after it.
+    assert!(
+        reload.is_some() && exited.is_some() && enable.is_some(),
+        "{msg}"
+    );
+    assert!(reload < exited, "{msg}");
+    assert!(exited < enable, "{msg}");
+    // (i)/(iii) a respawn probe during the legacy daemon's exit delay already saw the new build.
+    assert_eq!(
+        std::fs::read_to_string(&respawn).unwrap_or_default().trim(),
+        id,
+        "{msg}"
+    );
+    assert!(dest.join("cterm").exists(), "{msg}");
+    let _ = std::fs::remove_dir_all(&t);
+}

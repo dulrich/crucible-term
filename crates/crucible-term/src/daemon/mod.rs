@@ -38,7 +38,7 @@ use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
     EventLoop, Interest, LoopHandle, Mode, PostAction,
 };
-use state::{Conn, Expiry, SessionRec, State, detached_clock};
+use state::{ClaimWait, Conn, Expiry, SessionRec, State, detached_clock};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -295,7 +295,7 @@ fn do_open<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: Open, granted: b
                         "crucible-term: daemon: client {conn}: session key already names live session {old}; session {id} is not reattachable"
                     );
                 } else {
-                    rec.record = claim_record(st, b, id, &k);
+                    (rec.record, rec.claim_wait) = claim_record(st, b, id, &k);
                     rec.key = Some(k);
                 }
             }
@@ -324,12 +324,21 @@ fn claim_record<B: Backend>(
     b: &mut B,
     id: TermId,
     key: &str,
-) -> Option<store::Owned> {
-    let p = st.persist.as_mut()?;
+) -> (Option<store::Owned>, Option<ClaimWait>) {
+    let Some(p) = st.persist.as_mut() else {
+        return (None, None);
+    };
     let mut o = match p.claim(key, id) {
         store::Claim::Fresh(o) => o,
-        store::Claim::Reused(o) => return Some(o),
-        store::Claim::None => return None,
+        store::Claim::Reused(o) => return (Some(o), None),
+        store::Claim::Busy => {
+            let wait = ClaimWait {
+                key: key.to_string(),
+                next: Instant::now() + p.timing.claim_retry,
+            };
+            return (None, Some(wait));
+        }
+        store::Claim::None => return (None, None),
     };
     match store::load(&p.dir, key) {
         Ok(Some(r)) => {
@@ -341,7 +350,33 @@ fn claim_record<B: Backend>(
         Ok(None) => {}
         Err(e) => eprintln!("crucible-term: daemon: record skipped: {e}"),
     }
-    Some(o)
+    (Some(o), None)
+}
+
+/// Retry every busy record claim whose time has come. A late claim never replays (the open-time
+/// path in [`claim_record`] is valid only before the child's first output): the session takes
+/// ownership and its live grid is captured on the normal schedule, overwriting the old record.
+fn retry_claims(st: &mut State, now: Instant) {
+    let Some(p) = st.persist.as_mut() else {
+        return;
+    };
+    for (&id, r) in &mut st.sessions {
+        let Some(w) = r.claim_wait.as_mut() else {
+            continue;
+        };
+        if w.next > now {
+            continue;
+        }
+        match p.reclaim(&w.key, id) {
+            store::Claim::Fresh(o) | store::Claim::Reused(o) => {
+                eprintln!("crucible-term: daemon: session {id}: record claimed late; persisting");
+                r.record = Some(o);
+                r.claim_wait = None;
+            }
+            store::Claim::Busy => w.next = now + p.timing.claim_retry,
+            store::Claim::None => r.claim_wait = None,
+        }
+    }
 }
 
 /// The reattach rule for a *granted* open: if its session key names a detached session of this
@@ -1057,6 +1092,7 @@ fn serve<B: Backend>(
             }
             return Ok(());
         }
+        retry_claims(&mut state.borrow_mut(), Instant::now());
         // Periodic and final captures, before the reap drops finished sessions.
         {
             let mut st = state.borrow_mut();
@@ -1113,6 +1149,11 @@ fn record_deadline<B: Backend>(st: &State, b: &B) -> Option<Instant> {
     st.sessions
         .iter()
         .filter_map(|(&id, r)| p.due(r.record.as_ref()?, &b.view(id)?))
+        .chain(
+            st.sessions
+                .values()
+                .filter_map(|r| r.claim_wait.as_ref().map(|w| w.next)),
+        )
         .chain(p.next_deletion())
         .min()
 }
