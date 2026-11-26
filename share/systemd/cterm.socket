@@ -1,0 +1,11 @@
+[Unit]
+Description=crucible-term daemon socket
+Documentation=https://github.com/dulrich/crucible-term#readme
+
+[Socket]
+ListenStream=%t/cterm/daemon.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

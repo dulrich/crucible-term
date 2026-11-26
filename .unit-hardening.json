@@ -1,0 +1,8 @@
+{
+  "defaultScope": "user",
+  "units": [
+    { "path": "share/systemd/cterm.socket", "scope": "user" },
+    { "path": "share/systemd/cterm.service", "scope": "user", "ceiling": 9.6, "reason": "spawns the user's interactive shells (sudo, full filesystem, devices): the unit cannot sandbox its children" }
+  ],
+  "exclude": []
+}

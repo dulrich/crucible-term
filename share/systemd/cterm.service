@@ -1,0 +1,16 @@
+[Unit]
+Description=crucible-term daemon (owns the PTYs and VT state)
+Documentation=https://github.com/dulrich/crucible-term#readme
+Requires=cterm.socket
+After=cterm.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cterm daemon
+# SIGTERM reaches the daemon alone first (records are saved), then the shells are killed.
+KillMode=mixed
+TimeoutStopSec=30
+# One OOM-killed shell must not stop the unit and every other session with it.
+OOMPolicy=continue
+# The user manager's environment carries WAYLAND_DISPLAY; the service daemon must not inherit it.
+UnsetEnvironment=WAYLAND_DISPLAY
