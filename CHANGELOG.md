@@ -19,7 +19,7 @@ The daemon becomes a systemd user service, so sessions live outside every login 
 
 - User units `share/systemd/cterm.socket` and `cterm.service`. The service keeps running across logout (with linger), stops the daemon before its shells so records are saved, and survives one OOM-killed shell.
 - Config key `daemon-start`: `"service"` (default) only connects to the socket; `"spawn"` keeps the old behaviour, where the client starts `cterm daemon` itself when nothing listens (nested harnesses, hosts without the unit).
-- `scripts/deploy.sh --cutover <host>` stops a legacy daemon and switches the host to the service in one step that survives the death of its own terminal; `--check <host>` is a read-only check that the host runs the service daemon with the socket active and linger on.
+- The deploy script gains `--cutover <host>`, which stops a legacy daemon and switches the host to the service in one step that survives the death of its own terminal, and `--check <host>`, a read-only check that the host runs the service daemon with the socket active and linger on.
 
 ## 0.5.2 — 2026-11-13
 
