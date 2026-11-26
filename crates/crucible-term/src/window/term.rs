@@ -190,6 +190,11 @@ pub struct Term {
     /// What the daemon's viewers read from the event drain: the current OSC 0/2 title (with or
     /// without a surface), the last OSC 7 directory and the BELs not yet taken.
     pub(super) seen: crate::daemon::Seen,
+    /// A viewer owns the size: the session and PTY stay at this grid (cols, rows) whatever the
+    /// window's own buffer would give. `None`: the window sizes the session.
+    pub(super) foreign: Option<(u16, u16)>,
+    /// The window's own input took the size back; the daemon collects this once.
+    pub(super) active: bool,
 }
 
 /// Copy full-width bands of rows (`(y, height)`, `stride` bytes per row) from one slot of the
@@ -250,20 +255,59 @@ impl Term {
         }
     }
 
-    /// The padding in buffer pixels: the configured logical padding scaled, plus the spare
-    /// pixels split evenly when `center` is set.
-    pub(super) fn pad_px(&self) -> Pad {
-        let base = self.base_pad();
-        if self.cfg.settings.center {
-            render::centered(
-                self.buf.0,
-                self.buf.1,
-                &self.metrics(),
-                self.session.size(),
-                base,
-            )
-        } else {
-            base
+    /// Where the session's grid shows in the window, and how much of it (one mapping for the
+    /// painter, hit testing, selection and the cursor).
+    pub(super) fn visible(&self) -> render::Visible {
+        render::visible_grid(
+            self.buf,
+            &self.metrics(),
+            self.base_pad(),
+            self.cfg.settings.center,
+            self.session.size(),
+            self.foreign.is_some(),
+        )
+    }
+
+    /// The one place the session and its PTY take a size: the viewer's when it owns the size,
+    /// else what the window's buffer gives. With no buffer (never configured, or detached: the
+    /// host zeroes it) the current size stays.
+    fn fit_session(&mut self) {
+        let want = match self.foreign {
+            Some((c, r)) => (usize::from(c.max(1)), usize::from(r.max(1))),
+            None if self.buf.0 > 0 && self.buf.1 > 0 => {
+                render::grid_size(self.buf.0, self.buf.1, &self.metrics(), self.base_pad())
+            }
+            None => self.session.size(),
+        };
+        let (cols, rows) = want;
+        if want != self.session.size() {
+            self.inp.selection = None;
+            self.session.resize(cols, rows);
+            let size = (
+                u16::try_from(cols).unwrap_or(u16::MAX),
+                u16::try_from(rows).unwrap_or(u16::MAX),
+            );
+            if let Err(e) = self.pty.resize(size) {
+                eprintln!("crucible-term: pty resize: {e}");
+            }
+        }
+    }
+
+    /// A viewer's size request: `Some` takes the size (zero clamps to 1), `None` hands it back
+    /// to the window (a detached session keeps its current size).
+    pub(super) fn set_foreign(&mut self, size: Option<(u16, u16)>) {
+        self.foreign = size.map(|(c, r)| (c.max(1), r.max(1)));
+        self.fit_session();
+        self.full = true;
+        self.request_redraw();
+    }
+
+    /// The window's own input (a key, a paste, a pointer button): take the size back before the
+    /// input is encoded, and raise the flag the daemon collects. Nothing without a foreign size.
+    pub(super) fn window_active(&mut self) {
+        if self.foreign.is_some() {
+            self.set_foreign(None);
+            self.active = true;
         }
     }
 
@@ -431,19 +475,7 @@ impl Term {
                 sf.frames.reset();
             }
         }
-        let m: Metrics = self.metrics();
-        let (cols, rows) = render::grid_size(buf.0, buf.1, &m, self.base_pad());
-        if (cols, rows) != self.session.size() {
-            self.inp.selection = None;
-            self.session.resize(cols, rows);
-            let size = (
-                u16::try_from(cols).unwrap_or(u16::MAX),
-                u16::try_from(rows).unwrap_or(u16::MAX),
-            );
-            if let Err(e) = self.pty.resize(size) {
-                eprintln!("crucible-term: pty resize: {e}");
-            }
-        }
+        self.fit_session();
         if let Some(s) = &self.surf {
             if let Some(vp) = &s.viewport {
                 vp.set_destination(self.logical.0 as i32, self.logical.1 as i32);
@@ -495,7 +527,11 @@ impl Term {
         );
         // Scrolled back: damage rows are screen rows, not viewport rows, so repaint everything.
         let scrolled = self.session.display_offset() > 0;
-        let grid = self.session.viewport();
+        let mut grid = self.session.viewport();
+        let vis = self.visible();
+        if (vis.cols, vis.rows) != self.session.size() {
+            render::clip_grid(&mut grid, vis.cols, vis.rows);
+        }
         let mut rows = if self.full || scrolled {
             None
         } else {
@@ -554,7 +590,7 @@ impl Term {
             focused: self.focused,
             blink_on: self.blink_on,
         };
-        let pad = self.pad_px();
+        let pad = vis.origin;
         let top = self.session.viewport_top();
         let sel = self.inp.selection.as_ref();
         let selected = |r: usize, c: usize| sel.is_some_and(|s| s.contains(top + r, c));

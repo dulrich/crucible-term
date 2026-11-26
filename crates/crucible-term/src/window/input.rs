@@ -18,7 +18,6 @@ use super::routing::TermId;
 use super::seat_selection::{Clipboard, Primary, Target};
 use super::term::Term;
 use crate::clipboard::{self, Osc52};
-use crate::render;
 use crate::selection::{Clicks, Kind, Point, Selection};
 use crucible_term_core::{
     Key, Mods, MouseAction, MouseButton, MouseEvent, MouseMode, encode_key, encode_mouse,
@@ -294,10 +293,12 @@ impl Term {
 
     // ---- keyboard -----------------------------------------------------------------------
 
-    fn on_key(&mut self, seat: &mut SeatInput, event: &KeyEvent, repeat: bool) {
+    pub(super) fn on_key(&mut self, seat: &mut SeatInput, event: &KeyEvent, repeat: bool) {
         let Some((key, implied_shift)) = translate(event.keysym, event.utf8.as_deref()) else {
             return;
         };
+        // A key press is window activity: the size comes back before anything is encoded.
+        self.window_active();
         let mut mods = seat.mods;
         mods.shift |= implied_shift;
         let (ctrl_shift, shift_only) = (
@@ -358,18 +359,12 @@ impl Term {
 
     // ---- pointer ------------------------------------------------------------------------
 
-    /// The grid cell `(col, row)` under the pointer, clamped to the grid.
-    fn pointer_cell(&self) -> (usize, usize) {
+    /// The grid cell `(col, row)` under the pointer, clamped to the visible grid; `None` in the
+    /// blank margin beside a session a viewer sized smaller than the window.
+    fn pointer_cell(&self) -> Option<(usize, usize)> {
         let s = self.effective_scale();
-        let (cols, rows) = self.session.size();
-        render::cell_at(
-            self.inp.pos.0 * s,
-            self.inp.pos.1 * s,
-            &self.metrics(),
-            self.pad_px(),
-            cols,
-            rows,
-        )
+        self.visible()
+            .cell_at(self.inp.pos.0 * s, self.inp.pos.1 * s, &self.metrics())
     }
 
     fn abs_point(&self, (col, row): (usize, usize)) -> Point {
@@ -381,7 +376,9 @@ impl Term {
 
     fn report(&mut self, mods: Mods, action: MouseAction, button: MouseButton) -> bool {
         let modes = self.session.modes();
-        let (col, row) = self.pointer_cell();
+        let Some((col, row)) = self.pointer_cell() else {
+            return false;
+        };
         let ev = MouseEvent {
             action,
             button,
@@ -422,6 +419,9 @@ impl Term {
             }
             PointerEventKind::Press { button, serial, .. } => {
                 seat.serial = serial;
+                // A press is window activity: the size comes back before the click is mapped
+                // or encoded, so it is reported in the grid the user will then see.
+                self.window_active();
                 let Some(b) = mouse_button(button) else {
                     return;
                 };
@@ -503,7 +503,9 @@ impl Term {
     // ---- selection ----------------------------------------------------------------------
 
     fn begin_selection(&mut self, ctrl: bool) {
-        let cell = self.pointer_cell();
+        let Some(cell) = self.pointer_cell() else {
+            return;
+        };
         let p = self.abs_point(cell);
         let n = self
             .inp
@@ -535,7 +537,10 @@ impl Term {
     }
 
     fn drag_selection(&mut self) {
-        let p = self.abs_point(self.pointer_cell());
+        let Some(cell) = self.pointer_cell() else {
+            return;
+        };
+        let p = self.abs_point(cell);
         let rows = |r: usize| self.session.abs_row(r);
         if let Some((kind, origin)) = self.inp.pending
             && p != origin
@@ -654,6 +659,7 @@ impl Term {
         if data.is_empty() {
             return;
         }
+        self.window_active();
         let bytes = clipboard::paste_bytes(data, self.session.modes().bracketed_paste);
         self.snap_to_bottom();
         self.send(&bytes);

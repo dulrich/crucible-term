@@ -235,6 +235,85 @@ pub fn cell_at(
     )
 }
 
+/// Where the session's grid shows in the window and how much of it: the one mapping the painter,
+/// the damage logic, hit testing, selection and the cursor share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Visible {
+    /// Pixel origin of cell (0, 0).
+    pub origin: Pad,
+    /// Visible columns.
+    pub cols: usize,
+    /// Visible rows.
+    pub rows: usize,
+    /// Per axis: the session is smaller than the window there, so the pixels past the grid are
+    /// a blank margin that holds no cell.
+    margin: (bool, bool),
+}
+
+/// The visible grid for a `buf`-pixel window showing a `session`-sized grid. Window-owned size
+/// (`foreign` false): the session fits by construction; the origin is the padding, or the
+/// centring of it, exactly as before. Foreign size (a viewer set it): the grid anchors at the
+/// top-left padding, is clipped to what fits, and leaves a blank margin where it is smaller.
+pub fn visible_grid(
+    buf: (u32, u32),
+    m: &Metrics,
+    base: Pad,
+    center: bool,
+    session: (usize, usize),
+    foreign: bool,
+) -> Visible {
+    if !foreign {
+        let origin = if center {
+            centered(buf.0, buf.1, m, session, base)
+        } else {
+            base
+        };
+        return Visible {
+            origin,
+            cols: session.0,
+            rows: session.1,
+            margin: (false, false),
+        };
+    }
+    let cap = grid_size(buf.0, buf.1, m, base);
+    Visible {
+        origin: base,
+        cols: session.0.min(cap.0),
+        rows: session.1.min(cap.1),
+        margin: (session.0 < cap.0, session.1 < cap.1),
+    }
+}
+
+impl Visible {
+    /// The cell under a buffer-pixel position, clamped to the visible grid; `None` in a blank
+    /// margin (the session is smaller than the window and the position is past its grid).
+    pub fn cell_at(&self, x: f64, y: f64, m: &Metrics) -> Option<(usize, usize)> {
+        let end = |o: u32, cell: u32, n: usize| f64::from(o) + n as f64 * f64::from(cell);
+        if (self.margin.0 && x >= end(self.origin.x, m.cell_w, self.cols))
+            || (self.margin.1 && y >= end(self.origin.y, m.cell_h, self.rows))
+        {
+            return None;
+        }
+        Some(cell_at(x, y, m, self.origin, self.cols, self.rows))
+    }
+}
+
+/// Cut `grid` to its top-left `cols` x `rows` cells (never below 1x1 of what exists). A wide
+/// glyph whose second column is cut off is blanked, so nothing paints past the visible edge.
+pub fn clip_grid(grid: &mut Grid, cols: usize, rows: usize) {
+    grid.screen.truncate(rows);
+    for row in &mut grid.screen {
+        row.cells.truncate(cols);
+        if let Some(last) = row.cells.last_mut()
+            && last.width == Width::Wide
+        {
+            *last = Cell::default();
+        }
+    }
+    grid.cols = grid.cols.min(cols);
+    grid.rows = grid.rows.min(rows);
+}
+
 /// The per-frame inputs to [`paint`] other than the canvas, grid and fonts.
 #[derive(Clone, Copy)]
 pub struct Frame<'a> {

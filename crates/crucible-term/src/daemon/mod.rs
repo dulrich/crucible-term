@@ -135,6 +135,11 @@ pub trait Backend: 'static {
     fn set_size(&mut self, _id: TermId, _size: Option<(u16, u16)>) -> Result<(), String> {
         Err("size requests unsupported".into())
     }
+    /// The sessions whose window took its size back on its own input since the last call
+    /// (the daemon then records the window as the owner). Default: none.
+    fn take_window_active(&mut self) -> Vec<TermId> {
+        Vec::new()
+    }
     /// Session `id`'s child pid, current title and working directory.
     fn info(&self, _id: TermId) -> Option<Info> {
         None
@@ -203,6 +208,9 @@ impl Backend for Host {
     }
     fn set_size(&mut self, id: TermId, size: Option<(u16, u16)>) -> Result<(), String> {
         Host::set_size(self, id, size)
+    }
+    fn take_window_active(&mut self) -> Vec<TermId> {
+        Host::take_window_active(self)
     }
     fn info(&self, id: TermId) -> Option<Info> {
         Host::info(self, id)
@@ -1234,6 +1242,10 @@ fn serve<B: Backend>(
                 );
             }
             return Ok(());
+        }
+        // The window's own input already took its size back; record the window as the owner.
+        for id in b.take_window_active() {
+            viewers::window_active(&mut state.borrow_mut(), &mut b, id);
         }
         // Before the reap, so a finishing session's last picture still reaches its viewers.
         sync_viewers(&state, &handle, &mut b);

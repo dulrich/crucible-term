@@ -309,6 +309,9 @@ impl Host {
             }
             // Unfocused: the blink timer stops instead of ticking for no surface.
             t.focused = false;
+            // No buffer: a size request now keeps the current grid (the next configure
+            // derives the window's own).
+            t.buf = (0, 0);
         }
         self.routes = Routes::default();
         self.seat_in = SeatInput::detached();
@@ -548,6 +551,8 @@ impl Host {
             out_gen: 0,
             last_output: Instant::now(),
             seen: crate::daemon::Seen::default(),
+            foreign: None,
+            active: false,
         };
         term.apply_cursor_defaults();
         if term.diag.mem() {
@@ -634,14 +639,26 @@ impl Host {
         }
     }
 
-    /// A viewer's size request. Until the window can show a session at a size it did not set,
-    /// `Some` is refused (viewers see the window's grid, clipped) and `None` is a no-op.
+    /// A viewer's size request. `Some((cols, rows))` sizes the session and its PTY to exactly
+    /// that grid (a zero clamps to 1) and keeps it there through window resizes; `None` hands
+    /// the size back to the window (a session with no surface keeps its size). The window
+    /// shows the grid from its top-left corner either way. An unknown session is an `Err`.
     pub(crate) fn set_size(&mut self, id: TermId, size: Option<(u16, u16)>) -> Result<(), String> {
-        match (self.terms.contains_key(&id), size) {
-            (false, _) => Err(format!("no session {}", id.0)),
-            (true, None) => Ok(()),
-            (true, Some(_)) => Err("the window owns its size".into()),
-        }
+        let t = self
+            .terms
+            .get_mut(&id)
+            .ok_or_else(|| format!("no session {}", id.0))?;
+        t.set_foreign(size);
+        Ok(())
+    }
+
+    /// The windows whose own input took their size back since the last call (the daemon then
+    /// records the window as the size owner).
+    pub(crate) fn take_window_active(&mut self) -> Vec<TermId> {
+        self.terms
+            .iter_mut()
+            .filter_map(|(&id, t)| std::mem::take(&mut t.active).then_some(id))
+            .collect()
     }
 
     /// Session `id`'s child pid, current title and working directory (the spawn one until an

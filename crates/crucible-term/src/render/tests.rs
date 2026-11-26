@@ -555,3 +555,173 @@ fn frame_sum_of_incremental_paint_equals_full_repaint() {
     assert_eq!(fnv1a64_px(&inc), fnv1a64_px(&full));
     assert_ne!(fnv1a64_px(&inc), fnv1a64_px(&vec![0u32; w * h]));
 }
+
+// ---- the visible grid under a size the window did not set ---------------------------------
+
+fn metrics_10x20() -> Metrics {
+    Metrics {
+        cell_w: 10,
+        cell_h: 20,
+        baseline: 15,
+        underline_y: 17,
+        stroke: 1,
+        strike_y: 10,
+        px: 16.0,
+    }
+}
+
+const BASE: Pad = Pad { x: 4, y: 6 };
+
+/// (e) No foreign size: origin and extent are what the centring (or the padding) and the
+/// session size give.
+#[test]
+fn visible_grid_window_owned_is_unchanged() {
+    let m = metrics_10x20();
+    let v = visible_grid((800, 600), &m, BASE, false, (79, 29), false);
+    assert_eq!((v.origin, v.cols, v.rows), (BASE, 79, 29));
+    let v = visible_grid((800, 600), &m, BASE, true, (79, 29), false);
+    assert_eq!(v.origin, centered(800, 600, &m, (79, 29), BASE));
+    assert_eq!((v.cols, v.rows), (79, 29));
+    // Pointer clamping is the old one, margin or not.
+    assert_eq!(
+        v.cell_at(1e6, 1e6, &m),
+        Some(cell_at(1e6, 1e6, &m, v.origin, 79, 29))
+    );
+}
+
+/// (a) A centred-padding config under a foreign size still anchors at the top-left padding.
+#[test]
+fn visible_grid_foreign_anchors_top_left_even_when_centered() {
+    let m = metrics_10x20();
+    let v = visible_grid((800, 600), &m, BASE, true, (40, 10), true);
+    assert_eq!(v.origin, BASE);
+    assert_eq!((v.cols, v.rows), (40, 10));
+}
+
+/// (b) A position in the blank margin maps to no cell; padding before the grid still clamps.
+#[test]
+fn visible_grid_blank_margin_holds_no_cell() {
+    let m = metrics_10x20();
+    let v = visible_grid((800, 600), &m, BASE, false, (40, 10), true);
+    // Inside: the last cell. Past the right edge, past the bottom edge: nothing.
+    assert_eq!(v.cell_at(4.0 + 399.0, 6.0 + 10.0, &m), Some((39, 0)));
+    assert_eq!(v.cell_at(4.0 + 400.0, 6.0 + 10.0, &m), None);
+    assert_eq!(v.cell_at(4.0 + 10.0, 6.0 + 200.0, &m), None);
+    assert_eq!(v.cell_at(790.0, 590.0, &m), None);
+    // The padding before the grid clamps to the first cell.
+    assert_eq!(v.cell_at(0.0, 0.0, &m), Some((0, 0)));
+}
+
+/// (c) A session larger than the window: the visible grid is what fits, and positions clamp to
+/// it, never to the session's own grid.
+#[test]
+fn visible_grid_clips_and_clamps_to_what_fits() {
+    let m = metrics_10x20();
+    // 800x600 with 4/6 padding fits (800-8)/10 = 79 columns, (600-12)/20 = 29 rows.
+    let v = visible_grid((800, 600), &m, BASE, false, (120, 60), true);
+    assert_eq!((v.cols, v.rows), (79, 29));
+    assert_eq!(v.cell_at(1e6, 1e6, &m), Some((78, 28)));
+    // Wider only: rows past the session still hold no cell.
+    let v = visible_grid((800, 600), &m, BASE, false, (120, 10), true);
+    assert_eq!((v.cols, v.rows), (79, 10));
+    assert_eq!(v.cell_at(1e6, 100.0, &m), Some((78, 4)));
+    assert_eq!(v.cell_at(100.0, 1e6, &m), None);
+}
+
+/// (d) Only the cells that fit are painted: a clipped grid has no cell, wide-glyph half or row
+/// past the cut.
+#[test]
+fn clip_grid_keeps_only_whole_cells_that_fit() {
+    let mut s = Session::new(20, 6, 0);
+    s.feed("abcd\u{4e2d}fgh\r\nrow2\r\nrow3\r\nrow4".as_bytes());
+    let mut g = s.screen();
+    assert_eq!(g.screen[0].cells[4].width, Width::Wide);
+    clip_grid(&mut g, 5, 3);
+    assert_eq!((g.cols, g.rows, g.screen.len()), (5, 3, 3));
+    assert!(g.screen.iter().all(|r| r.cells.len() == 5));
+    // The wide glyph's second column was cut: it is blanked, not drawn half past the edge.
+    assert!(g.screen[0].cells[4].is_default());
+    assert_eq!(g.screen[0].text(), "abcd");
+    assert_eq!(g.screen[2].text(), "row3");
+}
+
+/// The top-left clipped paint equals the paint of a session that size showing the same cells.
+#[test]
+fn paint_of_a_clipped_session_matches_the_top_left_cells() {
+    let mut f = fonts(false);
+    let text = "abcde\r\nfghij\r\nklmno";
+    let mut big = Session::new(20, 6, 0);
+    big.feed(text.as_bytes());
+    let mut grid = big.screen();
+    clip_grid(&mut grid, 5, 3);
+    let mut small = Session::new(5, 3, 0);
+    small.feed(text.as_bytes());
+    let want = small.screen();
+    for g in [&grid, &want] {
+        for row in &g.screen {
+            for c in &row.cells {
+                f.prepare(&c.text);
+            }
+        }
+    }
+    let m = f.metrics();
+    let (w, h) = (5 * m.cell_w as usize, 3 * m.cell_h as usize);
+    let theme = Theme::default();
+    let mut draw = |g: &crucible_term_core::Grid| {
+        let mut px = vec![0u32; w * h];
+        paint(
+            &mut Canvas {
+                px: &mut px,
+                width: w,
+                height: h,
+            },
+            g,
+            &mut f,
+            &fr(&theme, NO_CURSOR),
+            None,
+        );
+        px
+    };
+    let (clipped, reference) = (draw(&grid), draw(&want));
+    assert_eq!(fnv(&clipped), fnv(&reference));
+    assert_ne!(fnv(&clipped), fnv(&vec![0u32; w * h]));
+}
+
+/// A session smaller than the window paints from the top-left and the window background fills
+/// the margin right of and below the grid.
+#[test]
+fn paint_of_a_small_session_fills_the_margin_with_the_background() {
+    let mut f = fonts(false);
+    let mut s = Session::new(3, 1, 0);
+    s.feed(b"\x1b[41mabc");
+    let grid = s.screen();
+    for c in &grid.screen[0].cells {
+        f.prepare(&c.text);
+    }
+    let m = f.metrics();
+    let (cw, ch) = (m.cell_w as usize, m.cell_h as usize);
+    let (w, h) = (6 * cw, 3 * ch);
+    let mut px = vec![0xdead_beefu32; w * h];
+    let theme = Theme::default();
+    paint(
+        &mut Canvas {
+            px: &mut px,
+            width: w,
+            height: h,
+        },
+        &grid,
+        &mut f,
+        &fr(&theme, NO_CURSOR),
+        None,
+    );
+    let o = Out { px, w, h };
+    let bg = 0xff11_1111;
+    assert_eq!(
+        at(&o, cw / 2, 1),
+        0xfff6_2b5a,
+        "the grid starts at the top-left"
+    );
+    assert_eq!(at(&o, 4 * cw, ch / 2), bg, "right margin");
+    assert_eq!(at(&o, cw / 2, 2 * ch), bg, "bottom margin");
+    assert_eq!(at(&o, 5 * cw, 3 * ch - 1), bg, "far corner");
+}

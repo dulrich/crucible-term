@@ -189,3 +189,130 @@ fn display_path_follows_libwayland() {
     );
     assert_eq!(display_path(&env(&[("WAYLAND_DISPLAY", "w")])), None);
 }
+
+// ---- a size the window did not set ------------------------------------------------------
+
+/// What the PTY master reports as its window size, `(cols, rows)`.
+fn pty_size(h: &Host, id: TermId) -> (u16, u16) {
+    let w = rustix::termios::tcgetwinsize(h.terms[&id].pty.master()).expect("TIOCGWINSZ");
+    (w.ws_col, w.ws_row)
+}
+
+/// Give the surface-less session a buffer, as a configure would, and return the grid the
+/// window's own buffer derives.
+fn give_buffer(h: &mut Host, id: TermId, buf: (u32, u32)) -> (usize, usize) {
+    let t = h.terms.get_mut(&id).expect("term");
+    t.logical = buf;
+    t.buf = buf;
+    let pad = t.cfg.settings.pad;
+    crate::render::grid_size(
+        buf.0,
+        buf.1,
+        &t.metrics(),
+        crate::render::Pad { x: pad.0, y: pad.1 },
+    )
+}
+
+fn close(ev: &mut EventLoop<'static, Host>, h: &mut Host, id: TermId) {
+    h.close(id);
+    h.reap();
+    assert!(run_until_exit(ev, h, id, Duration::from_secs(5)).is_some());
+}
+
+/// `Some` sizes session and PTY exactly; a window resize afterwards (relayout) changes
+/// nothing; `None` hands the size back and the session returns to the window's grid.
+#[test]
+fn a_viewer_size_survives_a_window_resize_until_handed_back() {
+    let (mut ev, mut h) = host(true, None);
+    let id = spawn(&mut h, "exec cat");
+    let window = give_buffer(&mut h, id, (800, 600));
+    assert!(h.set_size(id, Some((37, 11))).is_ok());
+    assert_eq!(h.terms[&id].session.size(), (37, 11));
+    assert_eq!(pty_size(&h, id), (37, 11));
+    // A simulated buffer resize and a relayout (a configure or a scale change).
+    let bigger = give_buffer(&mut h, id, (1000, 700));
+    assert_ne!(bigger, window);
+    let t = h.terms.get_mut(&id).expect("term");
+    t.relayout(&mut h.fonts);
+    assert_eq!(
+        t.session.size(),
+        (37, 11),
+        "the window did not change the session"
+    );
+    assert_eq!(pty_size(&h, id), (37, 11));
+    // Hand it back: the window's own grid.
+    assert!(h.set_size(id, None).is_ok());
+    assert_eq!(h.terms[&id].session.size(), bigger);
+    assert_eq!(pty_size(&h, id), (bigger.0 as u16, bigger.1 as u16));
+    close(&mut ev, &mut h, id);
+}
+
+/// An unknown session is an error, never a silent success; zero clamps to 1x1.
+#[test]
+fn set_size_rejects_unknown_ids_and_clamps_zero() {
+    let (mut ev, mut h) = host(true, None);
+    let id = spawn(&mut h, "exec cat");
+    assert!(h.set_size(TermId(999), Some((10, 10))).is_err());
+    assert!(h.set_size(TermId(999), None).is_err());
+    assert!(h.set_size(id, Some((0, 0))).is_ok());
+    assert_eq!(h.terms[&id].session.size(), (1, 1));
+    assert_eq!(pty_size(&h, id), (1, 1));
+    close(&mut ev, &mut h, id);
+}
+
+/// A detached session (no surface) takes `Some` and keeps its size on `None`, even after a
+/// loss zeroed its buffer.
+#[test]
+fn a_detached_session_accepts_both_requests() {
+    let (mut ev, mut h) = host(true, None);
+    let id = spawn(&mut h, "exec cat");
+    give_buffer(&mut h, id, (800, 600));
+    assert!(h.detach());
+    assert!(h.set_size(id, Some((50, 20))).is_ok());
+    assert_eq!(h.terms[&id].session.size(), (50, 20));
+    assert_eq!(pty_size(&h, id), (50, 20));
+    assert!(h.set_size(id, None).is_ok());
+    assert_eq!(h.terms[&id].session.size(), (50, 20), "None keeps the grid");
+    assert_eq!(pty_size(&h, id), (50, 20));
+    close(&mut ev, &mut h, id);
+}
+
+/// A key press in the window takes the size back before its bytes are encoded and raises the
+/// daemon's flag exactly once; with no foreign size it raises nothing, and a window resize is
+/// not activity.
+#[test]
+fn a_key_press_reclaims_the_size_once() {
+    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym};
+    let (mut ev, mut h) = host(true, None);
+    let id = spawn(&mut h, "exec cat");
+    let window = give_buffer(&mut h, id, (800, 600));
+    let key = KeyEvent {
+        time: 0,
+        raw_code: 30,
+        keysym: Keysym::a,
+        utf8: Some("a".into()),
+    };
+    let mut seat = SeatInput::detached();
+    let press = |h: &mut Host, seat: &mut SeatInput| {
+        h.terms
+            .get_mut(&id)
+            .expect("term")
+            .on_key(seat, &key, false);
+    };
+    press(&mut h, &mut seat);
+    assert!(h.take_window_active().is_empty(), "no foreign size");
+    assert!(h.set_size(id, Some((30, 9))).is_ok());
+    h.terms.get_mut(&id).expect("term").relayout(&mut h.fonts);
+    assert!(
+        h.take_window_active().is_empty(),
+        "a resize is not activity"
+    );
+    assert_eq!(h.terms[&id].session.size(), (30, 9));
+    press(&mut h, &mut seat);
+    assert_eq!(h.terms[&id].session.size(), window);
+    assert_eq!(pty_size(&h, id), (window.0 as u16, window.1 as u16));
+    assert_eq!(h.take_window_active(), vec![id]);
+    press(&mut h, &mut seat);
+    assert!(h.take_window_active().is_empty(), "exactly once");
+    close(&mut ev, &mut h, id);
+}
