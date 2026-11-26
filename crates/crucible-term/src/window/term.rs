@@ -187,6 +187,9 @@ pub struct Term {
     pub(super) out_gen: u64,
     /// When PTY output was last read.
     pub(super) last_output: Instant,
+    /// What the daemon's viewers read from the event drain: the current OSC 0/2 title (with or
+    /// without a surface), the last OSC 7 directory and the BELs not yet taken.
+    pub(super) seen: crate::daemon::Seen,
 }
 
 /// Copy full-width bands of rows (`(y, height)`, `stride` bytes per row) from one slot of the
@@ -289,6 +292,7 @@ impl Term {
         let replies = self.session.take_replies();
         self.send(&replies);
         for ev in self.session.take_events() {
+            self.seen.note(&ev);
             match ev {
                 Event::Title(t) => {
                     if let Some(s) = &self.surf {

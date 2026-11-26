@@ -13,7 +13,8 @@
 //! connects at once.
 
 use super::store;
-use super::{Backend, TermId};
+use super::{Backend, Info, Seen, TermId};
+use crate::outbox::Outbox;
 use crate::session_life;
 use crucible_term_core::Session;
 use crucible_term_core::pty::{Pty, SpawnSpec, exit_code};
@@ -52,6 +53,16 @@ struct Kid {
     generation: u64,
     last_output: Instant,
     scrollback: usize,
+    /// Bytes for the child (viewer input), written on push, the rest on writable.
+    outbox: Outbox,
+    /// The writable source draining `outbox`, while registered.
+    write_source: Option<RegistrationToken>,
+    /// Title, directory and BELs from the event drain.
+    seen: Seen,
+    /// The size the open asked for: what `set_size(None)` returns to.
+    window_size: (u16, u16),
+    /// The spawn directory.
+    cwd: PathBuf,
 }
 
 /// The headless backend; the calloop data in headless mode.
@@ -148,6 +159,23 @@ fn child_gone(h: &mut Headless, id: TermId) {
     }
 }
 
+/// Write what the master accepts of session `id`'s outbox; true when nothing is left to wait
+/// for (drained, or a hard error that dropped the queue).
+fn flush_input(h: &mut Headless, id: TermId) -> bool {
+    let Some(k) = h.kids.get_mut(&id) else {
+        return true;
+    };
+    let mut master: &std::fs::File = k.pty.master();
+    match k.outbox.flush(&mut master) {
+        Ok(done) => done,
+        Err(e) => {
+            eprintln!("crucible-term: pty write: {e}");
+            k.outbox.clear();
+            true
+        }
+    }
+}
+
 impl Backend for Headless {
     fn has_identity(&self) -> bool {
         self.identity
@@ -185,14 +213,23 @@ impl Backend for Headless {
             self.handle
                 .insert_source(drain, move |_, _, h| {
                     let mut buf = [0u8; 4096];
+                    // Bounded per wake-up (level-triggered: the rest comes next dispatch), so a
+                    // flood never starves the loop's other sources.
+                    let mut total = 0;
                     loop {
+                        if total >= 1 << 20 {
+                            return Ok(PostAction::Continue);
+                        }
                         match master.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
+                                total += n;
                                 if let Some(k) = h.kids.get_mut(&id) {
                                     k.session.feed(&buf[..n]);
                                     let _ = k.session.take_replies();
-                                    let _ = k.session.take_events();
+                                    for ev in k.session.take_events() {
+                                        k.seen.note(&ev);
+                                    }
                                     k.generation += 1;
                                     k.last_output = Instant::now();
                                 }
@@ -226,6 +263,11 @@ impl Backend for Headless {
                 generation: 0,
                 last_output: Instant::now(),
                 scrollback: cfg.settings.scrollback,
+                outbox: Outbox::default(),
+                write_source: None,
+                seen: Seen::default(),
+                window_size: (cfg.cols, cfg.rows),
+                cwd: cfg.cwd.clone(),
             },
         );
         Ok((id, pid))
@@ -235,7 +277,7 @@ impl Backend for Headless {
         let Some(k) = self.kids.remove(&id) else {
             return;
         };
-        for t in k.tokens {
+        for t in k.tokens.into_iter().chain(k.write_source) {
             self.handle.remove(t);
         }
         if let Some(code) = k.exit {
@@ -262,7 +304,7 @@ impl Backend for Headless {
             .collect();
         for id in done {
             if let Some(k) = self.kids.remove(&id) {
-                for t in k.tokens {
+                for t in k.tokens.into_iter().chain(k.write_source) {
                     self.handle.remove(t);
                 }
                 self.exits.extend(k.exit.map(|c| (id, c)));
@@ -353,5 +395,74 @@ impl Backend for Headless {
         let (s, n) = store::restored(rec, cols, rows, k.scrollback);
         k.session = s;
         Some((n, k.generation))
+    }
+
+    fn write_input(&mut self, id: TermId, bytes: &[u8]) -> bool {
+        let Some(k) = self.kids.get_mut(&id).filter(|k| k.exit.is_none()) else {
+            return false;
+        };
+        if bytes.is_empty() {
+            return true;
+        }
+        k.outbox.push(bytes);
+        if k.write_source.is_some() || flush_input(self, id) {
+            return true;
+        }
+        let Some(k) = self.kids.get_mut(&id) else {
+            return true;
+        };
+        let Ok(fd) = k.pty.master().try_clone() else {
+            k.outbox.clear();
+            return true;
+        };
+        let r = self.handle.insert_source(
+            Generic::new(fd, Interest::WRITE, Mode::Level),
+            move |_, _, h: &mut Headless| {
+                if flush_input(h, id) {
+                    if let Some(k) = h.kids.get_mut(&id) {
+                        k.write_source = None;
+                    }
+                    Ok(PostAction::Remove)
+                } else {
+                    Ok(PostAction::Continue)
+                }
+            },
+        );
+        match r {
+            Ok(t) => k.write_source = Some(t),
+            Err(e) => {
+                eprintln!("crucible-term: pty writable source: {e}");
+                k.outbox.clear();
+            }
+        }
+        true
+    }
+
+    fn set_size(&mut self, id: TermId, size: Option<(u16, u16)>) -> Result<(), String> {
+        let k = self
+            .kids
+            .get_mut(&id)
+            .ok_or_else(|| format!("no session {id}"))?;
+        let (cols, rows) = size.unwrap_or(k.window_size);
+        if k.session.size() != (usize::from(cols), usize::from(rows)) {
+            k.session.resize(usize::from(cols), usize::from(rows));
+            k.pty.resize((cols, rows)).map_err(|e| e.to_string())?;
+            k.generation += 1;
+        }
+        Ok(())
+    }
+
+    fn info(&self, id: TermId) -> Option<Info> {
+        self.kids.get(&id).map(|k| Info {
+            pid: k.pty.pid(),
+            title: k.seen.title.clone(),
+            cwd: k.seen.cwd.clone().unwrap_or_else(|| k.cwd.clone()),
+        })
+    }
+
+    fn take_bells(&mut self, id: TermId) -> u32 {
+        self.kids
+            .get_mut(&id)
+            .map_or(0, |k| std::mem::take(&mut k.seen.bells))
     }
 }

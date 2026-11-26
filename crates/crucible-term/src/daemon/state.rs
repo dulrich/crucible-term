@@ -16,6 +16,10 @@ pub(super) struct Conn {
     /// An `open` is waiting on the test-only delay timer.
     pub(super) opening: bool,
     pub(super) token: Option<RegistrationToken>,
+    /// Viewer-protocol replies waiting for the socket (never written blocking).
+    pub(super) out: super::viewers::Out,
+    /// Set while this connection views a session.
+    pub(super) watch: Option<super::viewers::Watch>,
 }
 
 /// When a session is closed unless something happens first.
@@ -41,6 +45,14 @@ pub(super) struct SessionRec {
     pub(super) record: Option<super::store::Owned>,
     /// Set while the key's record lock was held by another daemon at open: retried until owned.
     pub(super) claim_wait: Option<ClaimWait>,
+    /// Attached viewer connections, in attach order.
+    pub(super) viewers: Vec<u64>,
+    /// Who sizes the session.
+    pub(super) owner: super::viewers::Owner,
+    /// Connections that sent `Kill` for it: each gets one `Exited`.
+    pub(super) killers: Vec<u64>,
+    /// The title the viewers were last sent.
+    pub(super) title: String,
 }
 
 /// A busy record claim waiting for its next retry.
@@ -70,6 +82,8 @@ pub(super) struct State {
     pub(super) persist: Option<super::store::Persist>,
     /// SIGTERM or SIGHUP arrived (persistence on): save and exit.
     pub(super) shutdown: Option<i32>,
+    /// TEST-ONLY override of the viewer stall limit (`None`: [`super::viewers::STALL`]).
+    pub(super) viewer_stall: Option<Duration>,
 }
 
 impl State {
@@ -98,7 +112,9 @@ impl State {
 /// - lost (connected → lost): every pending expiry (detached or orphan) is cancelled;
 /// - reconnected (lost → connected): every live session still detached gets `now + timeout`;
 /// - a deadline that passes on a still-detached session closes it (SIGHUP grace) and drops its
-///   key (never reattached); a passed orphan expiry closes a session still attached and unowned.
+///   key (never reattached); a passed orphan expiry closes a session still attached and unowned;
+/// - a session with an attached viewer is claimed: no detached deadline is armed or honoured
+///   (attaching clears it, the last viewer leaving re-arms it: [`super::viewers::leave`]).
 ///
 /// Both closes take the session's final record capture first; the record identity
 /// (`SessionRec::record`) survives the cleared key, and both count as real closes (a timeout is an
@@ -117,10 +133,12 @@ pub(super) fn detached_clock<B: Backend>(
         let detached = b.is_detached(id);
         match r.expiry {
             _ if lost => r.expiry = None,
-            None if was_lost && detached => r.expiry = timeout.map(|t| Expiry::Detached(now + t)),
+            None if was_lost && detached && r.viewers.is_empty() => {
+                r.expiry = timeout.map(|t| Expiry::Detached(now + t));
+            }
             Some(Expiry::Detached(d)) if d <= now => {
                 r.expiry = None;
-                if detached {
+                if detached && r.viewers.is_empty() {
                     eprintln!(
                         "crucible-term: daemon: detached session {id} unclaimed after {}s; closing",
                         timeout.map_or(0, |t| t.as_secs())

@@ -5,6 +5,19 @@
 //! bytes (an `OsString` is its raw unix bytes, a `String` is UTF-8); `Option` as a `u8` 0/1 and
 //! then the value; a list as a `u32` count and then the items. A frame is capped at
 //! [`MAX_FRAME`]. Both sides send [`Msg::Hello`] first.
+//!
+//! Viewers (protocol 3, tags 8–16, added without a version bump: a daemon that predates them
+//! closes the connection on the unknown tag). A viewer connection sends `hello`, then
+//! [`Msg::Attach`]; the daemon answers [`Msg::Attached`] (or [`Msg::Refused`]) and then only
+//! [`Msg::Output`] frames: the enter sequence, the current title (OSC 2), then rendered frames for
+//! the viewer's size, title changes and BELs. [`Msg::Detach`] gets the leave sequence as `Output`
+//! and then EOF; a child exit gets the leave sequence and [`Msg::Exited`]. A session token is a
+//! decimal session id or a unique prefix (at least [`MIN_KEY_PREFIX`] hex digits) of its key.
+//! Refusal reasons for viewer requests are stable identifiers: `no-session` (no match),
+//! `ambiguous` (several sessions, or an id of one and a key prefix of another), `bad-size`
+//! (geometry 0 or above [`MAX_GEOMETRY`]), `already-attached` (the connection already views or
+//! owns a session). Bounds: `Output` payloads are at most [`OUTPUT_CHUNK`] bytes, `Sessions`
+//! titles and cwds at most [`MAX_FIELD`] bytes and at most [`MAX_ENTRIES`] entries.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -14,6 +27,39 @@ use std::path::PathBuf;
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest accepted frame (length field value), 1 MiB.
 pub const MAX_FRAME: usize = 1 << 20;
+/// Largest `cols` or `rows` an `Attach` or `Resize` may name.
+pub const MAX_GEOMETRY: u32 = 1000;
+/// Largest `Output` payload the daemon sends (a longer frame is split).
+pub const OUTPUT_CHUNK: usize = 64 * 1024;
+/// Longest `title` or `cwd` in a `Sessions` entry (longer ones are cut at a char boundary).
+pub const MAX_FIELD: usize = 256;
+/// Most entries in one `Sessions` reply.
+pub const MAX_ENTRIES: usize = 1024;
+/// Fewest hex digits a key prefix in a session token may have.
+pub const MIN_KEY_PREFIX: usize = 4;
+
+/// One line of a `Sessions` reply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Entry {
+    /// The session id.
+    pub id: u64,
+    /// Its session key, if it has one.
+    pub key: Option<String>,
+    /// The child's pid.
+    pub pid: u32,
+    /// The current title (OSC 0/2; empty when unset).
+    pub title: String,
+    /// The last OSC 7 working directory, else the spawn directory.
+    pub cwd: String,
+    /// The session's grid width.
+    pub cols: u32,
+    /// The session's grid height.
+    pub rows: u32,
+    /// A window (surface) shows it.
+    pub has_window: bool,
+    /// Attached viewers.
+    pub viewers: u32,
+}
 
 /// `open`: one window for this client.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,6 +120,56 @@ pub enum Msg {
     Close,
     /// Daemon → client: another client reattached this session; exit 0 silently.
     Superseded,
+    /// Client → daemon: list the live sessions (answered by `Sessions`).
+    List,
+    /// Client → daemon: become a viewer of `session` at `cols` x `rows`.
+    Attach {
+        /// A session token (decimal id or key prefix).
+        session: String,
+        /// The viewer's terminal width.
+        cols: u32,
+        /// The viewer's terminal height.
+        rows: u32,
+    },
+    /// Client → daemon (viewer): bytes for the child.
+    Input {
+        /// Raw terminal input.
+        bytes: Vec<u8>,
+    },
+    /// Client → daemon (viewer): the viewer's terminal size changed.
+    Resize {
+        /// Width.
+        cols: u32,
+        /// Height.
+        rows: u32,
+    },
+    /// Client → daemon (viewer): stop viewing; the daemon sends the leave sequence, then EOF.
+    Detach,
+    /// Client → daemon: close `session` as a window close does; answered by one `Exited` (when
+    /// the child's exit is recorded) or one `Refused`.
+    Kill {
+        /// A session token.
+        session: String,
+    },
+    /// Daemon → client: the answer to `List`.
+    Sessions {
+        /// One per live session, by id.
+        entries: Vec<Entry>,
+    },
+    /// Daemon → client: the viewer is attached to session `id`, currently `cols` x `rows`.
+    Attached {
+        /// The session id.
+        id: u64,
+        /// The session's grid width.
+        cols: u32,
+        /// The session's grid height.
+        rows: u32,
+    },
+    /// Daemon → client (viewer): bytes for the viewer's terminal.
+    Output {
+        /// VT bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 /// A malformed frame.
@@ -115,11 +211,23 @@ const T_REFUSED: u8 = 4;
 const T_EXITED: u8 = 5;
 const T_CLOSE: u8 = 6;
 const T_SUPERSEDED: u8 = 7;
+const T_LIST: u8 = 8;
+const T_ATTACH: u8 = 9;
+const T_INPUT: u8 = 10;
+const T_RESIZE: u8 = 11;
+const T_DETACH: u8 = 12;
+const T_KILL: u8 = 13;
+const T_SESSIONS: u8 = 14;
+const T_ATTACHED: u8 = 15;
+const T_OUTPUT: u8 = 16;
 
 struct W(Vec<u8>);
 
 impl W {
     fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn bytes(&mut self, b: &[u8]) {
@@ -189,7 +297,62 @@ pub fn encode(m: &Msg) -> Vec<u8> {
         }
         Msg::Close => w.0.push(T_CLOSE),
         Msg::Superseded => w.0.push(T_SUPERSEDED),
+        Msg::List => w.0.push(T_LIST),
+        Msg::Attach {
+            session,
+            cols,
+            rows,
+        } => {
+            w.0.push(T_ATTACH);
+            w.bytes(session.as_bytes());
+            w.u32(*cols);
+            w.u32(*rows);
+        }
+        Msg::Input { bytes } => {
+            w.0.push(T_INPUT);
+            w.bytes(bytes);
+        }
+        Msg::Resize { cols, rows } => {
+            w.0.push(T_RESIZE);
+            w.u32(*cols);
+            w.u32(*rows);
+        }
+        Msg::Detach => w.0.push(T_DETACH),
+        Msg::Kill { session } => {
+            w.0.push(T_KILL);
+            w.bytes(session.as_bytes());
+        }
+        Msg::Sessions { entries } => {
+            w.0.push(T_SESSIONS);
+            w.u32(entries.len() as u32);
+            for e in entries {
+                w.u64(e.id);
+                w.opt(&e.key);
+                w.u32(e.pid);
+                w.bytes(e.title.as_bytes());
+                w.bytes(e.cwd.as_bytes());
+                w.u32(e.cols);
+                w.u32(e.rows);
+                w.0.push(u8::from(e.has_window));
+                w.u32(e.viewers);
+            }
+        }
+        Msg::Attached { id, cols, rows } => {
+            w.0.push(T_ATTACHED);
+            w.u64(*id);
+            w.u32(*cols);
+            w.u32(*rows);
+        }
+        Msg::Output { bytes } => {
+            w.0.push(T_OUTPUT);
+            w.bytes(bytes);
+        }
     }
+    debug_assert!(
+        w.0.len() - 4 <= MAX_FRAME,
+        "encoded frame of {} bytes exceeds MAX_FRAME",
+        w.0.len() - 4
+    );
     let len = (w.0.len() - 4) as u32;
     w.0[..4].copy_from_slice(&len.to_le_bytes());
     w.0
@@ -212,6 +375,12 @@ impl R<'_> {
     fn u32(&mut self) -> Result<u32, WireError> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, WireError> {
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(u64::from_le_bytes(a))
     }
     fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
         let n = self.u32()? as usize;
@@ -283,6 +452,44 @@ pub fn decode_body(body: &[u8]) -> Result<Msg, WireError> {
         },
         T_CLOSE => Msg::Close,
         T_SUPERSEDED => Msg::Superseded,
+        T_LIST => Msg::List,
+        T_ATTACH => Msg::Attach {
+            session: r.string()?,
+            cols: r.u32()?,
+            rows: r.u32()?,
+        },
+        T_INPUT => Msg::Input { bytes: r.bytes()? },
+        T_RESIZE => Msg::Resize {
+            cols: r.u32()?,
+            rows: r.u32()?,
+        },
+        T_DETACH => Msg::Detach,
+        T_KILL => Msg::Kill {
+            session: r.string()?,
+        },
+        T_SESSIONS => {
+            let mut entries = Vec::new();
+            for _ in 0..r.count()? {
+                entries.push(Entry {
+                    id: r.u64()?,
+                    key: r.opt()?,
+                    pid: r.u32()?,
+                    title: r.string()?,
+                    cwd: r.string()?,
+                    cols: r.u32()?,
+                    rows: r.u32()?,
+                    has_window: r.u8()? != 0,
+                    viewers: r.u32()?,
+                });
+            }
+            Msg::Sessions { entries }
+        }
+        T_ATTACHED => Msg::Attached {
+            id: r.u64()?,
+            cols: r.u32()?,
+            rows: r.u32()?,
+        },
+        T_OUTPUT => Msg::Output { bytes: r.bytes()? },
         t => return Err(WireError::UnknownTag(t)),
     };
     if !r.0.is_empty() {
@@ -305,6 +512,15 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Msg, usize)>, WireError> {
         return Ok(None);
     }
     Ok(Some((decode_body(&buf[4..4 + len])?, 4 + len)))
+}
+
+/// `s` cut to at most `max` bytes at a char boundary.
+pub fn truncate(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// The client's verdict on the daemon's `hello`.
@@ -376,7 +592,62 @@ mod tests {
             Msg::Exited { code: 143 },
             Msg::Close,
             Msg::Superseded,
+            Msg::List,
+            Msg::Attach {
+                session: "ab12".into(),
+                cols: 80,
+                rows: 24,
+            },
+            Msg::Input {
+                bytes: vec![0, 0x1b, b'x', 0xff],
+            },
+            Msg::Resize {
+                cols: 1000,
+                rows: 1,
+            },
+            Msg::Detach,
+            Msg::Kill {
+                session: "7".into(),
+            },
+            Msg::Sessions { entries: vec![] },
+            Msg::Sessions {
+                entries: vec![
+                    Entry {
+                        id: 1 << 40,
+                        key: Some("0123456789abcdef0123456789abcdef".into()),
+                        pid: 99,
+                        title: "vim é".into(),
+                        cwd: "/home/x".into(),
+                        cols: 80,
+                        rows: 24,
+                        has_window: true,
+                        viewers: 2,
+                    },
+                    Entry::default(),
+                ],
+            },
+            Msg::Attached {
+                id: 3,
+                cols: 200,
+                rows: 50,
+            },
+            Msg::Output {
+                bytes: b"\x1b[H".to_vec(),
+            },
         ]
+    }
+
+    #[test]
+    fn viewer_tags_keep_their_numbers_and_truncate_cuts_at_a_char_boundary() {
+        // The numbers are the contract with older and newer peers.
+        assert_eq!(encode(&Msg::List)[4], 8);
+        assert_eq!(encode(&Msg::Detach)[4], 12);
+        assert_eq!(
+            encode(&Msg::Output { bytes: vec![] })[4..],
+            [16, 0, 0, 0, 0]
+        );
+        assert_eq!(truncate("aé", 2), "a");
+        assert_eq!(truncate("abc", 256), "abc");
     }
 
     #[test]

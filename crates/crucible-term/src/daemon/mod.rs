@@ -26,6 +26,9 @@ pub mod headless;
 pub mod paths;
 mod state;
 pub mod store;
+mod viewers;
+
+pub use viewers::{Info, Seen};
 
 use crate::client::{GRANT_VAR, SESSION_VAR};
 use crate::config;
@@ -121,6 +124,25 @@ pub trait Backend: 'static {
     fn restore(&mut self, _id: TermId, _rec: &store::Record) -> Option<(usize, u64)> {
         None
     }
+    /// Queue a viewer's `bytes` for session `id`'s child behind everything already waiting
+    /// (the session's PTY outbox, shared with the window's own input). False: no live session.
+    fn write_input(&mut self, _id: TermId, _bytes: &[u8]) -> bool {
+        false
+    }
+    /// The size authority's request: `Some((cols, rows))` sizes session `id` and its PTY for a
+    /// viewer; `None` hands the size back to the window. `Err` refuses (the session keeps its
+    /// size; viewers then see it clipped).
+    fn set_size(&mut self, _id: TermId, _size: Option<(u16, u16)>) -> Result<(), String> {
+        Err("size requests unsupported".into())
+    }
+    /// Session `id`'s child pid, current title and working directory.
+    fn info(&self, _id: TermId) -> Option<Info> {
+        None
+    }
+    /// BELs session `id`'s child rang since the last call.
+    fn take_bells(&mut self, _id: TermId) -> u32 {
+        0
+    }
 }
 
 impl Backend for Host {
@@ -175,6 +197,18 @@ impl Backend for Host {
     }
     fn restore(&mut self, id: TermId, rec: &store::Record) -> Option<(usize, u64)> {
         Host::restore(self, id, rec)
+    }
+    fn write_input(&mut self, id: TermId, bytes: &[u8]) -> bool {
+        Host::write_input(self, id, bytes)
+    }
+    fn set_size(&mut self, id: TermId, size: Option<(u16, u16)>) -> Result<(), String> {
+        Host::set_size(self, id, size)
+    }
+    fn info(&self, id: TermId) -> Option<Info> {
+        Host::info(self, id)
+    }
+    fn take_bells(&mut self, id: TermId) -> u32 {
+        Host::take_bells(self, id)
     }
 }
 
@@ -407,6 +441,8 @@ fn try_reattach<B: Backend>(st: &mut State, b: &mut B, conn: u64, o: &Open) -> b
     if let Some(old) = rec.conn.replace(conn) {
         st.send(old, &Msg::Superseded);
     }
+    // The rebound window sizes the session again.
+    viewers::window_active(st, b, id);
     eprintln!("crucible-term: daemon: client {conn}: reattached session {id}");
     st.send(
         conn,
@@ -438,7 +474,7 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64, m: Ms
     }
     match m {
         Msg::Open(o) => {
-            if c.opening || st.find(|r| r.conn == Some(conn)).is_some() {
+            if c.opening || c.watch.is_some() || st.find(|r| r.conn == Some(conn)).is_some() {
                 st.send(
                     conn,
                     &Msg::Refused {
@@ -486,6 +522,12 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64, m: Ms
             }
             true
         }
+        m @ (Msg::List
+        | Msg::Attach { .. }
+        | Msg::Input { .. }
+        | Msg::Resize { .. }
+        | Msg::Detach
+        | Msg::Kill { .. }) => viewers::on_msg(st, b, conn, m),
         other => {
             eprintln!("crucible-term: daemon: client {conn}: unexpected {other:?}");
             false
@@ -497,13 +539,106 @@ fn on_msg<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64, m: Ms
 /// grace) unless the connection is lost first; a detached session outlives its client (a later
 /// rebind reattaches it). The grace exists because on a compositor quit the thin clients die
 /// with it, and their EOFs can arrive before the daemon sees its own Wayland connection go.
-fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) {
-    st.conns.remove(&conn);
+///
+/// A viewer connection owns no session: dropping it only takes the viewer away
+/// ([`viewers::leave`]). Returns the removed connection (its sources are the caller's).
+fn drop_conn<B: Backend>(st: &mut State, b: &mut B, conn: u64) -> Option<Conn> {
+    viewers::leave(st, b, conn);
+    let removed = st.conns.remove(&conn);
     // Pin E1: only the owning connection may close; a superseded one owns nothing.
     if let Some((&id, rec)) = st.sessions.iter_mut().find(|(_, r)| r.conn == Some(conn)) {
         rec.conn = None;
         if !b.is_detached(id) {
             rec.expiry = Some(Expiry::Orphan(Instant::now() + ORPHAN_GRACE));
+        }
+    }
+    removed
+}
+
+/// Drop `conn` from the loop side: [`drop_conn`], then remove its read and write sources.
+fn finish_conn<B: Backend>(st: &mut State, b: &mut B, handle: &LoopHandle<'static, B>, conn: u64) {
+    if let Some(c) = drop_conn(st, b, conn) {
+        for t in c.token.into_iter().chain(c.out.write_token) {
+            handle.remove(t);
+        }
+    }
+}
+
+/// After a dispatch: run the viewer pump, drop failed and stalled viewer connections, close the
+/// drained ones that asked for it, and register a writable source for every queue still waiting.
+fn sync_viewers<B: Backend>(
+    state: &Rc<RefCell<State>>,
+    handle: &LoopHandle<'static, B>,
+    b: &mut B,
+) {
+    let mut st = state.borrow_mut();
+    let now = Instant::now();
+    let mut gone = viewers::pump(&mut st, b, now);
+    for conn in viewers::stalled(&st, now) {
+        eprintln!("crucible-term: daemon: client {conn}: output undrained too long; dropped");
+        gone.push(conn);
+    }
+    gone.extend(
+        st.conns
+            .iter()
+            .filter(|(_, c)| c.out.close_when_drained && c.out.is_empty())
+            .map(|(&k, _)| k),
+    );
+    for conn in gone {
+        finish_conn(&mut st, b, handle, conn);
+    }
+    let waiting: Vec<u64> = st
+        .conns
+        .iter()
+        .filter(|(_, c)| !c.out.is_empty() && c.out.write_token.is_none())
+        .map(|(&k, _)| k)
+        .collect();
+    for conn in waiting {
+        let Some(fd) = st
+            .conns
+            .get(&conn)
+            .and_then(|c| rustix::io::dup(&c.stream).ok())
+        else {
+            continue;
+        };
+        let (state2, h2) = (state.clone(), handle.clone());
+        let r = handle.insert_source(
+            Generic::new(fd, Interest::WRITE, Mode::Level),
+            move |_, _, b: &mut B| {
+                let mut st = state2.borrow_mut();
+                let st = &mut *st;
+                match viewers::on_writable(st, conn) {
+                    Ok(false) => return Ok(PostAction::Continue),
+                    Ok(true) => {
+                        let close = st.conns.get_mut(&conn).is_some_and(|c| {
+                            c.out.write_token = None;
+                            c.out.close_when_drained
+                        });
+                        if close {
+                            finish_conn(st, b, &h2, conn);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("crucible-term: daemon: client {conn}: write: {e}");
+                        if let Some(c) = st.conns.get_mut(&conn) {
+                            c.out.write_token = None;
+                        }
+                        finish_conn(st, b, &h2, conn);
+                    }
+                }
+                Ok(PostAction::Remove)
+            },
+        );
+        match r {
+            Ok(t) => {
+                if let Some(c) = st.conns.get_mut(&conn) {
+                    c.out.write_token = Some(t);
+                }
+            }
+            Err(e) => {
+                eprintln!("crucible-term: daemon: client {conn}: writable source: {e}");
+                finish_conn(&mut st, b, handle, conn);
+            }
         }
     }
 }
@@ -551,7 +686,9 @@ fn on_readable<B: Backend>(st: &mut State, b: &mut B, cx: &Sched<B>, conn: u64) 
         }
     }
     if eof {
-        drop_conn(st, b, conn);
+        if let Some(t) = drop_conn(st, b, conn).and_then(|c| c.out.write_token) {
+            cx.1.remove(t);
+        }
         PostAction::Remove
     } else {
         PostAction::Continue
@@ -631,6 +768,8 @@ fn on_accept<B: Backend>(
                 hello: false,
                 opening: false,
                 token: None,
+                out: viewers::Out::default(),
+                watch: None,
             },
         );
         drop(st);
@@ -997,6 +1136,9 @@ fn serve<B: Backend>(
         delay: open_delay,
         detached_timeout,
         persist,
+        viewer_stall: headless::Headless::parse_ms(
+            std::env::var(viewers::STALL_VAR).ok().as_deref(),
+        ),
         ..State::default()
     }));
     let own_uid = rustix::process::getuid().as_raw();
@@ -1061,6 +1203,7 @@ fn serve<B: Backend>(
                 .filter_map(|r| r.expiry)
                 .map(|(Expiry::Orphan(t) | Expiry::Detached(t))| t)
                 .chain(record_deadline(&st, &b))
+                .chain(viewers::deadline(&st, &b))
                 .min()
                 .map(|d| d.saturating_duration_since(Instant::now()))
         };
@@ -1092,6 +1235,8 @@ fn serve<B: Backend>(
             }
             return Ok(());
         }
+        // Before the reap, so a finishing session's last picture still reaches its viewers.
+        sync_viewers(&state, &handle, &mut b);
         retry_claims(&mut state.borrow_mut(), Instant::now());
         // Periodic and final captures, before the reap drops finished sessions.
         {
@@ -1117,6 +1262,7 @@ fn serve<B: Backend>(
                 if let (Some(p), Some(o)) = (st.persist.as_mut(), r.record) {
                     p.release(o, Instant::now());
                 }
+                viewers::on_exit(&mut st, &r.viewers, &r.killers, r.conn, code);
                 let Some(conn) = r.conn else {
                     continue;
                 };
@@ -1140,6 +1286,8 @@ fn serve<B: Backend>(
         if let Some(p) = state.borrow_mut().persist.as_mut() {
             p.expire(Instant::now());
         }
+        // Relay what the exits queued (leave sequences, `Exited`) without waiting a dispatch.
+        sync_viewers(&state, &handle, &mut b);
     }
 }
 

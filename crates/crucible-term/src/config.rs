@@ -17,7 +17,7 @@
 //! mode "standalone"                        // standalone | daemon | auto (default standalone)
 //! daemon-linger 0                          // daemon idle-exit seconds; 0 = stay resident
 //! daemon-start "service"                   // service (connect only) | spawn (start it if absent)
-//! detached-timeout 30                      // seconds a detached session waits for reattach after a reconnect; 0 = never
+//! detached-timeout 0                       // seconds a detached session waits for reattach after a reconnect (an attached viewer cancels the clock); 0 = never
 //! scrollback-persist #false                // daemon: keep a record of each keyed session on disk (survives reboot)
 //! persist-lines 2000                       // daemon: history rows per record (clamped to scrollback)
 //! persist-days 14                          // daemon: records older than this are deleted at startup; 0 = never
@@ -84,8 +84,9 @@ pub struct Settings {
     pub daemon_start: DaemonStart,
     /// Daemon idle-exit timeout in seconds with no windows and no clients; 0 = stay resident.
     pub daemon_linger: u64,
-    /// Seconds a session still detached after a Wayland reconnect waits for a reattach before it
-    /// is closed (SIGHUP grace); 0 = never.
+    /// Seconds a session still detached after a Wayland reconnect (or after its last viewer left)
+    /// waits for a reattach before it is closed (SIGHUP grace); an attached viewer cancels the
+    /// clock. 0 (the default) = never.
     pub detached_timeout: u64,
     /// Daemon: keep a durable record of each keyed session under
     /// `$XDG_STATE_HOME/crucible-term/sessions/` and replay it on the next keyed open.
@@ -110,7 +111,7 @@ impl Default for Settings {
             mode: RunMode::Standalone,
             daemon_start: DaemonStart::Service,
             daemon_linger: 0,
-            detached_timeout: 30,
+            detached_timeout: 0,
             scrollback_persist: false,
             persist_lines: 2000,
             persist_days: 14,
@@ -991,7 +992,7 @@ mod tests {
     #[test]
     fn seconds_keys_share_one_setter_from_both_sources() {
         let (mut s, w) = parsed("daemon-linger 5\ndetached-timeout 1.5\nmode \"auto\"\n");
-        assert_eq!((s.daemon_linger, s.detached_timeout), (5, 30));
+        assert_eq!((s.daemon_linger, s.detached_timeout), (5, 0));
         assert_eq!(s.mode, RunMode::Auto);
         assert_eq!(
             w,

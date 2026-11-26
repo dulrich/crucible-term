@@ -547,6 +547,7 @@ impl Host {
             force_present: false,
             out_gen: 0,
             last_output: Instant::now(),
+            seen: crate::daemon::Seen::default(),
         };
         term.apply_cursor_defaults();
         if term.diag.mem() {
@@ -619,6 +620,45 @@ impl Host {
             last_output: t.last_output,
             finishing: t.exit.is_some() || t.close_requested,
         })
+    }
+
+    /// A viewer's bytes for window `id`'s child, through the same outbox as the window's keys
+    /// and paste (arrival order). False when there is no such live session.
+    pub(crate) fn write_input(&mut self, id: TermId, bytes: &[u8]) -> bool {
+        match self.terms.get_mut(&id) {
+            Some(t) if t.exit.is_none() && !t.close_requested => {
+                t.send(bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A viewer's size request. Until the window can show a session at a size it did not set,
+    /// `Some` is refused (viewers see the window's grid, clipped) and `None` is a no-op.
+    pub(crate) fn set_size(&mut self, id: TermId, size: Option<(u16, u16)>) -> Result<(), String> {
+        match (self.terms.contains_key(&id), size) {
+            (false, _) => Err(format!("no session {}", id.0)),
+            (true, None) => Ok(()),
+            (true, Some(_)) => Err("the window owns its size".into()),
+        }
+    }
+
+    /// Session `id`'s child pid, current title and working directory (the spawn one until an
+    /// OSC 7 names another).
+    pub(crate) fn info(&self, id: TermId) -> Option<crate::daemon::Info> {
+        self.terms.get(&id).map(|t| crate::daemon::Info {
+            pid: t.pty.pid(),
+            title: t.seen.title.clone(),
+            cwd: t.seen.cwd.clone().unwrap_or_else(|| t.cfg.cwd.clone()),
+        })
+    }
+
+    /// BELs window `id`'s child rang since the last call.
+    pub(crate) fn take_bells(&mut self, id: TermId) -> u32 {
+        self.terms
+            .get_mut(&id)
+            .map_or(0, |t| std::mem::take(&mut t.seen.bells))
     }
 
     /// Replace window `id`'s session, before any PTY output, with `rec` replayed at the
